@@ -1,0 +1,70 @@
+@import "css/fonts.css";
+
+:root {
+    font-family: "Micro5";
+    font-size: 34px;
+    -bevy-font-smooth: none;
+    color: #ffffff;
+}
+
+.context-menu-root {
+    -bevy-image: url("sprites/ui/container.png");
+    -bevy-image-rect: 3 3 75 75;
+    -bevy-image-mode: sliced(9px tile(1.0) tile(1.0) 1.0);
+    -bevy-image-color: color(srgb-linear 1.0 1.0 1.0 / 0.75);
+}
+
+.separator {
+    width: 100%;
+    /* background-color: #ff0000; */
+    justify-content: center;
+    -bevy-image: url("sprites/ui/container.png");
+    -bevy-image-rect: 78 3 96 21;
+    -bevy-image-mode: sliced(3px tile(1.0) tile(1.0) 1.0);
+    -bevy-image-color: color(srgb-linear 1.0 1.0 1.0 / 0.75);
+}
+
+.context-menu {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    width: 150px;
+    row-gap: 10px;
+    padding: 0px 10px 10px 10px;
+
+}
+
+.context-menu-title {
+    font-family: "Micro5";
+    font-size: 34px;
+    -bevy-font-smooth: none;
+    color: #ffffff;
+}
+
+button.context-menu-button {
+    display: flex;
+    width: 100%;
+    justify-content: center;
+    align-items: center;
+
+    -bevy-image: url("sprites/ui/container.png");
+    -bevy-image-rect: 3 78 39 114;
+    -bevy-image-mode: sliced(6px tile(1.0) tile(1.0) 1.0);
+    -bevy-image-color: color(srgb-linear 1.0 1.0 1.0 / 0.75);
+
+    &:hover {
+        -bevy-image-rect: 42 78 78 114;
+    }
+
+    &:active {
+        -bevy-image-rect: 42 78 78 114;
+    }
+
+    text {
+        font-family: "Micro5";
+        font-size: 34px;
+        -bevy-font-smooth: none;
+        color: #ffffff;
+        transition: color 0.1s;
+    }
+}

@@ -1,0 +1,10 @@
+[package]
+name = "bevue"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = { version = "0.19", default-features = false, features = [
+    "ui",
+]}
+bevy_flair = { version = "0.8.1", optional = true }

@@ -1,0 +1,16 @@
+<layout>
+    <param name="menu" type_path="mushroom_colony::ui::types::ContextMenu">
+
+    </style href="css/context_menu.css">
+    
+    <div class="context-menu-root">
+        <div class="wrapper">
+            <div class="separator">
+                <p class="context-menu-title">{{menu.title}}</p>
+            </div>
+            <button v-for="action in menu.actions" :key="action.id">
+                <span>{{action.label}}</span>
+            </button>
+        </div>
+    </div>
+</layout>
