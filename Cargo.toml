@@ -8,3 +8,5 @@ bevy = { version = "0.19", default-features = false, features = [
     "ui",
 ]}
 bevy_flair = { version = "0.8.1", optional = true }
+tl = "0.7.8"
+winnow = "1.0.4"

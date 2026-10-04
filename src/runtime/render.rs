@@ -132,8 +132,29 @@ mod test {
                 ),
             ]
         )).id();
-
         world.trigger(RenderTemplate { template, ui_root: None });
+        app.update();
+    }
+
+    #[test]
+    fn render_parsed() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, BevueRuntimePlugin));
+        app.finish();
+
+        let source = r#"
+            <div>
+                <p>Hello.</p>
+                <span>World!</span>
+            </div>
+        "#;
+        let template = crate::parser::parse_template(source).unwrap();
+        let mut commands = app.world_mut().commands();
+        let root = template.spawn(&mut commands);
+
+        app.update();
+
+        app.world_mut().trigger(RenderTemplate { template: root, ui_root: None });
         app.update();
     }
 }

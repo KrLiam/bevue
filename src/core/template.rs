@@ -1,10 +1,14 @@
 use std::borrow::Cow;
 
-use bevy::ecs::component::Component;
+use bevy::{
+    asset::Asset,
+    ecs::{component::Component, entity::Entity, hierarchy::ChildOf, system::Commands},
+    reflect::TypePath,
+};
 
 
 /// The type of a template node.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ElementType {
     /// Native HTML element such as `div`,`p`, `span`, `button` etc.
     Native(Cow<'static, str>),
@@ -43,7 +47,7 @@ impl From<&'static str> for ElementType {
 }
 
 
-#[derive(Component, Debug, Clone, Default)]
+#[derive(Component, Debug, Clone, Default, PartialEq)]
 pub struct TemplateNode {
     /// The element type.
     pub element: ElementType,
@@ -139,7 +143,7 @@ impl From<bool> for Expression {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TextFragment {
     Literal(Cow<'static, str>),
     Interpolated(Expression),
@@ -167,7 +171,7 @@ impl From<Expression> for TextFragment {
 }
 
 
-#[derive(Component, Debug, Clone)]
+#[derive(Component, Debug, Clone, PartialEq)]
 pub struct TemplateText(pub Vec<TextFragment>);
 
 impl TemplateText {
@@ -177,7 +181,7 @@ impl TemplateText {
 }
 
 
-#[derive(Component, Debug, Clone)]
+#[derive(Component, Debug, Clone, PartialEq)]
 pub struct ListDirective {
     pub target: Identifier,
     pub iterable: Expression,
@@ -189,12 +193,96 @@ impl ListDirective {
     }
 }
 
-#[derive(Component, Debug, Clone)]
+#[derive(Component, Debug, Clone, PartialEq)]
 pub struct ConditionDirective(pub Expression);
 
 impl ConditionDirective {
     pub fn new(condition: impl Into<Expression>) -> Self {
         Self(condition.into())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TemplateNodeData {
+    pub node: TemplateNode,
+    pub children: Vec<usize>,
+    pub text: Option<TemplateText>,
+    pub list: Option<ListDirective>,
+    pub condition: Option<ConditionDirective>,
+}
+
+impl TemplateNodeData {
+    pub fn new(node: TemplateNode) -> Self {
+        Self {
+            node,
+            children: Vec::new(),
+            text: None,
+            list: None,
+            condition: None,
+        }
+    }
+}
+
+#[derive(Asset, TypePath, Debug, Clone, Default, PartialEq)]
+pub struct BevueTemplate {
+    pub nodes: Vec<TemplateNodeData>,
+}
+
+impl BevueTemplate {
+    pub fn new(nodes: Vec<TemplateNodeData>) -> Self {
+        Self { nodes }
+    }
+
+    pub fn spawn(&self, commands: &mut Commands) -> Entity {
+        if self.nodes.is_empty() {
+            return commands.spawn_empty().id();
+        }
+
+        let entities: Vec<Entity> = (0..self.nodes.len())
+            .map(|_| commands.spawn_empty().id())
+            .collect();
+
+        for (i, data) in self.nodes.iter().enumerate() {
+            let entity = entities[i];
+            let mut entity_commands = commands.entity(entity);
+            entity_commands.insert(data.node.clone());
+            if let Some(text) = &data.text {
+                entity_commands.insert(text.clone());
+            }
+            if let Some(list) = &data.list {
+                entity_commands.insert(list.clone());
+            }
+            if let Some(condition) = &data.condition {
+                entity_commands.insert(condition.clone());
+            }
+            for &child_idx in &data.children {
+                if child_idx < entities.len() {
+                    commands.entity(entities[child_idx]).insert(ChildOf(entity));
+                }
+            }
+        }
+
+        entities[0]
+    }
+}
+
+impl std::ops::Deref for BevueTemplate {
+    type Target = Vec<TemplateNodeData>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.nodes
+    }
+}
+
+impl std::ops::DerefMut for BevueTemplate {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.nodes
+    }
+}
+
+impl From<Vec<TemplateNodeData>> for BevueTemplate {
+    fn from(nodes: Vec<TemplateNodeData>) -> Self {
+        Self { nodes }
     }
 }
 
