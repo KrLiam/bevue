@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use bevy::{
-    asset::{AssetEvent, AssetId, Assets, Handle},
+    asset::{AssetEvent, AssetId, AssetServer, Assets, Handle},
     ecs::{
         component::Component,
         entity::Entity,
@@ -16,8 +16,11 @@ use bevy::{
     },
     ui::{Node, widget::Text},
 };
+use bevy_flair::prelude::{ClassList, Styled, StyleSheet};
 
-use crate::core::template::{BevueTemplate, ElementType, TextFragment};
+use crate::core::template::{
+    BevueTemplate, ElementType, Expression, NodeId, TemplateRef, TextFragment,
+};
 
 #[derive(Component, Clone, Debug, PartialEq, Eq)]
 pub struct Template(pub Handle<BevueTemplate>);
@@ -38,19 +41,6 @@ impl From<Handle<BevueTemplate>> for Template {
     }
 }
 
-impl std::ops::Deref for Template {
-    type Target = Handle<BevueTemplate>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for Template {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
 
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TemplateRendered(pub AssetId<BevueTemplate>);
@@ -151,7 +141,7 @@ pub fn watch_template_components(
     }
 }
 
-pub type RenderStackItem = (usize, Option<Entity>, Option<Entity>);
+pub type RenderStackItem = (NodeId, Option<Entity>, Option<Entity>);
 
 pub fn render_template(
     input: In<RenderTemplate>,
@@ -176,8 +166,17 @@ pub fn render_template(
         return;
     };
 
+    let root_entity = match input.ui_root {
+        Some(entity) => entity,
+        None => world.spawn_empty().id(),
+    };
+
+    if !world.entity(root_entity).contains::<Template>() {
+        world.entity_mut(root_entity).insert(Template(input.template.clone()));
+    }
+
     stack.clear();
-    stack.push((root_idx, input.ui_root, None));
+    stack.push((root_idx, Some(root_entity), None));
 
     while let Some((template_node_idx, node, parent_node)) = stack.pop() {
         let Some(template_node) = template.get(template_node_idx) else {
@@ -191,6 +190,11 @@ pub fn render_template(
             }
             None => world.spawn_empty().id(),
         };
+
+        world.entity_mut(node).insert(TemplateRef {
+            root: root_entity,
+            node: template_node_idx,
+        });
 
         for &child_idx in template.children(template_node_idx).iter().rev() {
             stack.push((child_idx, None, Some(node)));
@@ -234,6 +238,46 @@ pub fn render_template(
         }
     }
 }
+
+pub fn apply_template_classes_and_styles(
+    mut commands: Commands,
+    asset_server: Option<Res<AssetServer>>,
+    template_nodes: Query<(Entity, &TemplateRef), Changed<TemplateRef>>,
+    root_templates: Query<&Template>,
+    templates: Res<Assets<BevueTemplate>>,
+) {
+    for (entity, template_ref) in &template_nodes {
+        let Ok(root_template) = root_templates.get(template_ref.root) else {
+            continue;
+        };
+
+        let Some(template) = templates.get(&root_template.0) else {
+            continue;
+        };
+
+        let Some(template_node) = template.get(template_ref.node) else {
+            continue;
+        };
+
+        // 1. Copy the "class" attribute string to bevy flair's ClassList
+        for (name, expr) in &template_node.attributes {
+            if name == "class" && let Expression::String(class_str) = expr {
+                commands.entity(entity).insert(ClassList::new(class_str.as_ref()));
+            }
+        }
+
+        // 2. If the entity is the root, also get the style data and if src is present, add the Styled component
+        if template_ref.root == entity
+            && let Some(style) = &template_node.style
+            && let Some(src) = &style.src
+            && let Some(asset_server) = &asset_server
+        {
+            let style_handle: Handle<StyleSheet> = asset_server.load(src.to_string());
+            commands.entity(entity).insert(Styled::new(style_handle));
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod test {
@@ -472,5 +516,85 @@ mod test {
 
         let node = app.world().get::<Node>(entity).unwrap();
         assert_eq!(node.left, Val::Px(42.0));
+    }
+
+    #[test]
+    fn test_template_ref_class_list_and_styled() {
+        use bevy::ecs::entity::Entity;
+        use bevy_flair::prelude::{ClassList, Styled};
+        use crate::core::template::{NodeId, TemplateRef};
+
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default(), BevueRuntimePlugin));
+        app.finish();
+
+        let source = r#"
+            <template>
+                <div class="root">
+                    <p>Hello!</p>
+                    <div class="inner">
+                        <span>You</span>
+                    </div>
+                </div>
+            </template>
+
+            <style src="css/simple.css"></style>
+        "#;
+        let template = crate::parser::parse_template(source).unwrap();
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<BevueTemplate>>()
+            .add(template);
+
+        let entity = app.world_mut().spawn(Template(handle)).id();
+        app.update();
+
+        // 1. Verify root entity
+        let root_ref = app.world().get::<TemplateRef>(entity).expect("Root must have TemplateRef");
+        assert_eq!(root_ref.root, entity);
+        assert_eq!(root_ref.node, NodeId(0));
+
+        let root_classes = app.world().get::<ClassList>(entity).expect("Root must have ClassList");
+        assert!(root_classes.contains("root"));
+
+        let root_styled = app.world().get::<Styled>(entity).expect("Root must have Styled component");
+        match root_styled {
+            Styled::StyleSheet(handle) => {
+                assert_eq!(handle.path().map(|p| p.path()), Some(std::path::Path::new("css/simple.css")));
+            }
+            _ => panic!("Expected Styled::StyleSheet"),
+        }
+
+        // 2. Verify children entities
+        let mut query = app.world_mut().query::<(Entity, &TemplateRef, Option<&ClassList>, Option<&Styled>)>();
+        let mut found_inner = false;
+        let mut found_p = false;
+        let mut found_span = false;
+
+        for (_e, t_ref, class_list, styled) in query.iter(app.world()) {
+            assert_eq!(t_ref.root, entity);
+
+            if t_ref.node == NodeId(2) {
+                // <div class="inner">
+                found_inner = true;
+                let classes = class_list.expect("Inner div must have ClassList");
+                assert!(classes.contains("inner"));
+                assert!(styled.is_none(), "Non-root node should not have Styled");
+            } else if t_ref.node == NodeId(1) {
+                // <p>
+                found_p = true;
+                assert!(class_list.is_none(), "p has no class");
+                assert!(styled.is_none());
+            } else if t_ref.node == NodeId(3) {
+                // <span>
+                found_span = true;
+                assert!(class_list.is_none(), "span has no class");
+                assert!(styled.is_none());
+            }
+        }
+
+        assert!(found_inner);
+        assert!(found_p);
+        assert!(found_span);
     }
 }

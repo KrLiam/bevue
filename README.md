@@ -9,3 +9,13 @@ Bevue brings [Vue](https://vuejs.org/guide/introduction.html)-like templating to
 Bevue is only inspired by Vue, it won't:
 - Support *all* syntax of Vue;
 - Embed the Vue framework or a JavaScript engine. Everything still happens in Rust.
+
+# Features
+
+- [X] Vue-like components in HTML files;
+- [X] Loading components from assets with hot reloading;
+- [X] Easy styling with CSS through `bevy-flair` crate;
+- [X] Rendering static components to Bevy UI;
+- [ ] Text and attribute interpolation e.g `Hello {{ user }}!`;
+- [ ] Conditional rendering using the `v-if` directive;
+- [ ] List rendering using the `v-for` directive;

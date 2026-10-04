@@ -83,8 +83,8 @@ pub use expr::{
 };
 
 pub use crate::core::template::{
-    BevueTemplate, ConditionDirective, Expression, Identifier, ListDirective, TemplateNode,
-    TemplateNodeData, TemplateText, TextFragment,
+    BevueTemplate, ConditionDirective, Expression, Identifier, ListDirective, NodeId, TemplateNode,
+    TemplateRef, TemplateStyle, TemplateText, TextFragment,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -117,24 +117,49 @@ impl From<ExprParseError> for ParseError {
 pub type Result<T> = std::result::Result<T, ParseError>;
 
 /// Parses a template source string into a `BevueTemplate`.
-/// Ignores `<style>` and `<param>` tags for now.
+/// Supports `<template>` wrapper and `<style src="...">` tags.
 pub fn parse_template(source: &str) -> Result<BevueTemplate> {
     let dom = tl::parse(source, ParserOptions::default())
         .map_err(|e| ParseError::InvalidHtml(format!("{e:?}")))?;
 
     let mut nodes: Vec<TemplateNode> = Vec::new();
     let mut stack: Vec<usize> = Vec::new();
-    let mut ignore_depth: usize = 0;
+    let mut depth: usize = 0;
+    let mut in_style = false;
+    let mut current_style_src: Option<String> = None;
+    let mut current_style_inline = String::new();
+    let mut parsed_style: Option<TemplateStyle> = None;
+    let mut is_top_level_template = false;
 
     for node in traverse_dom(&dom) {
         match node {
             HtmlNode::OpenTag(tag) => {
                 let tag_name = tag.name().as_utf8_str();
-                if ignore_depth > 0
-                    || tag_name.eq_ignore_ascii_case("param")
-                    || tag_name.eq_ignore_ascii_case("style")
-                {
-                    ignore_depth += 1;
+
+                if tag_name.eq_ignore_ascii_case("style") {
+                    in_style = true;
+                    current_style_inline.clear();
+                    current_style_src = None;
+                    for (name, value) in tag.attributes().iter() {
+                        if name == "src" || (name == "href" && current_style_src.is_none()) {
+                            current_style_src = value.map(|b| b.to_string());
+                        }
+                    }
+                    continue;
+                }
+
+                if tag_name.eq_ignore_ascii_case("param") {
+                    depth += 1;
+                    continue;
+                }
+
+                if depth > 0 || in_style {
+                    depth += 1;
+                    continue;
+                }
+
+                if stack.is_empty() && tag_name.eq_ignore_ascii_case("template") {
+                    is_top_level_template = true;
                     continue;
                 }
 
@@ -183,20 +208,37 @@ pub fn parse_template(source: &str) -> Result<BevueTemplate> {
                 nodes.push(template_node);
 
                 if let Some(&parent_idx) = stack.last() {
-                    nodes[parent_idx].children.push(node_idx);
+                    nodes[parent_idx].children.push(node_idx.into());
                 }
 
                 stack.push(node_idx);
             }
-            HtmlNode::CloseTag(_tag) => {
-                if ignore_depth > 0 {
-                    ignore_depth -= 1;
+            HtmlNode::CloseTag(tag) => {
+                let tag_name = tag.name().as_utf8_str();
+                if tag_name.eq_ignore_ascii_case("style") && in_style {
+                    in_style = false;
+                    parsed_style = Some(TemplateStyle {
+                        src: current_style_src.take().map(Into::into),
+                        inline: current_style_inline.trim().to_string().into(),
+                    });
+                    continue;
+                }
+                if depth > 0 {
+                    depth -= 1;
+                    continue;
+                }
+                if tag_name.eq_ignore_ascii_case("template") && is_top_level_template && stack.is_empty() {
+                    is_top_level_template = false;
                     continue;
                 }
                 stack.pop();
             }
             HtmlNode::Text(text) => {
-                if ignore_depth > 0 {
+                if in_style {
+                    current_style_inline.push_str(&text);
+                    continue;
+                }
+                if depth > 0 {
                     continue;
                 }
                 if let Some(&current_idx) = stack.last() {
@@ -213,7 +255,15 @@ pub fn parse_template(source: &str) -> Result<BevueTemplate> {
         }
     }
 
-    Ok(BevueTemplate::new(nodes))
+    let mut template = BevueTemplate::new(nodes);
+    if let Some(style) = parsed_style
+        && let Some(root_idx) = template.root_index()
+        && let Some(node) = template.get_mut(root_idx)
+    {
+        node.style = Some(style);
+    }
+
+    Ok(template)
 }
 
 #[cfg(test)]
@@ -226,7 +276,9 @@ mod test {
         MinimalPlugins,
     };
 
-    use super::*;
+    use crate::core::template::NodeId;
+
+use super::*;
 
     const TEMPLATE: &str = r#"
         <layout>
@@ -258,7 +310,7 @@ mod test {
 
         // Node 0: <layout>
         assert_eq!(result.nodes[0].element, "layout".into());
-        assert_eq!(result.nodes[0].children, vec![1]);
+        assert_eq!(result.nodes[0].children, vec![NodeId(1)]);
 
         // Node 1: <div class="context-menu-root">
         assert_eq!(result.nodes[1].element, "div".into());
@@ -266,15 +318,15 @@ mod test {
             result.nodes[1].attributes,
             vec![("class".into(), Expression::String("context-menu-root".into()))]
         );
-        assert_eq!(result.nodes[1].children, vec![2]);
+        assert_eq!(result.nodes[1].children, vec![NodeId(2)]);
 
         // Node 2: <div class="wrapper">
         assert_eq!(result.nodes[2].element, "div".into());
-        assert_eq!(result.nodes[2].children, vec![3, 5]);
+        assert_eq!(result.nodes[2].children, vec![NodeId(3), NodeId(5)]);
 
         // Node 3: <div class="separator">
         assert_eq!(result.nodes[3].element, "div".into());
-        assert_eq!(result.nodes[3].children, vec![4]);
+        assert_eq!(result.nodes[3].children, vec![NodeId(4)]);
 
         // Node 4: <p class="context-menu-title">{{menu.title}}</p>
         assert_eq!(result.nodes[4].element, "p".into());
@@ -308,7 +360,7 @@ mod test {
                 field: "id".into(),
             })]
         );
-        assert_eq!(result.nodes[5].children, vec![6]);
+        assert_eq!(result.nodes[5].children, vec![NodeId(6)]);
 
         // Node 6: <span>{{action.label}}</span>
         assert_eq!(result.nodes[6].element, "span".into());
@@ -324,10 +376,10 @@ mod test {
         );
 
         // Verify helper methods on BevueTemplate
-        assert_eq!(result.children(0), &[1]);
-        assert_eq!(result.children(2), &[3, 5]);
-        assert_eq!(result.children(6), &[]);
-        assert_eq!(result.root_index(), Some(0));
+        assert_eq!(result.children(NodeId(0)), &[NodeId(1)]);
+        assert_eq!(result.children(NodeId(2)), &[NodeId(3), NodeId(5)]);
+        assert_eq!(result.children(NodeId(6)), &[]);
+        assert_eq!(result.root_index(), Some(NodeId(0)));
         assert_eq!(result.root().unwrap().element, "layout".into());
     }
 
@@ -355,5 +407,37 @@ mod test {
             world.get::<ChildOf>(div_root).expect("ChildOf parent").parent(),
             root
         );
+    }
+
+    #[test]
+    fn test_parse_template_with_style_and_wrapper() {
+        let source = r#"
+            <template>
+                <div class="root">
+                    <p>Hello!</p>
+                    <div class="inner">
+                        <span>You</span>
+                    </div>
+                </div>
+            </template>
+
+            <style src="css/simple.css"></style>
+        "#;
+
+        let template = parse_template(source).expect("Failed to parse template");
+        let root = template.root().expect("Root node should exist");
+        assert_eq!(root.element, "div".into());
+        assert_eq!(
+            root.attributes,
+            vec![("class".into(), Expression::String("root".into()))]
+        );
+        assert_eq!(
+            root.style,
+            Some(TemplateStyle {
+                src: Some("css/simple.css".into()),
+                inline: "".into(),
+            })
+        );
+        assert_eq!(root.children.len(), 2);
     }
 }

@@ -8,6 +8,6 @@ bevy = { version = "0.19", default-features = false, features = [
     "ui",
     "file_watcher",
 ]}
-bevy_flair = { version = "0.8.1", optional = true }
+bevy_flair = { version = "0.8.1" }
 tl = "0.7.8"
 winnow = "1.0.4"

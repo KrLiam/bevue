@@ -2,10 +2,39 @@ use std::borrow::Cow;
 
 use bevy::{
     asset::Asset,
-    ecs::{entity::Entity, hierarchy::ChildOf, system::Commands},
+    ecs::{component::Component, entity::Entity, hierarchy::ChildOf, system::Commands},
+    prelude::Deref,
     reflect::TypePath,
 };
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TemplateStyle {
+    pub src: Option<Cow<'static, str>>,
+    pub inline: Cow<'static, str>,
+}
+
+impl TemplateStyle {
+    pub fn new(src: Option<impl Into<Cow<'static, str>>>, inline: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            src: src.map(Into::into),
+            inline: inline.into(),
+        }
+    }
+
+    pub fn from_src(src: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            src: Some(src.into()),
+            inline: Cow::Borrowed(""),
+        }
+    }
+
+    pub fn from_inline(inline: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            src: None,
+            inline: inline.into(),
+        }
+    }
+}
 
 /// The type of a template node.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,10 +81,11 @@ pub struct TemplateNode {
     /// The element type.
     pub element: ElementType,
     pub attributes: Vec<(Cow<'static, str>, Expression)>,
-    pub children: Vec<usize>,
+    pub children: Vec<NodeId>,
     pub text: Option<TemplateText>,
     pub list: Option<ListDirective>,
     pub condition: Option<ConditionDirective>,
+    pub style: Option<TemplateStyle>,
 }
 
 impl TemplateNode {
@@ -67,6 +97,7 @@ impl TemplateNode {
             text: None,
             list: None,
             condition: None,
+            style: None,
         }
     }
 
@@ -75,8 +106,8 @@ impl TemplateNode {
         self
     }
 
-    pub fn with_child(mut self, child_index: usize) -> Self {
-        self.children.push(child_index);
+    pub fn with_child(mut self, child_index: impl Into<NodeId>) -> Self {
+        self.children.push(child_index.into());
         self
     }
 
@@ -92,6 +123,11 @@ impl TemplateNode {
 
     pub fn with_condition(mut self, condition: ConditionDirective) -> Self {
         self.condition = Some(condition);
+        self
+    }
+
+    pub fn with_style(mut self, style: TemplateStyle) -> Self {
+        self.style = Some(style);
         self
     }
 }
@@ -231,8 +267,35 @@ impl ConditionDirective {
     }
 }
 
-/// Alias for `TemplateNode` for backwards compatibility.
-pub type TemplateNodeData = TemplateNode;
+#[derive(Debug, Clone, Copy, Deref, PartialEq, Eq, Hash)]
+pub struct NodeId(pub usize);
+
+impl From<usize> for NodeId {
+    fn from(value: usize) -> Self {
+        NodeId(value)
+    }
+}
+
+impl NodeId {
+    pub fn root() -> NodeId {
+        NodeId(0)
+    }
+}
+
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TemplateRef {
+    pub root: Entity,
+    pub node: NodeId,
+}
+
+impl TemplateRef {
+    pub fn new(root: Entity, node: impl Into<NodeId>) -> Self {
+        Self {
+            root,
+            node: node.into(),
+        }
+    }
+}
 
 #[derive(Asset, TypePath, Debug, Clone, Default, PartialEq)]
 pub struct BevueTemplate {
@@ -245,63 +308,63 @@ impl BevueTemplate {
     }
 
     /// Gets a reference to the node at the given index.
-    pub fn get(&self, index: usize) -> Option<&TemplateNode> {
-        self.nodes.get(index)
+    pub fn get(&self, id: impl Into<NodeId>) -> Option<&TemplateNode> {
+        self.nodes.get(*id.into())
     }
 
     /// Gets a mutable reference to the node at the given index.
-    pub fn get_mut(&mut self, index: usize) -> Option<&mut TemplateNode> {
-        self.nodes.get_mut(index)
+    pub fn get_mut(&mut self, id: impl Into<NodeId>) -> Option<&mut TemplateNode> {
+        self.nodes.get_mut(*id.into())
     }
 
     /// Returns the indices of the children of the node at `index`.
-    pub fn children(&self, index: usize) -> &[usize] {
-        self.nodes.get(index).map(|n| n.children.as_slice()).unwrap_or(&[])
+    pub fn children(&self, id: NodeId) -> &[NodeId] {
+        self.nodes.get(*id).map(|n| n.children.as_slice()).unwrap_or(&[])
     }
 
     /// Returns an iterator yielding `(child_index, &child_node)` for the node at `index`.
-    pub fn child_nodes(&self, index: usize) -> impl Iterator<Item = (usize, &TemplateNode)> + '_ {
-        self.children(index)
+    pub fn child_nodes(&self, id: NodeId) -> impl Iterator<Item = (NodeId, &TemplateNode)> + '_ {
+        self.children(id)
             .iter()
             .copied()
-            .filter_map(|child_idx| self.nodes.get(child_idx).map(|node| (child_idx, node)))
+            .filter_map(|child_id| self.nodes.get(*child_id).map(|node| (child_id, node)))
     }
 
     /// Returns an iterator yielding the child indices of the node at `index`.
-    pub fn child_node_indices(&self, index: usize) -> impl Iterator<Item = usize> + '_ {
-        self.children(index).iter().copied()
+    pub fn child_node_indices(&self, id: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+        self.children(id).iter().copied()
     }
 
     /// Finds and returns the indices of all root nodes (nodes that are not children of any other node).
-    pub fn roots(&self) -> Vec<usize> {
+    pub fn roots(&self) -> Vec<NodeId> {
         let mut is_child = vec![false; self.nodes.len()];
         for node in &self.nodes {
             for &child in &node.children {
-                if child < is_child.len() {
-                    is_child[child] = true;
+                if *child < is_child.len() {
+                    is_child[*child] = true;
                 }
             }
         }
         is_child
             .into_iter()
             .enumerate()
-            .filter_map(|(i, child)| if !child { Some(i) } else { None })
+            .filter_map(|(i, child)| if !child { Some(NodeId(i)) } else { None })
             .collect()
     }
 
     /// Returns the index of the primary root node (defaults to 0, or first unparented node).
-    pub fn root_index(&self) -> Option<usize> {
+    pub fn root_index(&self) -> Option<NodeId> {
         if self.nodes.is_empty() {
             None
         } else {
-            Some(self.roots().first().copied().unwrap_or(0))
+            Some(self.roots().first().copied().unwrap_or(NodeId(0)))
         }
     }
 
     /// Returns a reference to the primary root node.
     pub fn root(&self) -> Option<&TemplateNode> {
-        let root_idx = self.root_index()?;
-        self.nodes.get(root_idx)
+        let root_id = self.root_index()?;
+        self.nodes.get(*root_id)
     }
 
     /// Spawns the template node tree into Bevy UI nodes.
@@ -314,9 +377,16 @@ impl BevueTemplate {
             .map(|_| commands.spawn_empty().id())
             .collect();
 
+        let root_id = self.root_index().unwrap_or(NodeId(0));
+        let root_entity = entities[*root_id];
+
         for (i, node) in self.nodes.iter().enumerate() {
             let entity = entities[i];
             let mut entity_commands = commands.entity(entity);
+            entity_commands.insert(TemplateRef {
+                root: root_entity,
+                node: NodeId(i),
+            });
             match &node.element {
                 ElementType::Native(_) => {
                     entity_commands.insert(bevy::ui::Node::default());
@@ -332,15 +402,15 @@ impl BevueTemplate {
                 }
                 entity_commands.insert(bevy::ui::widget::Text::new(acc));
             }
-            for &child_idx in &node.children {
-                if child_idx < entities.len() {
-                    commands.entity(entities[child_idx]).insert(ChildOf(entity));
+            for &child_id in &node.children {
+                if *child_id < entities.len() {
+                    commands.entity(entities[*child_id]).insert(ChildOf(entity));
                 }
             }
         }
 
-        let root_idx = self.root_index().unwrap_or(0);
-        entities[root_idx]
+        let root_id = self.root_index().unwrap_or(NodeId(0));
+        entities[*root_id]
     }
 }
 
@@ -368,8 +438,7 @@ impl From<Vec<TemplateNode>> for BevueTemplate {
 #[cfg(test)]
 mod test {
     use crate::core::template::{
-        BevueTemplate, ConditionDirective, Expression, Identifier, ListDirective, TemplateNode,
-        TemplateText,
+        BevueTemplate, ConditionDirective, Expression, Identifier, ListDirective, TemplateNode, NodeId, TemplateText,
     };
 
     #[test]
@@ -377,7 +446,7 @@ mod test {
         let template = BevueTemplate::new(vec![
             TemplateNode::new("div")
                 .with_condition(ConditionDirective::new(Identifier::new("active")))
-                .with_child(1),
+                .with_child(NodeId(1)),
             TemplateNode::new("p")
                 .with_list(ListDirective::new("item", Identifier::new("items")))
                 .with_text(TemplateText::new([
@@ -391,12 +460,12 @@ mod test {
                 ])),
         ]);
 
-        assert_eq!(template.root_index(), Some(0));
-        assert_eq!(template.children(0), &[1]);
-        assert_eq!(template.children(1), &[]);
-        let child_nodes: Vec<_> = template.child_nodes(0).collect();
+        assert_eq!(template.root_index(), Some(NodeId(0)));
+        assert_eq!(template.children(NodeId(0)), &[NodeId(1)]);
+        assert_eq!(template.children(NodeId(1)), &[]);
+        let child_nodes: Vec<_> = template.child_nodes(NodeId(0)).collect();
         assert_eq!(child_nodes.len(), 1);
-        assert_eq!(child_nodes[0].0, 1);
+        assert_eq!(child_nodes[0].0, NodeId(1));
         assert_eq!(child_nodes[0].1.element, "p".into());
     }
 }
