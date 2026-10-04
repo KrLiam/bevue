@@ -1,10 +1,66 @@
-use bevy::{ecs::{entity::Entity, error::FallbackErrorHandler, event::Event, hierarchy::{ChildOf, Children}, observer::On, query::QueryState, system::{Command, Commands, In, Local, Res, command::run_system_cached_with}, world::World}, ui::{Node, widget::Text}};
+use std::collections::HashSet;
 
-use crate::core::template::{ElementType, TemplateNode, TemplateText, TextFragment};
+use bevy::{
+    asset::{AssetEvent, AssetId, Assets, Handle},
+    ecs::{
+        component::Component,
+        entity::Entity,
+        error::FallbackErrorHandler,
+        event::Event,
+        hierarchy::ChildOf,
+        message::MessageReader,
+        observer::On,
+        query::{Changed, With},
+        system::{Command, Commands, In, Local, Query, Res, command::run_system_cached_with},
+        world::World,
+    },
+    ui::{Node, widget::Text},
+};
+
+use crate::core::template::{BevueTemplate, ElementType, TextFragment};
+
+#[derive(Component, Clone, Debug, PartialEq, Eq)]
+pub struct Template(pub Handle<BevueTemplate>);
+
+impl Template {
+    pub fn new(handle: Handle<BevueTemplate>) -> Self {
+        Self(handle)
+    }
+
+    pub fn handle(&self) -> &Handle<BevueTemplate> {
+        &self.0
+    }
+}
+
+impl From<Handle<BevueTemplate>> for Template {
+    fn from(handle: Handle<BevueTemplate>) -> Self {
+        Self(handle)
+    }
+}
+
+impl std::ops::Deref for Template {
+    type Target = Handle<BevueTemplate>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Template {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TemplateRendered(pub AssetId<BevueTemplate>);
+
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaitingForTemplate;
 
 #[derive(Event, Clone)]
 pub struct RenderTemplate {
-    pub template: Entity,
+    pub template: Handle<BevueTemplate>,
     pub ui_root: Option<Entity>,
 }
 
@@ -22,124 +78,209 @@ pub fn on_render_template(
     );
 }
 
+pub fn watch_template_components(
+    mut commands: Commands,
+    assets: Res<Assets<BevueTemplate>>,
+    mut asset_events: MessageReader<AssetEvent<BevueTemplate>>,
+    changed_templates: Query<(Entity, &Template), Changed<Template>>,
+    waiting_templates: Query<(Entity, &Template), With<WaitingForTemplate>>,
+    all_templates: Query<(Entity, &Template)>,
+) {
+    let mut triggered_entities = HashSet::new();
+
+    // 1. Process modified or reloaded asset events (for hot reload / file watching).
+    let mut modified_asset_ids = HashSet::new();
+    for event in asset_events.read() {
+        match event {
+            AssetEvent::Modified { id } | AssetEvent::LoadedWithDependencies { id } => {
+                modified_asset_ids.insert(id);
+            }
+            _ => {}
+        }
+    }
+
+    if !modified_asset_ids.is_empty() {
+        for (entity, template) in &all_templates {
+            if modified_asset_ids.contains(&template.0.id()) && assets.contains(&template.0) {
+                commands.trigger(RenderTemplate {
+                    template: template.0.clone(),
+                    ui_root: Some(entity),
+                });
+                commands.entity(entity).insert(TemplateRendered(template.0.id()));
+                commands.entity(entity).remove::<WaitingForTemplate>();
+                triggered_entities.insert(entity);
+            }
+        }
+    }
+
+    // 2. Process newly added or changed Template components.
+    for (entity, template) in &changed_templates {
+        if triggered_entities.contains(&entity) {
+            continue;
+        }
+
+        if assets.contains(&template.0) {
+            commands.trigger(RenderTemplate {
+                template: template.0.clone(),
+                ui_root: Some(entity),
+            });
+            commands.entity(entity).insert(TemplateRendered(template.0.id()));
+            commands.entity(entity).remove::<WaitingForTemplate>();
+            triggered_entities.insert(entity);
+        } else {
+            commands.entity(entity).insert(WaitingForTemplate);
+            commands.entity(entity).remove::<TemplateRendered>();
+        }
+    }
+
+    // 3. Process entities that are waiting for their asset to load.
+    for (entity, template) in &waiting_templates {
+        if triggered_entities.contains(&entity) {
+            continue;
+        }
+
+        if assets.contains(&template.0) {
+            commands.trigger(RenderTemplate {
+                template: template.0.clone(),
+                ui_root: Some(entity),
+            });
+            commands.entity(entity).insert(TemplateRendered(template.0.id()));
+            commands.entity(entity).remove::<WaitingForTemplate>();
+            triggered_entities.insert(entity);
+        }
+    }
+}
+
+pub type RenderStackItem = (usize, Option<Entity>, Option<Entity>);
+
 pub fn render_template(
     input: In<RenderTemplate>,
     world: &mut World,
-    mut templates: Local<QueryState<(&TemplateNode, Option<&TemplateText>, Option<&Children>), ()>>,
-    mut stack: Local<Vec<(Entity, Option<Entity>, Option<Entity>)>>,
+    mut stack: Local<Vec<RenderStackItem>>,
 ) {
     println!("Render template");
 
-    stack.clear();
-    stack.push((input.template, input.ui_root, None));
+    let template = {
+        let Some(templates) = world.get_resource::<Assets<BevueTemplate>>() else {
+            println!("Assets<BevueTemplate> resource not found");
+            return;
+        };
+        let Some(template) = templates.get(&input.template) else {
+            println!("BevueTemplate asset not loaded yet");
+            return;
+        };
+        template.clone()
+    };
 
-    while let Some((template_entity, node, parent_node)) = stack.pop() {
+    let Some(root_idx) = template.root_index() else {
+        return;
+    };
+
+    stack.clear();
+    stack.push((root_idx, input.ui_root, None));
+
+    while let Some((template_node_idx, node, parent_node)) = stack.pop() {
+        let Some(template_node) = template.get(template_node_idx) else {
+            continue;
+        };
+
         let node = match node {
             Some(entity) => {
                 world.entity_mut(entity).despawn_children();
                 entity
-            },
-            None => {
-                world.spawn_empty().id()
-            },
-        };
-        let Ok((template, template_text, children)) = templates.get(world, template_entity)
-        else { continue };
-
-        if let Some(children) = children {
-            for &child in children.iter().rev() {
-                stack.push((child, None, Some(node)));
             }
+            None => world.spawn_empty().id(),
+        };
+
+        for &child_idx in template.children(template_node_idx).iter().rev() {
+            stack.push((child_idx, None, Some(node)));
         }
 
         let mut text: Option<String> = None;
-        if let Some(template_text) = template_text {
+        if let Some(template_text) = &template_node.text {
             let mut acc = String::new();
             for fragment in &template_text.0 {
                 match fragment {
                     TextFragment::Literal(value) => {
                         acc.push_str(value);
-                    },
-                    TextFragment::Interpolated(_) => {
-                    },
+                    }
+                    TextFragment::Interpolated(_) => {}
                 }
             }
             text = Some(acc);
         }
 
-        match &template.element {
+        match &template_node.element {
             ElementType::Native(name) => {
                 println!("element {} {}", name, node);
 
+                let mut entity_mut = world.entity_mut(node);
                 if let Some(parent) = parent_node {
                     println!("parent: {parent}");
-                    world.entity_mut(node).insert((
-                        ChildOf(parent),
-                        Node::default(),
-                    ));
+                    entity_mut.insert(ChildOf(parent));
                 }
-                else {
-                    world.entity_mut(node).insert((
-                        Node::default(),
-                    ));
+                if !entity_mut.contains::<Node>() {
+                    entity_mut.insert(Node::default());
                 }
-            },
+            }
             ElementType::Component(_) => panic!("Components not supported yet."),
         }
 
         if let Some(text) = text {
             println!("text: '{text}'");
-            world.entity_mut(node).insert((
-                Text::new(text),
-            ));
+            world.entity_mut(node).insert(Text::new(text));
+        } else if parent_node.is_none() {
+            world.entity_mut(node).remove::<Text>();
         }
     }
 }
 
 #[cfg(test)]
 mod test {
-    use bevy::{MinimalPlugins, app::App, ecs::children};
+    use bevy::{
+        app::App,
+        asset::{AssetPlugin, Assets},
+        ecs::hierarchy::ChildOf,
+        ui::{Node, Val, widget::Text},
+        MinimalPlugins,
+    };
 
-    use crate::{core::template::{TemplateNode, TemplateText}, runtime::{BevueRuntimePlugin, render::RenderTemplate}};
+    use crate::{
+        core::template::{BevueTemplate, TemplateNode, TemplateText},
+        runtime::{
+            render::{RenderTemplate, Template, WaitingForTemplate},
+            BevueRuntimePlugin,
+        },
+    };
 
     #[test]
     fn render() {
         let mut app = App::new();
-        app.add_plugins((MinimalPlugins, BevueRuntimePlugin));
+        app.add_plugins((MinimalPlugins, AssetPlugin::default(), BevueRuntimePlugin));
         app.finish();
 
-        let world = app.world_mut();
+        let template = BevueTemplate::new(vec![
+            TemplateNode::new("div").with_child(1).with_child(4),
+            TemplateNode::new("div").with_child(2).with_child(3),
+            TemplateNode::new("span").with_text(TemplateText::new(["You".into()])),
+            TemplateNode::new("span").with_text(TemplateText::new(["!".into()])),
+            TemplateNode::new("p").with_text(TemplateText::new(["Hello.".into()])),
+        ]);
 
-        let template = world.spawn((
-            TemplateNode::new("div"),
-            children! [
-                (
-                    TemplateNode::new("div"),
-                    children! [
-                        (
-                            TemplateNode::new("span"),
-                            TemplateText::new(["You".into()]),
-                        ),
-                        (
-                            TemplateNode::new("span"),
-                            TemplateText::new(["!".into()]),
-                        )
-                    ]
-                ),
-                (
-                    TemplateNode::new("p"),
-                    TemplateText::new(["Hello.".into()]),
-                ),
-            ]
-        )).id();
-        world.trigger(RenderTemplate { template, ui_root: None });
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<BevueTemplate>>()
+            .add(template);
+
+        app.world_mut()
+            .trigger(RenderTemplate { template: handle, ui_root: None });
         app.update();
     }
 
     #[test]
     fn render_parsed() {
         let mut app = App::new();
-        app.add_plugins((MinimalPlugins, BevueRuntimePlugin));
+        app.add_plugins((MinimalPlugins, AssetPlugin::default(), BevueRuntimePlugin));
         app.finish();
 
         let source = r#"
@@ -149,12 +290,187 @@ mod test {
             </div>
         "#;
         let template = crate::parser::parse_template(source).unwrap();
-        let mut commands = app.world_mut().commands();
-        let root = template.spawn(&mut commands);
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<BevueTemplate>>()
+            .add(template);
+
+        app.world_mut()
+            .trigger(RenderTemplate { template: handle, ui_root: None });
+        app.update();
+    }
+
+    #[test]
+    fn test_template_component_renders_when_asset_loaded() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default(), BevueRuntimePlugin));
+        app.finish();
+
+        let template = BevueTemplate::new(vec![
+            TemplateNode::new("div").with_child(1).with_child(2),
+            TemplateNode::new("p").with_text(TemplateText::new(["Title".into()])),
+            TemplateNode::new("span").with_text(TemplateText::new(["Subtitle".into()])),
+        ]);
+
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<BevueTemplate>>()
+            .add(template);
+
+        let entity = app.world_mut().spawn(Template(handle)).id();
 
         app.update();
 
-        app.world_mut().trigger(RenderTemplate { template: root, ui_root: None });
+        // Check that children were spawned under `entity`
+        let mut children_texts = Vec::new();
+        let mut query = app.world_mut().query::<(Option<&Text>, &ChildOf)>();
+        for (text, child_of) in query.iter(app.world()) {
+            if child_of.0 == entity && let Some(t) = text {
+                children_texts.push(t.0.clone());
+            }
+        }
+
+        assert_eq!(children_texts.len(), 2);
+        assert!(children_texts.contains(&"Title".to_string()));
+        assert!(children_texts.contains(&"Subtitle".to_string()));
+        assert!(app.world().get::<WaitingForTemplate>(entity).is_none());
+    }
+
+    #[test]
+    fn test_template_component_waits_for_deferred_load() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default(), BevueRuntimePlugin));
+        app.finish();
+
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<BevueTemplate>>()
+            .reserve_handle();
+
+        let entity = app.world_mut().spawn(Template(handle.clone())).id();
+
+        // First update: asset is not loaded yet
         app.update();
+
+        assert!(app.world().get::<WaitingForTemplate>(entity).is_some());
+
+        let mut child_count = 0;
+        let mut query = app.world_mut().query::<&ChildOf>();
+        for child_of in query.iter(app.world()) {
+            if child_of.0 == entity {
+                child_count += 1;
+            }
+        }
+        assert_eq!(child_count, 0);
+
+        // Now load the asset into Assets<BevueTemplate>
+        let template = BevueTemplate::new(vec![
+            TemplateNode::new("div").with_child(1),
+            TemplateNode::new("h1").with_text(TemplateText::new(["Deferred".into()])),
+        ]);
+        let _ = app
+            .world_mut()
+            .resource_mut::<Assets<BevueTemplate>>()
+            .insert(&handle, template);
+
+        // Second update: should detect asset is loaded and render
+        app.update();
+
+        assert!(app.world().get::<WaitingForTemplate>(entity).is_none());
+
+        let mut texts = Vec::new();
+        let mut query = app.world_mut().query::<(Option<&Text>, &ChildOf)>();
+        for (text, child_of) in query.iter(app.world()) {
+            if child_of.0 == entity && let Some(t) = text {
+                texts.push(t.0.clone());
+            }
+        }
+        assert_eq!(texts, vec!["Deferred".to_string()]);
+    }
+
+    #[test]
+    fn test_template_component_watches_for_modifications() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default(), BevueRuntimePlugin));
+        app.finish();
+
+        let initial_template = BevueTemplate::new(vec![
+            TemplateNode::new("div").with_child(1),
+            TemplateNode::new("p").with_text(TemplateText::new(["Initial".into()])),
+        ]);
+
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<BevueTemplate>>()
+            .add(initial_template);
+
+        let entity = app.world_mut().spawn(Template(handle.clone())).id();
+        app.update();
+
+        let count_children = |app: &mut App| -> (usize, Vec<String>) {
+            let mut texts = Vec::new();
+            let mut count = 0;
+            let mut query = app.world_mut().query::<(Option<&Text>, &ChildOf)>();
+            for (text, child_of) in query.iter(app.world()) {
+                if child_of.0 == entity {
+                    count += 1;
+                    if let Some(t) = text {
+                        texts.push(t.0.clone());
+                    }
+                }
+            }
+            (count, texts)
+        };
+
+        let (count, texts) = count_children(&mut app);
+        assert_eq!(count, 1);
+        assert_eq!(texts, vec!["Initial".to_string()]);
+
+        // Modify the asset (simulating file watcher reload)
+        let updated_template = BevueTemplate::new(vec![
+            TemplateNode::new("div").with_child(1).with_child(2),
+            TemplateNode::new("p").with_text(TemplateText::new(["Updated 1".into()])),
+            TemplateNode::new("p").with_text(TemplateText::new(["Updated 2".into()])),
+        ]);
+        {
+            let mut assets = app.world_mut().resource_mut::<Assets<BevueTemplate>>();
+            let mut asset = assets.get_mut(&handle).unwrap();
+            *asset = updated_template;
+        }
+
+        // Update to trigger file watching re-render
+        app.update();
+
+        let (new_count, new_texts) = count_children(&mut app);
+        assert_eq!(new_count, 2);
+        assert_eq!(new_texts, vec!["Updated 1".to_string(), "Updated 2".to_string()]);
+    }
+
+    #[test]
+    fn test_template_preserves_custom_node() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default(), BevueRuntimePlugin));
+        app.finish();
+
+        let template = BevueTemplate::new(vec![
+            TemplateNode::new("div").with_child(1),
+            TemplateNode::new("span").with_text(TemplateText::new(["Content".into()])),
+        ]);
+
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<BevueTemplate>>()
+            .add(template);
+
+        let custom_node = Node {
+            left: Val::Px(42.0),
+            ..Default::default()
+        };
+
+        let entity = app.world_mut().spawn((custom_node, Template(handle))).id();
+        app.update();
+
+        let node = app.world().get::<Node>(entity).unwrap();
+        assert_eq!(node.left, Val::Px(42.0));
     }
 }

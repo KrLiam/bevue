@@ -1,3 +1,7 @@
+pub mod asset;
+pub mod core;
 pub mod parser;
 pub mod runtime;
-pub mod core;
+
+pub use runtime::Template;
+

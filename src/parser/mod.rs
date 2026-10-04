@@ -122,7 +122,7 @@ pub fn parse_template(source: &str) -> Result<BevueTemplate> {
     let dom = tl::parse(source, ParserOptions::default())
         .map_err(|e| ParseError::InvalidHtml(format!("{e:?}")))?;
 
-    let mut nodes: Vec<TemplateNodeData> = Vec::new();
+    let mut nodes: Vec<TemplateNode> = Vec::new();
     let mut stack: Vec<usize> = Vec::new();
     let mut ignore_depth: usize = 0;
 
@@ -176,16 +176,11 @@ pub fn parse_template(source: &str) -> Result<BevueTemplate> {
                     }
                 }
 
-                let node_data = TemplateNodeData {
-                    node: template_node,
-                    children: Vec::new(),
-                    text: None,
-                    list: list_directive,
-                    condition: condition_directive,
-                };
+                template_node.list = list_directive;
+                template_node.condition = condition_directive;
 
                 let node_idx = nodes.len();
-                nodes.push(node_data);
+                nodes.push(template_node);
 
                 if let Some(&parent_idx) = stack.last() {
                     nodes[parent_idx].children.push(node_idx);
@@ -262,27 +257,27 @@ mod test {
         assert_eq!(result.nodes.len(), 7);
 
         // Node 0: <layout>
-        assert_eq!(result.nodes[0].node.element, "layout".into());
+        assert_eq!(result.nodes[0].element, "layout".into());
         assert_eq!(result.nodes[0].children, vec![1]);
 
         // Node 1: <div class="context-menu-root">
-        assert_eq!(result.nodes[1].node.element, "div".into());
+        assert_eq!(result.nodes[1].element, "div".into());
         assert_eq!(
-            result.nodes[1].node.attributes,
+            result.nodes[1].attributes,
             vec![("class".into(), Expression::String("context-menu-root".into()))]
         );
         assert_eq!(result.nodes[1].children, vec![2]);
 
         // Node 2: <div class="wrapper">
-        assert_eq!(result.nodes[2].node.element, "div".into());
+        assert_eq!(result.nodes[2].element, "div".into());
         assert_eq!(result.nodes[2].children, vec![3, 5]);
 
         // Node 3: <div class="separator">
-        assert_eq!(result.nodes[3].node.element, "div".into());
+        assert_eq!(result.nodes[3].element, "div".into());
         assert_eq!(result.nodes[3].children, vec![4]);
 
         // Node 4: <p class="context-menu-title">{{menu.title}}</p>
-        assert_eq!(result.nodes[4].node.element, "p".into());
+        assert_eq!(result.nodes[4].element, "p".into());
         assert_eq!(result.nodes[4].children, vec![]);
         assert_eq!(
             result.nodes[4].text,
@@ -295,7 +290,7 @@ mod test {
         );
 
         // Node 5: <button v-for="action in menu.actions" :key="action.id">
-        assert_eq!(result.nodes[5].node.element, "button".into());
+        assert_eq!(result.nodes[5].element, "button".into());
         assert_eq!(
             result.nodes[5].list,
             Some(ListDirective::new(
@@ -307,7 +302,7 @@ mod test {
             ))
         );
         assert_eq!(
-            result.nodes[5].node.attributes,
+            result.nodes[5].attributes,
             vec![("key".into(), Expression::Access {
                 target: Box::new(Expression::Identifier("action".into())),
                 field: "id".into(),
@@ -316,7 +311,7 @@ mod test {
         assert_eq!(result.nodes[5].children, vec![6]);
 
         // Node 6: <span>{{action.label}}</span>
-        assert_eq!(result.nodes[6].node.element, "span".into());
+        assert_eq!(result.nodes[6].element, "span".into());
         assert_eq!(result.nodes[6].children, vec![]);
         assert_eq!(
             result.nodes[6].text,
@@ -327,6 +322,13 @@ mod test {
                 }
             )]))
         );
+
+        // Verify helper methods on BevueTemplate
+        assert_eq!(result.children(0), &[1]);
+        assert_eq!(result.children(2), &[3, 5]);
+        assert_eq!(result.children(6), &[]);
+        assert_eq!(result.root_index(), Some(0));
+        assert_eq!(result.root().unwrap().element, "layout".into());
     }
 
     #[test]
@@ -341,17 +343,14 @@ mod test {
 
         app.update();
 
-        // Verify root node exists and has TemplateNode
         let world = app.world();
-        assert!(world.get::<TemplateNode>(root).is_some());
-        assert_eq!(world.get::<TemplateNode>(root).unwrap().element, "layout".into());
+        assert!(world.get::<bevy::ui::Node>(root).is_some());
 
-        // Verify children were established
         let children = world.get::<Children>(root).expect("Root should have children");
         assert_eq!(children.len(), 1);
 
         let div_root = children[0];
-        assert_eq!(world.get::<TemplateNode>(div_root).unwrap().element, "div".into());
+        assert!(world.get::<bevy::ui::Node>(div_root).is_some());
         assert_eq!(
             world.get::<ChildOf>(div_root).expect("ChildOf parent").parent(),
             root
