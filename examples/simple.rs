@@ -5,7 +5,7 @@ use bevy::{DefaultPlugins, app::{App, Startup}, asset::AssetServer, camera::Came
 fn main() {
     let mut app = App::new();
 
-    app.add_plugins((DefaultPlugins, BevueAssetPlugin, BevueRuntimePlugin))
+    app.add_plugins((BevueAssetPlugin, DefaultPlugins, BevueRuntimePlugin))
         .add_systems(Startup, startup);
 
     app.run();

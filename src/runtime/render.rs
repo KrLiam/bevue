@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, path::Path};
 
 use bevy::{
     asset::{AssetEvent, AssetId, AssetServer, Assets, Handle},
@@ -18,6 +18,7 @@ use bevy::{
 };
 use bevy_flair::prelude::{ClassList, Styled, StyleSheet};
 
+use crate::asset::BevueAssetRegistry;
 use crate::core::template::{
     BevueTemplate, ElementType, Expression, NodeId, TemplateRef, TextFragment,
 };
@@ -241,7 +242,8 @@ pub fn render_template(
 
 pub fn apply_template_classes_and_styles(
     mut commands: Commands,
-    asset_server: Option<Res<AssetServer>>,
+    asset_server: Res<AssetServer>,
+    bevue_assets: Res<BevueAssetRegistry>,
     template_nodes: Query<(Entity, &TemplateRef), Changed<TemplateRef>>,
     root_templates: Query<&Template>,
     templates: Res<Assets<BevueTemplate>>,
@@ -266,14 +268,41 @@ pub fn apply_template_classes_and_styles(
             }
         }
 
-        // 2. If the entity is the root, also get the style data and if src is present, add the Styled component
+        // 2. If the entity is the root, also get the style data and if src or inline is present, add the Styled component
         if template_ref.root == entity
             && let Some(style) = &template_node.style
-            && let Some(src) = &style.src
-            && let Some(asset_server) = &asset_server
         {
-            let style_handle: Handle<StyleSheet> = asset_server.load(src.to_string());
-            commands.entity(entity).insert(Styled::new(style_handle));
+            let mut style_path = style.src.as_ref().map(|s| s.to_string());
+
+            let inline = style.inline.trim();
+            if !inline.is_empty() {
+                let html_path_str = if let Some(p) = root_template.0.path() {
+                    p.path().to_string_lossy().to_string()
+                } else {
+                    format!("inline_{entity}")
+                };
+
+                let css_file_name = format!("{html_path_str}.css");
+                let css_asset_path = format!("bevue://{css_file_name}");
+
+                let mut full_css = String::new();
+                if let Some(src) = &style.src {
+                    let import_stmt = format!("@import \"{src}\";\n");
+                    full_css.push_str(&import_stmt);
+                }
+                full_css.push_str(&style.inline);
+
+                let path = Path::new(&css_file_name);
+                bevue_assets.dir.insert_asset_text(path, &full_css);
+                asset_server.reload(&css_asset_path);
+
+                style_path = Some(css_asset_path);
+            }
+
+            if let Some(path) = style_path {
+                let style_handle: Handle<StyleSheet> = asset_server.load(path);
+                commands.entity(entity).insert(Styled::new(style_handle));
+            }
         }
     }
 }
@@ -579,22 +608,128 @@ mod test {
                 found_inner = true;
                 let classes = class_list.expect("Inner div must have ClassList");
                 assert!(classes.contains("inner"));
-                assert!(styled.is_none(), "Non-root node should not have Styled");
+                assert!(!matches!(styled, Some(Styled::StyleSheet(_))), "Non-root node should not have Styled::StyleSheet");
             } else if t_ref.node == NodeId(1) {
                 // <p>
                 found_p = true;
                 assert!(class_list.is_none(), "p has no class");
-                assert!(styled.is_none());
+                assert!(!matches!(styled, Some(Styled::StyleSheet(_))));
             } else if t_ref.node == NodeId(3) {
                 // <span>
                 found_span = true;
                 assert!(class_list.is_none(), "span has no class");
-                assert!(styled.is_none());
+                assert!(!matches!(styled, Some(Styled::StyleSheet(_))));
             }
         }
 
         assert!(found_inner);
         assert!(found_p);
         assert!(found_span);
+    }
+
+    #[test]
+    fn test_template_ref_inline_style() {
+        use bevy_flair::prelude::{ClassList, Styled};
+        use crate::core::template::{NodeId, TemplateRef};
+        use crate::asset::{BevueAssetPlugin, BevueAssetRegistry};
+
+        let mut app = App::new();
+        app.add_plugins((BevueAssetPlugin, MinimalPlugins, AssetPlugin::default(), BevueRuntimePlugin));
+        app.finish();
+
+        let source = r#"
+            <template>
+                <div class="root">
+                    <p>Hello!</p>
+                </div>
+            </template>
+
+            <style>
+                .root {
+                    background-color: red;
+                }
+            </style>
+        "#;
+        let template = crate::parser::parse_template(source).unwrap();
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<BevueTemplate>>()
+            .add(template);
+
+        let entity = app.world_mut().spawn(Template(handle)).id();
+        app.update();
+
+        // 1. Verify root entity
+        let root_ref = app.world().get::<TemplateRef>(entity).expect("Root must have TemplateRef");
+        assert_eq!(root_ref.root, entity);
+        assert_eq!(root_ref.node, NodeId(0));
+
+        let root_classes = app.world().get::<ClassList>(entity).expect("Root must have ClassList");
+        assert!(root_classes.contains("root"));
+
+        // 2. Verify root entity has Styled pointing to fabricated asset in bevue://
+        let root_styled = app.world().get::<Styled>(entity).expect("Root must have Styled component");
+        match root_styled {
+            Styled::StyleSheet(handle) => {
+                let path = handle.path().expect("Fabricated stylesheet must have an AssetPath");
+                assert_eq!(path.source().as_str(), Some("bevue"));
+                assert!(path.path().to_string_lossy().ends_with(".css"));
+
+                // Verify file content in BevueAssetRegistry
+                let registry = app.world().resource::<BevueAssetRegistry>();
+                let asset_data = registry.get_asset(path.path()).expect("Asset must exist in BevueAssetRegistry");
+                let css_text = std::str::from_utf8(asset_data.value()).unwrap();
+                assert!(css_text.contains(".root"));
+                assert!(css_text.contains("background-color: red;"));
+            }
+            _ => panic!("Expected Styled::StyleSheet"),
+        }
+    }
+
+    #[test]
+    fn test_template_ref_inline_and_src_style() {
+        use bevy_flair::prelude::Styled;
+        use crate::asset::{BevueAssetPlugin, BevueAssetRegistry};
+
+        let mut app = App::new();
+        app.add_plugins((BevueAssetPlugin, MinimalPlugins, AssetPlugin::default(), BevueRuntimePlugin));
+        app.finish();
+
+        let source = r#"
+            <template>
+                <div class="root">
+                    <p>Hello!</p>
+                </div>
+            </template>
+
+            <style src="shared.css">
+                .root {
+                    color: blue;
+                }
+            </style>
+        "#;
+        let template = crate::parser::parse_template(source).unwrap();
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<BevueTemplate>>()
+            .add(template);
+
+        let entity = app.world_mut().spawn(Template(handle)).id();
+        app.update();
+
+        let root_styled = app.world().get::<Styled>(entity).expect("Root must have Styled component");
+        match root_styled {
+            Styled::StyleSheet(handle) => {
+                let path = handle.path().expect("Fabricated stylesheet must have an AssetPath");
+                assert_eq!(path.source().as_str(), Some("bevue"));
+
+                let registry = app.world().resource::<BevueAssetRegistry>();
+                let asset_data = registry.get_asset(path.path()).expect("Asset must exist in BevueAssetRegistry");
+                let css_text = std::str::from_utf8(asset_data.value()).unwrap();
+                assert!(css_text.contains("@import \"shared.css\";"));
+                assert!(css_text.contains("color: blue;"));
+            }
+            _ => panic!("Expected Styled::StyleSheet"),
+        }
     }
 }

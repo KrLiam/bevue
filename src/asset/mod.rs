@@ -1,8 +1,18 @@
+use std::ops::{Deref, DerefMut};
+
 use bevy::{
     app::{App, Plugin},
-    asset::{io::Reader, AssetApp, AssetLoader, LoadContext},
+    asset::{
+        io::{
+            memory::{Dir, MemoryAssetReader},
+            AssetSourceBuilder, Reader,
+        },
+        AssetApp, AssetLoader, AssetServer, Assets, LoadContext,
+    },
+    ecs::resource::Resource,
     reflect::TypePath,
 };
+use bevy_flair::style::StyleSheet;
 
 use crate::{core::template::BevueTemplate, parser::parse_template};
 
@@ -70,13 +80,73 @@ impl AssetLoader for BevueTemplateLoader {
     }
 }
 
-/// Plugin that initializes the `BevueTemplate` asset and registers its loader.
+/// Resource storing an in-memory virtual filesystem [`Dir`] for Bevue assets (such as fabricated CSS stylesheets).
+#[derive(Resource, Clone, Default, Debug)]
+pub struct BevueAssetRegistry {
+    pub dir: Dir,
+}
+
+impl BevueAssetRegistry {
+    pub fn new() -> Self {
+        Self {
+            dir: Dir::default(),
+        }
+    }
+}
+
+impl Deref for BevueAssetRegistry {
+    type Target = Dir;
+
+    fn deref(&self) -> &Self::Target {
+        &self.dir
+    }
+}
+
+impl DerefMut for BevueAssetRegistry {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.dir
+    }
+}
+
+pub type BevueAssets = BevueAssetRegistry;
+
+/// Plugin that initializes the `BevueTemplate` asset, registers the `"bevue"` virtual asset source, and registers its loader.
 pub struct BevueAssetPlugin;
 
 impl Plugin for BevueAssetPlugin {
     fn build(&self, app: &mut App) {
-        app.init_asset::<BevueTemplate>()
-            .register_asset_loader(BevueTemplateLoader);
+        let registry = app
+            .world()
+            .get_resource::<BevueAssetRegistry>()
+            .cloned()
+            .unwrap_or_default();
+
+        let dir = registry.dir.clone();
+        app.register_asset_source(
+            "bevue",
+            AssetSourceBuilder::new(move || Box::new(MemoryAssetReader { root: dir.clone() })),
+        );
+        app.insert_resource(registry);
+
+        if app.world().get_resource::<AssetServer>().is_some() {
+            Self::init_assets(app);
+        }
+    }
+
+    fn finish(&self, app: &mut App) {
+        Self::init_assets(app);
+    }
+}
+
+impl BevueAssetPlugin {
+    fn init_assets(app: &mut App) {
+        if !app.world().contains_resource::<Assets<BevueTemplate>>() {
+            app.init_asset::<BevueTemplate>()
+                .register_asset_loader(BevueTemplateLoader);
+        }
+        if !app.world().contains_resource::<Assets<StyleSheet>>() {
+            app.init_asset::<StyleSheet>();
+        }
     }
 }
 
@@ -84,18 +154,41 @@ impl Plugin for BevueAssetPlugin {
 mod tests {
     use super::*;
     use bevy::{
-        asset::{AssetPlugin, AssetServer, Assets},
+        asset::{AssetPlugin, AssetServer, Assets, Handle},
         MinimalPlugins,
     };
 
     #[test]
     fn test_asset_loader_registered() {
         let mut app = App::new();
-        app.add_plugins((MinimalPlugins, AssetPlugin::default(), BevueAssetPlugin));
+        app.add_plugins((BevueAssetPlugin, MinimalPlugins, AssetPlugin::default()));
         app.finish();
 
         let world = app.world();
         assert!(world.contains_resource::<Assets<BevueTemplate>>());
         assert!(world.contains_resource::<AssetServer>());
+        assert!(world.contains_resource::<BevueAssetRegistry>());
+    }
+
+    #[test]
+    fn test_bevue_asset_source_registered() {
+        let mut app = App::new();
+        app.add_plugins((BevueAssetPlugin, MinimalPlugins, AssetPlugin::default()));
+        app.finish();
+
+        let registry = app.world().resource::<BevueAssetRegistry>();
+        registry.dir.insert_asset_text(
+            std::path::Path::new("test.html.css"),
+            ".root { color: red; }",
+        );
+
+        let asset_server = app.world().resource::<AssetServer>();
+        let handle: Handle<bevy_flair::style::StyleSheet> =
+            asset_server.load("bevue://test.html.css");
+        assert_eq!(handle.path().unwrap().source().as_str(), Some("bevue"));
+        assert_eq!(
+            handle.path().unwrap().path(),
+            std::path::Path::new("test.html.css")
+        );
     }
 }

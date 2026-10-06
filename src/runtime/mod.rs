@@ -1,7 +1,5 @@
 use bevy::{
-    app::{App, Plugin, PostUpdate},
-    asset::AssetEventSystems,
-    ecs::schedule::IntoScheduleConfigs,
+    app::{App, Plugin, PostUpdate}, asset::AssetEventSystems, ecs::{message::Messages, schedule::IntoScheduleConfigs}, window::{RequestRedraw, WindowEvent},
 };
 use bevy_flair::{FlairPlugin, parser::FlairCssParserPlugin};
 
@@ -26,6 +24,8 @@ impl Plugin for BevueRuntimePlugin {
         if !app.is_plugin_added::<FlairCssParserPlugin>() {
             app.add_plugins(FlairPlugin);
         }
+        app.init_resource::<Messages<WindowEvent>>();
+        app.init_resource::<Messages<RequestRedraw>>();
         app.add_observer(on_render_template);
         app.add_systems(
             PostUpdate,
