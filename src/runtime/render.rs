@@ -1,4 +1,4 @@
-use std::{collections::HashSet, path::Path, sync::Arc};
+use std::{borrow::Cow, collections::HashSet, path::Path, sync::Arc};
 
 use bevy::{
     asset::{AssetEvent, AssetId, AssetServer, Assets, Handle},
@@ -10,9 +10,10 @@ use bevy::{
         event::Event,
         message::MessageReader,
         observer::On,
+        lifecycle::HookContext,
         query::{Changed, QueryState, With},
-        system::{Command, Commands, In, Query, Res, command::run_system_cached_with},
-        world::World,
+        system::{Command, Commands, In, IntoSystem, Query, Res, command::run_system_cached_with},
+        world::{DeferredWorld, World},
     },
     log::{error, warn},
 };
@@ -21,25 +22,115 @@ use bevy_flair::prelude::{Styled, StyleSheet};
 use crate::asset::BevueAssetRegistry;
 use crate::core::template::{BevueTemplate, TemplateRef};
 use crate::core::value::Value;
-use crate::runtime::{instance::TemplateInstance, props::BevueProps};
+use crate::runtime::{
+    functions::{
+        assert_not_reserved, box_function, BevueCtx, BevueFunctionFactory, BoxedBevueFunction, TemplateFunctions,
+    },
+    instance::TemplateInstance,
+    props::BevueProps,
+};
 
-#[derive(Component, Clone, Debug, PartialEq, Eq)]
-pub struct Template(pub Handle<BevueTemplate>);
+/// Renders a [`BevueTemplate`] asset under this entity.
+#[derive(Component, Clone)]
+#[component(on_insert = register_template_functions, on_discard = unregister_template_functions)]
+pub struct Template {
+    pub handle: Handle<BevueTemplate>,
+    /// Functions only this template can call, registered while the component is present.
+    functions: Vec<(Cow<'static, str>, BevueFunctionFactory)>,
+}
 
 impl Template {
     pub fn new(handle: Handle<BevueTemplate>) -> Self {
-        Self(handle)
+        Self { handle, functions: Vec::new() }
     }
 
     pub fn handle(&self) -> &Handle<BevueTemplate> {
-        &self.0
+        &self.handle
+    }
+
+    /// Makes `system` callable as `name(...)` from this template only, taking precedence over a
+    /// global function of the same name. The system is registered when the component is inserted
+    /// and unregistered when it is removed or replaced. Panics if `name` starts with `$`.
+    pub fn with_function<O, M>(
+        mut self,
+        name: impl Into<Cow<'static, str>>,
+        system: impl IntoSystem<In<BevueCtx>, O, M> + Clone + Send + Sync + 'static,
+    ) -> Self
+    where
+        O: Into<Value> + 'static,
+    {
+        let name = name.into();
+        assert_not_reserved(&name);
+        let factory: BevueFunctionFactory = Arc::new(move || box_function(system.clone()));
+        self.functions.retain(|(existing, _)| *existing != name);
+        self.functions.push((name, factory));
+        self
+    }
+
+    /// The names of the functions registered with [`Template::with_function`].
+    pub fn function_names(&self) -> impl Iterator<Item = &str> {
+        self.functions.iter().map(|(name, _)| name.as_ref())
+    }
+}
+
+impl PartialEq for Template {
+    fn eq(&self, other: &Self) -> bool {
+        self.handle == other.handle && self.function_names().eq(other.function_names())
+    }
+}
+
+impl Eq for Template {}
+
+impl std::fmt::Debug for Template {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Template")
+            .field("handle", &self.handle)
+            .field("functions", &self.function_names().collect::<Vec<_>>())
+            .finish()
     }
 }
 
 impl From<Handle<BevueTemplate>> for Template {
     fn from(handle: Handle<BevueTemplate>) -> Self {
-        Self(handle)
+        Self::new(handle)
     }
+}
+
+/// Registers the template's own functions as one-shot systems in a [`TemplateFunctions`].
+fn register_template_functions(mut world: DeferredWorld, ctx: HookContext) {
+    let Some(template) = world.get::<Template>(ctx.entity) else { return };
+    if template.functions.is_empty() {
+        return;
+    }
+    let systems: Vec<(String, BoxedBevueFunction)> =
+        template.functions.iter().map(|(name, factory)| (name.to_string(), factory())).collect();
+    let entity = ctx.entity;
+    world.commands().queue(move |world: &mut World| {
+        let mut functions = TemplateFunctions::default();
+        for (name, system) in systems {
+            functions.0.insert(name, world.register_boxed_system(system));
+        }
+        match world.get_entity_mut(entity) {
+            Ok(mut entity) => {
+                entity.insert(functions);
+            }
+            Err(_) => {
+                for id in functions.0.into_values() {
+                    let _ = world.unregister_system(id);
+                }
+            }
+        }
+    });
+}
+
+/// Removes the template's functions; [`TemplateFunctions`] unregisters them when removed.
+fn unregister_template_functions(mut world: DeferredWorld, ctx: HookContext) {
+    let entity = ctx.entity;
+    world.commands().queue(move |world: &mut World| {
+        if let Ok(mut entity) = world.get_entity_mut(entity) {
+            entity.remove::<TemplateFunctions>();
+        }
+    });
 }
 
 
@@ -90,12 +181,12 @@ pub fn watch_template_components(
 
     if !modified_asset_ids.is_empty() {
         for (entity, template) in &all_templates {
-            if modified_asset_ids.contains(&template.0.id()) && assets.contains(&template.0) {
+            if modified_asset_ids.contains(&template.handle.id()) && assets.contains(&template.handle) {
                 commands.trigger(RenderTemplate {
-                    template: template.0.clone(),
+                    template: template.handle.clone(),
                     ui_root: Some(entity),
                 });
-                commands.entity(entity).insert(TemplateRendered(template.0.id()));
+                commands.entity(entity).insert(TemplateRendered(template.handle.id()));
                 commands.entity(entity).remove::<WaitingForTemplate>();
                 triggered_entities.insert(entity);
             }
@@ -108,12 +199,12 @@ pub fn watch_template_components(
             continue;
         }
 
-        if assets.contains(&template.0) {
+        if assets.contains(&template.handle) {
             commands.trigger(RenderTemplate {
-                template: template.0.clone(),
+                template: template.handle.clone(),
                 ui_root: Some(entity),
             });
-            commands.entity(entity).insert(TemplateRendered(template.0.id()));
+            commands.entity(entity).insert(TemplateRendered(template.handle.id()));
             commands.entity(entity).remove::<WaitingForTemplate>();
             triggered_entities.insert(entity);
         } else {
@@ -128,12 +219,12 @@ pub fn watch_template_components(
             continue;
         }
 
-        if assets.contains(&template.0) {
+        if assets.contains(&template.handle) {
             commands.trigger(RenderTemplate {
-                template: template.0.clone(),
+                template: template.handle.clone(),
                 ui_root: Some(entity),
             });
-            commands.entity(entity).insert(TemplateRendered(template.0.id()));
+            commands.entity(entity).insert(TemplateRendered(template.handle.id()));
             commands.entity(entity).remove::<WaitingForTemplate>();
             triggered_entities.insert(entity);
         }
@@ -160,7 +251,7 @@ pub fn render_template(input: In<RenderTemplate>, world: &mut World) {
 
     let mut root = world.entity_mut(root_entity);
     if !root.contains::<Template>() {
-        root.insert(Template(input.template.clone()));
+        root.insert(Template::new(input.template.clone()));
     }
     // Discard any previous render (e.g. on hot reload).
     root.remove::<TemplateInstance>();
@@ -208,7 +299,7 @@ pub fn update_templates(
 }
 
 /// Takes the props value out of `entity` without triggering change detection.
-fn take_props(world: &mut World, entity: Entity) -> Value {
+pub(crate) fn take_props(world: &mut World, entity: Entity) -> Value {
     world
         .get_mut::<BevueProps>(entity)
         .map(|mut props| std::mem::take(&mut props.bypass_change_detection().value))
@@ -216,7 +307,7 @@ fn take_props(world: &mut World, entity: Entity) -> Value {
 }
 
 /// Puts back a value taken with [`take_props`].
-fn restore_props(world: &mut World, entity: Entity, value: Value) {
+pub(crate) fn restore_props(world: &mut World, entity: Entity, value: Value) {
     if let Some(mut props) = world.get_mut::<BevueProps>(entity) {
         props.bypass_change_detection().value = value;
     }
@@ -239,7 +330,7 @@ pub fn apply_template_classes_and_styles(
         let Ok(root_template) = root_templates.get(entity) else {
             continue;
         };
-        let Some(template) = templates.get(&root_template.0) else {
+        let Some(template) = templates.get(&root_template.handle) else {
             continue;
         };
         let Some(style) = template.get(template_ref.node).and_then(|node| node.style.as_ref()) else {
@@ -250,7 +341,7 @@ pub fn apply_template_classes_and_styles(
 
         let inline = style.inline.trim();
         if !inline.is_empty() {
-            let html_path_str = if let Some(p) = root_template.0.path() {
+            let html_path_str = if let Some(p) = root_template.handle.path() {
                 p.path().to_string_lossy().to_string()
             } else {
                 format!("inline_{entity}")
@@ -363,7 +454,7 @@ mod test {
             .resource_mut::<Assets<BevueTemplate>>()
             .add(template);
 
-        let entity = app.world_mut().spawn(Template(handle)).id();
+        let entity = app.world_mut().spawn(Template::new(handle)).id();
 
         app.update();
 
@@ -393,7 +484,7 @@ mod test {
             .resource_mut::<Assets<BevueTemplate>>()
             .reserve_handle();
 
-        let entity = app.world_mut().spawn(Template(handle.clone())).id();
+        let entity = app.world_mut().spawn(Template::new(handle.clone())).id();
 
         // First update: asset is not loaded yet
         app.update();
@@ -450,7 +541,7 @@ mod test {
             .resource_mut::<Assets<BevueTemplate>>()
             .add(initial_template);
 
-        let entity = app.world_mut().spawn(Template(handle.clone())).id();
+        let entity = app.world_mut().spawn(Template::new(handle.clone())).id();
         app.update();
 
         let count_children = |app: &mut App| -> (usize, Vec<String>) {
@@ -513,7 +604,7 @@ mod test {
             ..Default::default()
         };
 
-        let entity = app.world_mut().spawn((custom_node, Template(handle))).id();
+        let entity = app.world_mut().spawn((custom_node, Template::new(handle))).id();
         app.update();
 
         let node = app.world().get::<Node>(entity).unwrap();
@@ -548,7 +639,7 @@ mod test {
             .resource_mut::<Assets<BevueTemplate>>()
             .add(template);
 
-        let entity = app.world_mut().spawn(Template(handle)).id();
+        let entity = app.world_mut().spawn(Template::new(handle)).id();
         app.update();
 
         // 1. Verify root entity
@@ -629,7 +720,7 @@ mod test {
             .resource_mut::<Assets<BevueTemplate>>()
             .add(template);
 
-        let entity = app.world_mut().spawn(Template(handle)).id();
+        let entity = app.world_mut().spawn(Template::new(handle)).id();
         app.update();
 
         // 1. Verify root entity
@@ -687,7 +778,7 @@ mod test {
             .resource_mut::<Assets<BevueTemplate>>()
             .add(template);
 
-        let entity = app.world_mut().spawn(Template(handle)).id();
+        let entity = app.world_mut().spawn(Template::new(handle)).id();
         app.update();
 
         let root_styled = app.world().get::<Styled>(entity).expect("Root must have Styled component");

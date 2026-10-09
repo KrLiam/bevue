@@ -3,8 +3,11 @@
         <p>Hello! {{ counter.seconds }}s</p>
         <p v-if="counter.even">Even second</p>
         <p v-else>Odd second</p>
-        <div class="button" v-for="item in counter.items" :key="item">
-            <span>{{ item }}</span>
+        <div class="button" @click="add_item()">
+            <span>Add item</span>
+        </div>
+        <div class="item" v-for="item in counter.items" :key="item">
+            <span>{{ label(item) }}</span>
         </div>
     </div>
 </template>
@@ -21,6 +24,15 @@
 }
 
 .button {
+    padding: 5px 10px;
+    background-color: white;
+}
+
+.button:hover {
+    background-color: lightgray;
+}
+
+.item {
     padding: 5px 10px;
     background-color: white;
 }

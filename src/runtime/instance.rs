@@ -17,19 +17,29 @@ use std::{
 
 use bevy::{
     ecs::{component::Component, entity::Entity, hierarchy::ChildOf, world::World},
-    ui::{Node, widget::Text},
+    ui::{Interaction, Node, widget::Text},
 };
 use bevy_flair::prelude::ClassList;
 
 use crate::{
     core::{
-        compile::{CompileError, CompiledExpr, CompiledSegment, CompiledTemplate, IfChain, ScopeRef, Slot},
+        compile::{
+            CompileError, CompiledExpr, CompiledHandler, CompiledSegment, CompiledTemplate, IfChain, ScopeRef, Slot,
+        },
         path::PathSegment,
         template::{BevueTemplate, NodeId, TemplateRef},
         value::{ChangeFlags, Value},
     },
-    runtime::interpolation::{class_names, eval, eval_path, render_text, Frame},
+    runtime::{
+        functions::call_function,
+        interpolation::{class_names, eval, eval_path, no_calls, render_text, EvalCtx, Frame, FrameElement},
+    },
 };
+
+/// A function caller for expressions evaluated on `entity` of the template rooted at `root`.
+fn caller(world: &mut World, root: Entity, entity: Entity) -> impl FnMut(&str, Vec<Value>) -> Value + '_ {
+    move |name: &str, args: Vec<Value>| call_function(world, root, entity, name, args)
+}
 
 // Arena
 
@@ -217,6 +227,9 @@ struct ForBlock {
     binding: Option<BindingId>,
     /// Where element changes are routed from, if the iterable is a static path.
     route: Option<(TrieOwner, Vec<PathSegment>)>,
+    /// The elements of an iterable that is not a prop path (e.g. `sorted(items)`), as computed
+    /// by the last reconcile.
+    computed: Option<Arc<[Value]>>,
 }
 
 enum Block {
@@ -272,6 +285,8 @@ pub struct TemplateInstance {
     blocks: Arena<Block>,
     items: Arena<Item>,
     elements: HashMap<Entity, Vec<SlotState>>,
+    /// Nodes with event listeners: their template node and `v-for` scope.
+    listeners: HashMap<Entity, (NodeId, Vec<ItemId>)>,
 }
 
 impl Default for TemplateInstance {
@@ -286,6 +301,7 @@ impl Default for TemplateInstance {
             blocks: Arena::default(),
             items: Arena::default(),
             elements: HashMap::new(),
+            listeners: HashMap::new(),
         }
     }
 }
@@ -348,7 +364,7 @@ impl TemplateInstance {
                 self.reconcile(world, props, &mut pending, block, force);
             }
             for (block_id, index) in routed {
-                self.walk_item(props, &mut pending, block_id, index);
+                self.walk_item(world, props, &mut pending, block_id, index);
             }
         }
 
@@ -365,7 +381,7 @@ impl TemplateInstance {
     }
 
     /// Walks the element at `index` of a list against the item rendering it.
-    fn walk_item(&mut self, props: &Value, pending: &mut Pending, block_id: BlockId, index: usize) {
+    fn walk_item(&mut self, world: &mut World, props: &Value, pending: &mut Pending, block_id: BlockId, index: usize) {
         if pending.force_full.contains(&block_id) {
             return;
         }
@@ -374,9 +390,12 @@ impl TemplateInstance {
         if pending.fresh.contains(&item_id) {
             return;
         }
-        let frames = self.frames(&block.scope, props);
-        let list = self.compiled.get(block.node).list.as_ref().unwrap();
-        let Some(path) = eval_path(&list.iterable, &frames, props) else { return };
+        let compiled = self.compiled.clone();
+        let list = compiled.get(block.node).list.as_ref().unwrap();
+        let parent = block.parent;
+        let frames = self.frames(world, &block.scope, props);
+        let mut call = caller(world, self.root, parent);
+        let Some(path) = eval_path(&list.iterable, &mut EvalCtx::new(&frames, props, &mut call)) else { return };
         let Some(element) = props.at(&path.join(index)) else { return };
         let keyed = block.keyed;
         let block_binding = block.binding;
@@ -388,8 +407,8 @@ impl TemplateInstance {
         // identity keeps following keys.
         if keyed && let Some(key_expr) = &list.key {
             let mut key_frames = frames;
-            key_frames.push(Frame { path: path.join(index), index });
-            let key = eval(key_expr, &key_frames, props).to_string();
+            key_frames.push(Frame::path(path.join(index), index));
+            let key = eval(key_expr, &mut EvalCtx::new(&key_frames, props, &mut call)).to_string();
             if key != item.key
                 && let Some(binding) = block_binding
             {
@@ -426,10 +445,19 @@ impl TemplateInstance {
             entity_mut.insert(ChildOf(parent));
             self.owned_mut(owner).elements.push(entity);
         }
+        // `Node` requires `FocusPolicy::Pass`, so every listening node under the cursor gets its own
+        // `Interaction`, like DOM events reaching all ancestors.
+        if node.interactive() && !entity_mut.contains::<Interaction>() {
+            entity_mut.insert(Interaction::default());
+        }
+        if !node.listeners.is_empty() {
+            self.listeners.insert(entity, (node_id, scope.to_vec()));
+        }
 
         match &node.text {
             Some(text) if text.is_static() => {
-                world.entity_mut(entity).insert(Text::new(render_text(text, &[], props)));
+                let text = render_text(text, &mut EvalCtx::new(&[], props, &mut no_calls));
+                world.entity_mut(entity).insert(Text::new(text));
             }
             Some(text) => {
                 let exprs = text.0.iter().filter_map(|f| match f {
@@ -449,7 +477,7 @@ impl TemplateInstance {
             let id = self.add_binding(entity, node_id, BindingKind::Class, scope, owner, node.classes.iter(), DepMode::Deep);
             self.apply(world, props, id);
         } else if !node.classes.is_empty() {
-            let names = class_names(&node.classes, &[], props);
+            let names = class_names(&node.classes, &mut EvalCtx::new(&[], props, &mut no_calls));
             world.entity_mut(entity).insert(ClassList::new_with_classes(names));
         }
 
@@ -491,6 +519,7 @@ impl TemplateInstance {
                         keyed,
                         binding: None,
                         route: None,
+                        computed: None,
                     }));
                     self.owned_mut(owner).blocks.push(block);
 
@@ -537,12 +566,12 @@ impl TemplateInstance {
     /// Re-evaluates an if-chain and swaps the rendered branch if it changed.
     fn update_if(&mut self, world: &mut World, props: &Value, pending: &mut Pending, block_id: BlockId) {
         let Some(Block::If(block)) = self.blocks.get(block_id) else { return };
-        let frames = self.frames(&block.scope, props);
-        let active = block
-            .chain
-            .0
-            .iter()
-            .position(|(cond, _)| cond.as_ref().is_none_or(|c| eval(c, &frames, props).is_truthy()));
+        let frames = self.frames(world, &block.scope, props);
+        let active = {
+            let mut call = caller(world, self.root, block.parent);
+            let mut ctx = EvalCtx::new(&frames, props, &mut call);
+            block.chain.0.iter().position(|(cond, _)| cond.as_ref().is_none_or(|c| eval(c, &mut ctx).is_truthy()))
+        };
         if active == block.active {
             return;
         }
@@ -578,21 +607,39 @@ impl TemplateInstance {
         let compiled = self.compiled.clone();
         let Some(Block::For(block)) = self.blocks.get(block_id) else { return };
         let list = compiled.get(block.node).list.as_ref().unwrap();
-        let frames = self.frames(&block.scope, props);
-        let base = eval_path(&list.iterable, &frames, props).unwrap_or_default();
-        let iterable = eval(&list.iterable, &frames, props);
+        let frames = self.frames(world, &block.scope, props);
+        let mut call = caller(world, self.root, block.parent);
+
+        // An iterable that is a prop path is read in place; anything else (a call) is computed
+        // and cached for the items' frames.
+        let mut ctx = EvalCtx::new(&frames, props, &mut call);
+        let base = eval_path(&list.iterable, &mut ctx);
+        let iterable = eval(&list.iterable, &mut ctx);
         let elements: &[Value] = iterable.as_list().map(Vec::as_slice).unwrap_or(&[]);
+        let computed: Option<Arc<[Value]>> = match base {
+            Some(_) => None,
+            None => Some(Arc::from(elements.to_vec())),
+        };
+        let element_frame = |index: usize| match (&base, &computed) {
+            (Some(base), _) => Frame::path(base.join(index), index),
+            (None, Some(list)) => Frame { element: FrameElement::Value(list.clone()), index },
+            (None, None) => unreachable!(),
+        };
 
         let keys: Vec<String> = (0..elements.len())
             .map(|i| match &list.key {
                 Some(key) => {
                     let mut key_frames = frames.clone();
-                    key_frames.push(Frame { path: base.join(i), index: i });
-                    eval(key, &key_frames, props).to_string()
+                    key_frames.push(element_frame(i));
+                    eval(key, &mut EvalCtx::new(&key_frames, props, &mut call)).to_string()
                 }
                 None => format!("#{i}"),
             })
             .collect();
+        drop(call);
+        // Items of an iterable that is not a static path get no element routing, so reused
+        // items must always be re-evaluated.
+        let force = force || block.route.is_none();
 
         let mut by_key: HashMap<String, VecDeque<ItemId>> = HashMap::new();
         for &item_id in &block.items {
@@ -608,6 +655,9 @@ impl TemplateInstance {
         let node = block.node;
         let scope = block.scope.clone();
 
+        if let Some(Block::For(block)) = self.blocks.get_mut(block_id) {
+            block.computed = computed;
+        }
         for item_id in removed {
             self.remove_item(world, item_id);
         }
@@ -703,8 +753,10 @@ impl TemplateInstance {
         let node = self.compiled.get(binding.node);
         match binding.kind {
             BindingKind::Text => {
-                let frames = self.frames(&binding.scope, props);
-                let text = render_text(node.text.as_ref().unwrap(), &frames, props);
+                let frames = self.frames(world, &binding.scope, props);
+                let mut call = caller(world, self.root, binding.entity);
+                let text = render_text(node.text.as_ref().unwrap(), &mut EvalCtx::new(&frames, props, &mut call));
+                drop(call);
                 let Ok(mut entity) = world.get_entity_mut(binding.entity) else { return };
                 match entity.get_mut::<Text>() {
                     Some(mut current) => {
@@ -718,8 +770,11 @@ impl TemplateInstance {
                 }
             }
             BindingKind::Class => {
-                let frames = self.frames(&binding.scope, props);
-                let classes = ClassList::new_with_classes(class_names(&node.classes, &frames, props));
+                let frames = self.frames(world, &binding.scope, props);
+                let mut call = caller(world, self.root, binding.entity);
+                let names = class_names(&node.classes, &mut EvalCtx::new(&frames, props, &mut call));
+                drop(call);
+                let classes = ClassList::new_with_classes(names);
                 let Ok(mut entity) = world.get_entity_mut(binding.entity) else { return };
                 if entity.get::<ClassList>() != Some(&classes) {
                     entity.insert(classes);
@@ -730,16 +785,49 @@ impl TemplateInstance {
     }
 
     /// Resolves the frames of the `v-for` items in `scope` for evaluation.
-    fn frames(&self, scope: &[ItemId], props: &Value) -> Vec<Frame> {
+    fn frames(&self, world: &mut World, scope: &[ItemId], props: &Value) -> Vec<Frame> {
         let mut frames: Vec<Frame> = Vec::with_capacity(scope.len());
         for &item_id in scope {
             let Some(item) = self.items.get(item_id) else { break };
             let Some(Block::For(block)) = self.blocks.get(item.block) else { break };
-            let list = self.compiled.get(block.node).list.as_ref().unwrap();
-            let base = eval_path(&list.iterable, &frames, props).unwrap_or_default();
-            frames.push(Frame { path: base.join(item.index), index: item.index });
+            let element = match &block.computed {
+                Some(list) => FrameElement::Value(list.clone()),
+                None => {
+                    let list = self.compiled.get(block.node).list.as_ref().unwrap();
+                    let mut call = caller(world, self.root, block.parent);
+                    let base = eval_path(&list.iterable, &mut EvalCtx::new(&frames, props, &mut call));
+                    FrameElement::Path(base.unwrap_or_default().join(item.index))
+                }
+            };
+            frames.push(Frame { element, index: item.index });
         }
         frames
+    }
+
+    /// Resolves the handler of `entity`'s listener for the event `name`: the function to call and
+    /// its evaluated arguments. Returns `None` if the node has no handler for the event.
+    pub fn resolve_event(
+        &self,
+        world: &mut World,
+        props: &Value,
+        entity: Entity,
+        name: &str,
+        args: &[Value],
+    ) -> Option<(String, Vec<Value>)> {
+        let (node_id, scope) = self.listeners.get(&entity)?;
+        let compiled = self.compiled.clone();
+        let handler = compiled.get(*node_id).listener(name)?.handler.as_ref()?;
+        match handler {
+            CompiledHandler::Function(function) => Some((function.to_string(), args.to_vec())),
+            CompiledHandler::Call { function, args: exprs } => {
+                let frames = self.frames(world, scope, props);
+                let mut call = caller(world, self.root, entity);
+                let mut ctx = EvalCtx::new(&frames, props, &mut call);
+                ctx.event_args = Some(args);
+                let values = exprs.iter().map(|expr| eval(expr, &mut ctx).into_owned()).collect();
+                Some((function.to_string(), values))
+            }
+        }
     }
 
     fn trie_owner(&self, root: ScopeRef, scope: &[ItemId]) -> Option<TrieOwner> {
@@ -747,6 +835,7 @@ impl TemplateInstance {
             ScopeRef::Props => TrieOwner::Root,
             ScopeRef::Item(level) => TrieOwner::Item(*scope.get(level)?),
             ScopeRef::Index(level) => TrieOwner::ItemIndex(*scope.get(level)?),
+            ScopeRef::Event => return None,
         })
     }
 
@@ -806,6 +895,7 @@ impl TemplateInstance {
         }
         for entity in owned.elements {
             self.elements.remove(&entity);
+            self.listeners.remove(&entity);
         }
     }
 

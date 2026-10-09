@@ -8,7 +8,10 @@ pub mod runtime;
 
 pub use asset::{BevueAssetPlugin, BevueAssetRegistry, BevueAssets};
 pub use core::template::{TemplateRef, TemplateStyle};
-pub use runtime::{BevueProps, BevuePropsAppExt, BevueSystems, PropsResource, PropsSource, Template};
+pub use runtime::{
+    BevueCtx, BevueEvent, BevueFunctionsAppExt, BevueProps, BevuePropsAppExt, BevueSystems, PropsResource, PropsSource,
+    Template,
+};
 pub use core::value::Value;
 
 pub use core::props::{Props, PropsExt};

@@ -19,11 +19,11 @@ impl std::fmt::Display for ExprParseError {
 
 impl std::error::Error for ExprParseError {}
 
-/// Parses an identifier string: [a-zA-Z_][a-zA-Z0-9_]*
+/// Parses an identifier string: [a-zA-Z_$][a-zA-Z0-9_$]*
 fn ident_str<'s>(input: &mut &'s str) -> ModalResult<&'s str> {
     let start = *input;
-    let head = one_of(('a'..='z', 'A'..='Z', '_')).parse_next(input)?;
-    let tail: &str = take_while(0.., ('a'..='z', 'A'..='Z', '0'..='9', '_')).parse_next(input)?;
+    let head = one_of(('a'..='z', 'A'..='Z', '_', '$')).parse_next(input)?;
+    let tail: &str = take_while(0.., ('a'..='z', 'A'..='Z', '0'..='9', '_', '$')).parse_next(input)?;
     let len = head.len_utf8() + tail.len();
     Ok(&start[..len])
 }
@@ -98,6 +98,7 @@ fn parse_int_literal(input: &mut &str) -> ModalResult<i32> {
 /// - string literal
 /// - float literal
 /// - integer literal
+/// - function call `ident(expr, ...)`
 /// - boolean or identifier
 fn parse_atom(input: &mut &str) -> ModalResult<Expression> {
     let _: &str = multispace0.parse_next(input)?;
@@ -127,12 +128,43 @@ fn parse_atom(input: &mut &str) -> ModalResult<Expression> {
     }
     *input = checkpoint;
     
-    // Identifier or bool
+    // Identifier, bool or call
     let id_str = ident_str.parse_next(input)?;
+    let after_ident = *input;
+    let _: &str = multispace0.parse_next(input)?;
+    if input.starts_with('(') {
+        if matches!(id_str, "true" | "false") {
+            return Err(winnow::error::ErrMode::Cut(ContextError::new()));
+        }
+        let args = parse_call_args.parse_next(input)?;
+        return Ok(Expression::Call { function: Identifier::new(id_str.to_string()), args });
+    }
+    *input = after_ident;
     match id_str {
         "true" => Ok(Expression::Bool(true)),
         "false" => Ok(Expression::Bool(false)),
         other => Ok(Expression::Identifier(Identifier::new(other.to_string()))),
+    }
+}
+
+/// Parses a parenthesized, comma separated and possibly empty argument list: `(a, b.c, 1)`.
+fn parse_call_args(input: &mut &str) -> ModalResult<Vec<Expression>> {
+    let _ = literal("(").parse_next(input)?;
+    let mut args = Vec::new();
+    let _: &str = multispace0.parse_next(input)?;
+    if input.starts_with(')') {
+        let _ = literal(")").parse_next(input)?;
+        return Ok(args);
+    }
+    loop {
+        args.push(parse_expr_internal.parse_next(input)?);
+        let _: &str = multispace0.parse_next(input)?;
+        if input.starts_with(',') {
+            let _ = literal(",").parse_next(input)?;
+        } else {
+            let _ = literal(")").parse_next(input)?;
+            return Ok(args);
+        }
     }
 }
 
@@ -348,6 +380,57 @@ mod tests {
 
         assert!(try_parse_for("item inside").is_err());
         assert!(try_parse_for("(a, b in list").is_err());
+    }
+
+    #[test]
+    fn test_dollar_identifiers() {
+        assert_eq!(parse_expression("$event"), Expression::Identifier("$event".into()));
+        assert_eq!(parse_expression("a$b"), Expression::Identifier("a$b".into()));
+    }
+
+    #[test]
+    fn test_calls() {
+        assert_eq!(parse_expression("f()"), Expression::Call { function: "f".into(), args: vec![] });
+        assert_eq!(
+            parse_expression("f( a.b , 1, \"x\" )"),
+            Expression::Call {
+                function: "f".into(),
+                args: vec![
+                    Expression::Access {
+                        target: Box::new(Expression::Identifier("a".into())),
+                        field: "b".into(),
+                    },
+                    Expression::Integer(1),
+                    Expression::String("x".into()),
+                ],
+            }
+        );
+        assert_eq!(
+            parse_expression("f(g(x))[0].name"),
+            Expression::Access {
+                target: Box::new(Expression::Index {
+                    target: Box::new(Expression::Call {
+                        function: "f".into(),
+                        args: vec![Expression::Call {
+                            function: "g".into(),
+                            args: vec![Expression::Identifier("x".into())],
+                        }],
+                    }),
+                    index: Box::new(Expression::Integer(0)),
+                }),
+                field: "name".into(),
+            }
+        );
+        assert_eq!(
+            parse_expression("$emit('buy', $event)"),
+            Expression::Call {
+                function: "$emit".into(),
+                args: vec![Expression::String("buy".into()), Expression::Identifier("$event".into())],
+            }
+        );
+        assert!(try_parse_expression("f(a,)").is_err());
+        assert!(try_parse_expression("f(a").is_err());
+        assert!(try_parse_expression("true(1)").is_err());
     }
 
     #[test]

@@ -1,16 +1,20 @@
 use bevy::{
-    app::{App, Plugin, PostUpdate}, asset::AssetEventSystems, ecs::{message::Messages, schedule::{IntoScheduleConfigs, SystemSet}}, window::{RequestRedraw, WindowEvent},
+    app::{App, Plugin, PostUpdate, PreUpdate}, asset::AssetEventSystems, ecs::{message::Messages, schedule::{IntoScheduleConfigs, SystemSet}}, ui::UiSystems, window::{RequestRedraw, WindowEvent},
 };
 use bevy_flair::{FlairPlugin, parser::FlairCssParserPlugin};
 
 use crate::asset::BevueAssetPlugin;
 
+pub mod events;
+pub mod functions;
 pub mod instance;
 pub mod interpolation;
 pub mod props;
 pub mod render;
 
 pub use crate::core::template::TemplateRef;
+pub use events::{BevueEvent, LastInteraction};
+pub use functions::{BevueCtx, BevueFunctions, BevueFunctionsAppExt, TemplateFunctions};
 pub use instance::TemplateInstance;
 pub use props::{BevueProps, BevuePropsAppExt, PropsResource, PropsSource};
 pub use render::{
@@ -44,6 +48,11 @@ impl Plugin for BevueRuntimePlugin {
         app.init_resource::<Messages<WindowEvent>>();
         app.init_resource::<Messages<RequestRedraw>>();
         app.add_observer(on_render_template);
+        app.add_observer(events::on_bevue_event);
+        functions::insert_global_function(app.world_mut(), "$emit".to_owned(), functions::box_function(functions::emit));
+        // Runs after `Interaction` is updated, so handlers run before `Update` and their prop
+        // changes are rendered in the same frame.
+        app.add_systems(PreUpdate, events::emit_interaction_events.after(UiSystems::Focus));
         app.configure_sets(
             PostUpdate,
             (BevueSystems::SyncProps, BevueSystems::Render, BevueSystems::Update, BevueSystems::Style)

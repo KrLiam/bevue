@@ -59,6 +59,85 @@ impl<'a> Iterator for HtmlIterator<'a> {
     }
 }
 
+/// Parses the attributes of an opening tag from its raw source, in source order.
+///
+/// `tl` does not accept `@` in attribute names and drops the first character of an attribute
+/// that follows a valueless one (`<p disabled class="a">` gives `lass`), so attributes are read
+/// directly instead. Values may be double quoted, single quoted or unquoted.
+fn tag_attributes<'a>(tag: &'a HTMLTag<'a>) -> Vec<(&'a str, Option<&'a str>)> {
+    let raw = tag.raw().as_utf8_str();
+    let raw: &'a str = match raw {
+        Cow::Borrowed(raw) => raw,
+        // `tl` borrows the source, so this does not happen for valid UTF-8 input.
+        Cow::Owned(_) => return Vec::new(),
+    };
+    parse_attributes(raw)
+}
+
+fn parse_attributes(raw: &str) -> Vec<(&str, Option<&str>)> {
+    let bytes = raw.as_bytes();
+    let mut i = 1; // skip '<'
+    while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'>' && bytes[i] != b'/' {
+        i += 1;
+    }
+
+    let mut attributes = Vec::new();
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] == b'>' || (bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'>')) {
+            break;
+        }
+        let name_start = i;
+        while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && bytes[i] != b'='
+            && bytes[i] != b'>'
+            && !(bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'>'))
+        {
+            i += 1;
+        }
+        let name = &raw[name_start..i];
+        if name.is_empty() {
+            // A stray character such as a lone '/' or '='.
+            i += 1;
+            continue;
+        }
+
+        let mut j = i;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if bytes.get(j) != Some(&b'=') {
+            attributes.push((name, None));
+            continue;
+        }
+        j += 1;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        let value = match bytes.get(j) {
+            Some(&quote @ (b'"' | b'\'')) => {
+                let start = j + 1;
+                let end = raw[start..].find(quote as char).map_or(raw.len(), |e| start + e);
+                i = (end + 1).min(raw.len());
+                &raw[start..end]
+            }
+            _ => {
+                let start = j;
+                while j < bytes.len() && !bytes[j].is_ascii_whitespace() && bytes[j] != b'>' {
+                    j += 1;
+                }
+                i = j;
+                &raw[start..j]
+            }
+        };
+        attributes.push((name, Some(value)));
+    }
+    attributes
+}
+
 /// Creates an iterator over the HTML nodes.
 /// The `VDom` must be created beforehand so the iterator can borrow from it.
 pub fn traverse_dom<'a>(dom: &'a VDom<'a>) -> HtmlIterator<'a> {
@@ -140,9 +219,9 @@ pub fn parse_template(source: &str) -> Result<BevueTemplate> {
                     in_style = true;
                     current_style_inline.clear();
                     current_style_src = None;
-                    for (name, value) in tag.attributes().iter() {
+                    for (name, value) in tag_attributes(tag) {
                         if name == "src" || (name == "href" && current_style_src.is_none()) {
-                            current_style_src = value.map(|b| b.to_string());
+                            current_style_src = value.map(str::to_string);
                         }
                     }
                     continue;
@@ -167,8 +246,8 @@ pub fn parse_template(source: &str) -> Result<BevueTemplate> {
                 let mut list_directive: Option<ListDirective> = None;
                 let mut condition_directive: Option<ConditionDirective> = None;
 
-                for (name, value) in tag.attributes().iter() {
-                    let val_str = value.as_deref();
+                for (name, value) in tag_attributes(tag) {
+                    let val_str = value;
                     if name == "v-for" {
                         let val = val_str.ok_or_else(|| {
                             ParseError::InvalidDirective("v-for requires a value".to_owned())
@@ -189,6 +268,17 @@ pub fn parse_template(source: &str) -> Result<BevueTemplate> {
                         });
                     } else if name == "v-else" {
                         condition_directive = Some(ConditionDirective::otherwise());
+                    } else if let Some(event) = name.strip_prefix('@').or_else(|| name.strip_prefix("v-on:")) {
+                        if event.is_empty() {
+                            return Err(ParseError::InvalidDirective(format!("missing event name in '{name}'")));
+                        }
+                        if event.contains('.') {
+                            return Err(ParseError::InvalidDirective(format!(
+                                "event modifiers are not supported yet: '{name}'"
+                            )));
+                        }
+                        let handler = val_str.map(try_parse_expression).transpose()?;
+                        template_node.events.push((event.to_string().into(), handler));
                     } else if let Some(stripped) = name.strip_prefix(':') {
                         if let Some(val) = val_str {
                             let expr = try_parse_expression(val)?;
@@ -441,6 +531,47 @@ use super::*;
             template.nodes[4].list,
             Some(ListDirective::new("item", Identifier::new("items")).with_index("i"))
         );
+    }
+
+    #[test]
+    fn test_attributes() {
+        assert_eq!(
+            parse_attributes(r#"<p @click disabled class="a b" :k='c > d' v-on:x = "y" w=1 v-else/>"#),
+            vec![
+                ("@click", None),
+                ("disabled", None),
+                ("class", Some("a b")),
+                (":k", Some("c > d")),
+                ("v-on:x", Some("y")),
+                ("w", Some("1")),
+                ("v-else", None),
+            ]
+        );
+        assert_eq!(parse_attributes("<div>"), vec![]);
+
+        // Attributes after a valueless one keep their first character.
+        let template = parse_template(r#"<div><p v-if="a">A</p><p v-else class="x">B</p></div>"#).unwrap();
+        assert_eq!(template.nodes[2].attributes, vec![("class".into(), Expression::String("x".into()))]);
+    }
+
+    #[test]
+    fn test_parse_events() {
+        let template = parse_template(
+            r#"<div><p @click>A</p><p @click="add()">B</p><p v-on:custom="handle">C</p></div>"#,
+        )
+        .expect("Failed to parse template");
+        assert_eq!(template.nodes[1].events, vec![("click".into(), None)]);
+        assert_eq!(
+            template.nodes[2].events,
+            vec![("click".into(), Some(Expression::Call { function: "add".into(), args: vec![] }))]
+        );
+        assert_eq!(
+            template.nodes[3].events,
+            vec![("custom".into(), Some(Expression::Identifier("handle".into())))]
+        );
+        assert!(template.nodes[1].attributes.is_empty());
+
+        assert!(parse_template(r#"<div><p @click.stop="a()">x</p></div>"#).is_err());
     }
 
     #[test]

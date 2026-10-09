@@ -86,6 +86,9 @@ pub struct TemplateNode {
     pub list: Option<ListDirective>,
     pub condition: Option<ConditionDirective>,
     pub style: Option<TemplateStyle>,
+    /// Event listeners from `@name="handler"` / `v-on:name="handler"`. A listener without a
+    /// handler (`@click`) still makes the node interactive.
+    pub events: Vec<(Cow<'static, str>, Option<Expression>)>,
 }
 
 impl TemplateNode {
@@ -98,6 +101,7 @@ impl TemplateNode {
             list: None,
             condition: None,
             style: None,
+            events: Vec::default(),
         }
     }
 
@@ -123,6 +127,11 @@ impl TemplateNode {
 
     pub fn with_condition(mut self, condition: ConditionDirective) -> Self {
         self.condition = Some(condition);
+        self
+    }
+
+    pub fn with_event(mut self, name: impl Into<Cow<'static, str>>, handler: Option<Expression>) -> Self {
+        self.events.push((name.into(), handler));
         self
     }
 
@@ -173,6 +182,8 @@ pub enum Expression {
     Identifier(Identifier),
     Access { target: Box<Expression>, field: Identifier },
     Index { target: Box<Expression>, index: Box<Expression> },
+    /// A call to a registered function: `function(args...)`.
+    Call { function: Identifier, args: Vec<Expression> },
     Float(f32),
     Integer(i32),
     String(Cow<'static, str>),

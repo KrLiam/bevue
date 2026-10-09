@@ -1,4 +1,7 @@
-use bevue::{BevuePropsAppExt, Props, PropsResource, Template, asset::BevueAssetPlugin, runtime::BevueRuntimePlugin};
+use bevue::{
+    BevueCtx, BevueFunctionsAppExt, BevuePropsAppExt, Props, PropsResource, Template, asset::BevueAssetPlugin,
+    runtime::BevueRuntimePlugin,
+};
 use bevy::{
     DefaultPlugins,
     app::{App, Startup, Update},
@@ -6,7 +9,7 @@ use bevy::{
     camera::Camera2d,
     ecs::{
         resource::Resource,
-        system::{Commands, Res, ResMut},
+        system::{Commands, In, Res, ResMut},
     },
     time::Time,
 };
@@ -27,6 +30,7 @@ fn main() {
     app.add_plugins((BevueAssetPlugin, DefaultPlugins, BevueRuntimePlugin))
         .register_props_resource::<Counter>()
         .init_resource::<Counter>()
+        .register_bevue_function("add_item", add_item)
         .add_systems(Startup, startup)
         .add_systems(Update, tick);
 
@@ -37,9 +41,20 @@ fn startup(asset_server: Res<AssetServer>, mut cmds: Commands) {
     cmds.spawn(Camera2d);
 
     cmds.spawn((
-        Template::new(asset_server.load("simple.html")),
+        Template::new(asset_server.load("simple.html")).with_function("label", label),
         PropsResource::<Counter>::at("counter"),
     ));
+}
+
+/// Called by `@click="add_item()"`: adds an item right away.
+fn add_item(In(_ctx): In<BevueCtx>, mut counter: ResMut<Counter>) {
+    let next = counter.items.last().map_or(1, |last| last + 1);
+    counter.items.push(next);
+}
+
+/// Called by `{{ label(item) }}`, only available to this template.
+fn label(In(ctx): In<BevueCtx>) -> String {
+    format!("Item #{}", ctx.args[0].to_text())
 }
 
 /// Updates the counter once per second. Only the template nodes bound to the fields that changed

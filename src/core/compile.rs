@@ -23,6 +23,9 @@ pub enum ScopeRef {
     Item(usize),
     /// The current index of the `v-for` loop at this nesting level.
     Index(usize),
+    /// The arguments of the event being handled, as a list. Only valid in event handlers, where
+    /// `$args` is this list and `$event` its first element.
+    Event,
 }
 
 /// A path segment that may need evaluating.
@@ -38,6 +41,8 @@ pub enum CompiledSegment {
 pub enum CompiledExpr {
     Literal(Value),
     Path { root: ScopeRef, segments: Vec<CompiledSegment> },
+    /// A call to a registered function; `segments` are applied to its result.
+    Call { function: Cow<'static, str>, args: Vec<CompiledExpr>, segments: Vec<CompiledSegment> },
 }
 
 impl CompiledExpr {
@@ -47,19 +52,38 @@ impl CompiledExpr {
 
     /// Appends the paths this expression reads. A dynamic segment cuts the path there, so
     /// `rows[i].name` depends on all of `rows` plus whatever `i` depends on.
+    ///
+    /// Functions are assumed pure: a call depends only on its arguments. Event arguments are not
+    /// reactive and add no dependency.
     pub fn dependencies(&self, out: &mut Vec<(ScopeRef, Vec<PathSegment>)>) {
-        let CompiledExpr::Path { root, segments } = self else { return };
-        let mut prefix = Vec::new();
-        for segment in segments {
-            match segment {
-                CompiledSegment::Static(s) => prefix.push(s.clone()),
-                CompiledSegment::Dynamic(index) => {
-                    index.dependencies(out);
-                    break;
+        match self {
+            CompiledExpr::Literal(_) => {}
+            CompiledExpr::Path { root, segments } => {
+                let mut prefix = Vec::new();
+                for segment in segments {
+                    match segment {
+                        CompiledSegment::Static(s) => prefix.push(s.clone()),
+                        CompiledSegment::Dynamic(index) => {
+                            index.dependencies(out);
+                            break;
+                        }
+                    }
+                }
+                if *root != ScopeRef::Event {
+                    out.push((*root, prefix));
+                }
+            }
+            CompiledExpr::Call { args, segments, .. } => {
+                for arg in args {
+                    arg.dependencies(out);
+                }
+                for segment in segments {
+                    if let CompiledSegment::Dynamic(index) = segment {
+                        index.dependencies(out);
+                    }
                 }
             }
         }
-        out.push((*root, prefix));
     }
 }
 
@@ -106,6 +130,25 @@ pub struct CompiledList {
     pub level: usize,
 }
 
+/// What an event listener does.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompiledHandler {
+    /// `@click="add_user(item.id, $event)"`: calls the function with the evaluated arguments.
+    Call { function: Cow<'static, str>, args: Vec<CompiledExpr> },
+    /// `@click="add_user"`: calls the function with the event's arguments.
+    Function(Cow<'static, str>),
+}
+
+/// An `@name` / `v-on:name` listener. Without a handler it only makes the node interactive.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompiledListener {
+    pub name: Cow<'static, str>,
+    pub handler: Option<CompiledHandler>,
+}
+
+/// Events that Bevue triggers from `Interaction`.
+pub const INTERACTION_EVENTS: [&str; 3] = ["click", "mouseover", "mouseleave"];
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CompiledNode {
     pub text: Option<CompiledText>,
@@ -113,12 +156,22 @@ pub struct CompiledNode {
     pub classes: Vec<CompiledExpr>,
     pub slots: Vec<Slot>,
     pub list: Option<CompiledList>,
+    pub listeners: Vec<CompiledListener>,
 }
 
 impl CompiledNode {
     /// Returns true if any class attribute needs evaluating.
     pub fn has_dynamic_classes(&self) -> bool {
         self.classes.iter().any(|c| !c.is_literal())
+    }
+
+    /// Returns true if the node listens to an event triggered from `Interaction`.
+    pub fn interactive(&self) -> bool {
+        self.listeners.iter().any(|l| INTERACTION_EVENTS.contains(&l.name.as_ref()))
+    }
+
+    pub fn listener(&self, name: &str) -> Option<&CompiledListener> {
+        self.listeners.iter().find(|l| l.name == name)
     }
 }
 
@@ -148,7 +201,8 @@ impl CompiledTemplate {
             return Err(CompileError::new(root, "the root element cannot have v-if or v-for"));
         }
 
-        let mut compiler = Compiler { template, scopes: Vec::new(), visited: vec![false; template.nodes.len()] };
+        let mut compiler =
+            Compiler { template, scopes: Vec::new(), visited: vec![false; template.nodes.len()], in_handler: false };
         compiler.compile_node(root, &mut compiled)?;
         Ok(compiled)
     }
@@ -164,6 +218,8 @@ struct Compiler<'a> {
     template: &'a BevueTemplate,
     scopes: Vec<ScopeFrame>,
     visited: Vec<bool>,
+    /// Set while compiling an event handler, where `$event`, `$args` and `$emit` are allowed.
+    in_handler: bool,
 }
 
 impl Compiler<'_> {
@@ -197,6 +253,19 @@ impl Compiler<'_> {
             .map(|(_, expr)| self.expr(expr))
             .collect::<Result<_, _>>()
             .map_err(|e| e.at(id))?;
+
+        self.in_handler = true;
+        let listeners = node
+            .events
+            .iter()
+            .map(|(name, handler)| {
+                let handler = handler.as_ref().map(|h| self.handler(h)).transpose()?;
+                Ok(CompiledListener { name: name.clone(), handler })
+            })
+            .collect::<Result<_, CompileError>>()
+            .map_err(|e| e.at(id));
+        self.in_handler = false;
+        let listeners = listeners?;
 
         let mut slots = Vec::new();
         let mut open_chain: Option<IfChain> = None;
@@ -261,7 +330,21 @@ impl Compiler<'_> {
         compiled.text = text;
         compiled.classes = classes;
         compiled.slots = slots;
+        compiled.listeners = listeners;
         Ok(())
+    }
+
+    fn handler(&self, expr: &Expression) -> Result<CompiledHandler, CompileError> {
+        match expr {
+            Expression::Call { function, args } => Ok(CompiledHandler::Call {
+                function: function.as_str().to_owned().into(),
+                args: args.iter().map(|a| self.expr(a)).collect::<Result<_, _>>()?,
+            }),
+            Expression::Identifier(name) if !name.as_str().starts_with('$') => {
+                Ok(CompiledHandler::Function(name.as_str().to_owned().into()))
+            }
+            _ => Err(CompileError::unplaced("event handler must be a function call or a function name")),
+        }
     }
 
     fn expr(&self, expr: &Expression) -> Result<CompiledExpr, CompileError> {
@@ -270,7 +353,17 @@ impl Compiler<'_> {
             Expression::Integer(i) => CompiledExpr::Literal(Value::from(*i)),
             Expression::String(s) => CompiledExpr::Literal(Value::from(s.as_ref())),
             Expression::Bool(b) => CompiledExpr::Literal(Value::from(*b)),
-            Expression::Identifier(ident) => self.resolve(ident),
+            Expression::Identifier(ident) => self.resolve(ident)?,
+            Expression::Call { function, args } => {
+                if function.as_str() == "$emit" && !self.in_handler {
+                    return Err(CompileError::unplaced("$emit can only be used in event handlers"));
+                }
+                CompiledExpr::Call {
+                    function: function.as_str().to_owned().into(),
+                    args: args.iter().map(|a| self.expr(a)).collect::<Result<_, _>>()?,
+                    segments: Vec::new(),
+                }
+            }
             Expression::Access { target, field } => {
                 self.extend(self.expr(target)?, CompiledSegment::Static(PathSegment::Key(field.as_str().to_owned().into())))?
             }
@@ -285,19 +378,29 @@ impl Compiler<'_> {
         })
     }
 
-    fn resolve(&self, ident: &Identifier) -> CompiledExpr {
+    fn resolve(&self, ident: &Identifier) -> Result<CompiledExpr, CompileError> {
+        if matches!(ident.as_str(), "$event" | "$args") {
+            if !self.in_handler {
+                return Err(CompileError::unplaced(format!("{ident} can only be used in event handlers")));
+            }
+            let segments = match ident.as_str() {
+                "$event" => vec![CompiledSegment::Static(PathSegment::Index(0))],
+                _ => Vec::new(),
+            };
+            return Ok(CompiledExpr::Path { root: ScopeRef::Event, segments });
+        }
         for (level, frame) in self.scopes.iter().enumerate().rev() {
             if frame.item == *ident {
-                return CompiledExpr::Path { root: ScopeRef::Item(level), segments: Vec::new() };
+                return Ok(CompiledExpr::Path { root: ScopeRef::Item(level), segments: Vec::new() });
             }
             if frame.index.as_ref() == Some(ident) {
-                return CompiledExpr::Path { root: ScopeRef::Index(level), segments: Vec::new() };
+                return Ok(CompiledExpr::Path { root: ScopeRef::Index(level), segments: Vec::new() });
             }
         }
-        CompiledExpr::Path {
+        Ok(CompiledExpr::Path {
             root: ScopeRef::Props,
             segments: vec![CompiledSegment::Static(PathSegment::Key(ident.as_str().to_owned().into()))],
-        }
+        })
     }
 
     fn extend(&self, target: CompiledExpr, segment: CompiledSegment) -> Result<CompiledExpr, CompileError> {
@@ -308,6 +411,10 @@ impl Compiler<'_> {
             CompiledExpr::Path { root, mut segments } => {
                 segments.push(segment);
                 Ok(CompiledExpr::Path { root, segments })
+            }
+            CompiledExpr::Call { function, args, mut segments } => {
+                segments.push(segment);
+                Ok(CompiledExpr::Call { function, args, segments })
             }
             CompiledExpr::Literal(_) => Err(CompileError::unplaced("cannot access a field of a literal")),
         }
@@ -458,6 +565,65 @@ mod tests {
                 ],
             })
         );
+    }
+
+    #[test]
+    fn calls_and_handlers() {
+        let template = parse_template(
+            r#"<div>
+                <p v-for="item in items" @click="buy(item.id, $event)" @custom="log" @mouseover>{{fmt(item.price)[0]}}</p>
+            </div>"#,
+        )
+        .unwrap();
+        let compiled = CompiledTemplate::compile(&template).unwrap();
+        let node = compiled.get(NodeId(1));
+        assert!(node.interactive());
+        assert_eq!(
+            node.listener("click").unwrap().handler,
+            Some(CompiledHandler::Call {
+                function: "buy".into(),
+                args: vec![
+                    CompiledExpr::Path { root: ScopeRef::Item(0), segments: vec![key("id")] },
+                    CompiledExpr::Path { root: ScopeRef::Event, segments: vec![CompiledSegment::Static(PathSegment::Index(0))] },
+                ],
+            })
+        );
+        assert_eq!(node.listener("custom").unwrap().handler, Some(CompiledHandler::Function("log".into())));
+        assert_eq!(node.listener("mouseover").unwrap().handler, None);
+
+        let CompiledFragment::Expr(expr) = &node.text.as_ref().unwrap().0[0] else { panic!() };
+        assert_eq!(
+            *expr,
+            CompiledExpr::Call {
+                function: "fmt".into(),
+                args: vec![CompiledExpr::Path { root: ScopeRef::Item(0), segments: vec![key("price")] }],
+                segments: vec![CompiledSegment::Static(PathSegment::Index(0))],
+            }
+        );
+        let mut deps = Vec::new();
+        expr.dependencies(&mut deps);
+        assert_eq!(deps, vec![(ScopeRef::Item(0), vec![PathSegment::Key("price".into())])]);
+
+        let custom_only = parse_template(r#"<div><p @custom="f()">x</p></div>"#).unwrap();
+        assert!(!CompiledTemplate::compile(&custom_only).unwrap().get(NodeId(1)).interactive());
+    }
+
+    #[test]
+    fn handler_only_builtins() {
+        for source in [
+            r#"<div><p>{{$event}}</p></div>"#,
+            r#"<div><p :class="$args">x</p></div>"#,
+            r#"<div><p>{{$emit('x')}}</p></div>"#,
+            r#"<div><p v-if="$emit('x')">x</p></div>"#,
+            r#"<div><p @click="1">x</p></div>"#,
+            r#"<div><p @click="a.b">x</p></div>"#,
+            r#"<div><p @click="$event">x</p></div>"#,
+        ] {
+            let template = parse_template(source).unwrap();
+            assert!(CompiledTemplate::compile(&template).is_err(), "{source} should not compile");
+        }
+        let ok = parse_template(r#"<div><p @click="$emit('buy', $args)">x</p></div>"#).unwrap();
+        assert!(CompiledTemplate::compile(&ok).is_ok());
     }
 
     #[test]

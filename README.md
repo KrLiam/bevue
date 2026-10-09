@@ -21,6 +21,8 @@ Bevue is only inspired by Vue, it won't:
 - [X] Keyed list rendering using the `v-for` directive, e.g. `v-for="(item, i) in items" :key="item.id"`;
 - [X] Fine-grained reactivity: only UI nodes bound to the props that changed are updated;
 - [X] `#[derive(Props)]` to render Bevy components and resources, with path access like `a.b[0].c`;
+- [X] Function calls in expressions, backed by Bevy systems, e.g. `{{ format(price) }}`;
+- [X] Event handling with `@click`, `@mouseover`, `@mouseleave`, custom events and `$emit`;
 
 # Reactivity
 
@@ -47,3 +49,29 @@ commands.spawn((Template::new(asset_server.load("menu.html")), PropsResource::<M
 
 Changed Rust data is diffed into the props, so editing `menu.actions[1].label` only updates the
 text bound to that label.
+
+# Functions and events
+
+Functions are Bevy systems taking `In<BevueCtx>`. They can be called anywhere in a template; calls
+in bindings re-run only when the props their arguments read change.
+
+```rust
+fn add_user(In(ctx): In<BevueCtx>, mut props: Query<&mut BevueProps>) {
+    props.get_mut(ctx.root).unwrap().get_mut("users").unwrap().push("new");
+}
+
+app.register_bevue_function("add_user", add_user); // global
+Template::new(handle).with_function("add_user", add_user); // only for this template
+```
+
+```html
+<button @click="add_user()">Add</button>
+<li v-for="user in users" @click="$emit('select', user.id)">{{ user.name }}</li>
+<p @click>Observed from Bevy</p>
+```
+
+Bevue adds `Interaction` to nodes that listen to `click`, `mouseover` or `mouseleave`, and triggers
+a `BevueEvent { entity, name, args }` for them. Trigger your own with
+`commands.trigger(BevueEvent { .. })`, and observe any of them with `On<BevueEvent>`. Handlers can
+read `$event` (the first event argument) and `$args` (all of them). `$emit(name, ...args)` triggers
+an event on the template root.

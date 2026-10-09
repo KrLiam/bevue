@@ -25,7 +25,7 @@ fn app() -> App {
 fn spawn(app: &mut App, source: &str, props: Value) -> Entity {
     let template = crate::parser::parse_template(source).unwrap();
     let handle = app.world_mut().resource_mut::<Assets<BevueTemplate>>().add(template);
-    let entity = app.world_mut().spawn((Template(handle), BevueProps::new(props))).id();
+    let entity = app.world_mut().spawn((Template::new(handle), BevueProps::new(props))).id();
     app.update();
     entity
 }
@@ -119,7 +119,7 @@ fn props_added_after_render() {
     let mut app = app();
     let template = crate::parser::parse_template(r#"<div><p>{{name}}</p></div>"#).unwrap();
     let handle = app.world_mut().resource_mut::<Assets<BevueTemplate>>().add(template);
-    let root = app.world_mut().spawn(Template(handle)).id();
+    let root = app.world_mut().spawn(Template::new(handle)).id();
     app.update();
     assert_eq!(texts(app.world(), root), vec![""]);
 
@@ -428,7 +428,7 @@ mod props_sources {
 
         let template = crate::parser::parse_template(MENU).unwrap();
         let handle = app.world_mut().resource_mut::<Assets<BevueTemplate>>().add(template);
-        let root = app.world_mut().spawn((Template(handle), PropsResource::<Menu>::at("menu"))).id();
+        let root = app.world_mut().spawn((Template::new(handle), PropsResource::<Menu>::at("menu"))).id();
         app.update();
         assert_eq!(texts(app.world(), root), vec!["File", "Open", "Save"]);
 
@@ -464,12 +464,12 @@ mod props_sources {
         let handle = app.world_mut().resource_mut::<Assets<BevueTemplate>>().add(template);
         let local = app
             .world_mut()
-            .spawn((Template(handle.clone()), Player { name: "ana".into(), hp: 10 }, PropsSource::<Player>::root()))
+            .spawn((Template::new(handle.clone()), Player { name: "ana".into(), hp: 10 }, PropsSource::<Player>::root()))
             .id();
         let player = app.world_mut().spawn(Player { name: "bo".into(), hp: 3 }).id();
         let remote = app
             .world_mut()
-            .spawn((Template(handle), PropsSource::<Player>::root().from_entity(player)))
+            .spawn((Template::new(handle), PropsSource::<Player>::root().from_entity(player)))
             .id();
         app.update();
         assert_eq!(texts(app.world(), local), vec!["ana: 10"]);
@@ -479,5 +479,287 @@ mod props_sources {
         app.update();
         assert_eq!(texts(app.world(), local), vec!["ana: 10"]);
         assert_eq!(texts(app.world(), remote), vec!["bo: 2"]);
+    }
+}
+
+mod events_and_functions {
+    use bevy::{
+        ecs::{
+            observer::On,
+            query::With,
+            resource::Resource,
+            system::{In, Query, ResMut},
+        },
+        ui::{FocusPolicy, Interaction},
+    };
+
+    use super::*;
+    use crate::{
+        core::template::TemplateRef,
+        runtime::{BevueCtx, BevueEvent, BevueFunctionsAppExt, TemplateFunctions},
+    };
+
+    #[derive(Resource, Default)]
+    struct Calls(u32);
+
+    #[derive(Resource, Default)]
+    struct Recorded(Vec<Vec<Value>>);
+
+    #[derive(Resource, Default)]
+    struct EventLog(Vec<(Entity, String, Vec<Value>)>);
+
+    fn upper(In(ctx): In<BevueCtx>, mut calls: ResMut<Calls>) -> String {
+        calls.0 += 1;
+        ctx.args[0].to_text().to_uppercase()
+    }
+
+    fn record(In(ctx): In<BevueCtx>, mut recorded: ResMut<Recorded>) {
+        recorded.0.push(ctx.args);
+    }
+
+    fn evens(In(ctx): In<BevueCtx>) -> Value {
+        let list = ctx.args[0].as_list().cloned().unwrap_or_default();
+        Value::list(list.into_iter().filter(|v| v.as_number().is_some_and(|n| n % 2.0 == 0.0)).collect())
+    }
+
+    fn event_app() -> App {
+        let mut app = app();
+        app.init_resource::<Calls>()
+            .init_resource::<Recorded>()
+            .init_resource::<EventLog>()
+            .register_bevue_function("upper", upper)
+            .register_bevue_function("record", record)
+            .register_bevue_function("evens", evens)
+            .add_observer(|event: On<BevueEvent>, mut log: ResMut<EventLog>| {
+                log.0.push((event.entity, event.name.to_string(), event.args.clone()));
+            });
+        app
+    }
+
+    fn nodes_with<F: bevy::ecs::query::QueryFilter>(app: &mut App) -> Vec<Entity> {
+        let mut query = app.world_mut().query_filtered::<Entity, (With<TemplateRef>, F)>();
+        query.iter(app.world()).collect()
+    }
+
+    fn set_interaction(app: &mut App, entity: Entity, interaction: Interaction) {
+        *app.world_mut().get_mut::<Interaction>(entity).unwrap() = interaction;
+        app.update();
+    }
+
+    fn log_names(app: &mut App) -> Vec<String> {
+        std::mem::take(&mut app.world_mut().resource_mut::<EventLog>().0).into_iter().map(|(_, name, _)| name).collect()
+    }
+
+    #[test]
+    fn calls_in_bindings_rerun_only_when_args_change() {
+        let mut app = event_app();
+        let root = spawn(&mut app, r#"<div><p>{{upper(name)}}!</p><p>{{other}}</p></div>"#, value!({ "name": "ana", "other": 1 }));
+        assert_eq!(texts(app.world(), root), vec!["ANA!", "1"]);
+        assert_eq!(app.world().resource::<Calls>().0, 1);
+
+        props(&mut app, root).get_mut("other").unwrap().set(2);
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["ANA!", "2"]);
+        assert_eq!(app.world().resource::<Calls>().0, 1);
+
+        props(&mut app, root).get_mut("name").unwrap().set("bo");
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["BO!", "2"]);
+        assert_eq!(app.world().resource::<Calls>().0, 2);
+    }
+
+    #[test]
+    fn call_iterables() {
+        let mut app = event_app();
+        let root = spawn(
+            &mut app,
+            r#"<div><span v-for="(x, i) in evens(nums)" :key="x">{{i}}:{{x}}</span></div>"#,
+            value!({ "nums": [1, 2, 3, 4] }),
+        );
+        assert_eq!(texts(app.world(), root), vec!["0:2", "1:4"]);
+        let four = children(app.world(), root)[1];
+
+        props(&mut app, root).get_mut("nums").unwrap().remove_at(1);
+        props(&mut app, root).get_mut("nums").unwrap().push(6);
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["0:4", "1:6"]);
+        assert_eq!(children(app.world(), root)[0], four, "keyed items are reused");
+    }
+
+    #[test]
+    fn events_from_code_with_loop_scope() {
+        let mut app = event_app();
+        let root = spawn(
+            &mut app,
+            r#"<div><span v-for="item in items" :key="item.id" @custom="record($event, item.id)">{{item.id}}</span></div>"#,
+            value!({ "items": [{ "id": "a" }, { "id": "b" }] }),
+        );
+        let b = children(app.world(), root)[1];
+        app.world_mut().trigger(BevueEvent::new(b, "custom", vec![Value::from(1)]));
+        app.update();
+        assert_eq!(app.world().resource::<Recorded>().0, vec![vec![Value::from(1), Value::from("b")]]);
+
+        // Events without a listener reach user observers but call nothing.
+        app.world_mut().trigger(BevueEvent::new(b, "other", vec![]));
+        app.update();
+        assert_eq!(app.world().resource::<Recorded>().0.len(), 1);
+        assert_eq!(log_names(&mut app), vec!["custom", "other"]);
+    }
+
+    #[test]
+    fn bare_function_handler_gets_event_args() {
+        let mut app = event_app();
+        let root = spawn(&mut app, r#"<div><p @custom="record">x</p></div>"#, Value::empty_dict());
+        let p = children(app.world(), root)[0];
+        app.world_mut().trigger(BevueEvent::new(p, "custom", vec![Value::from("x"), Value::from(2)]));
+        app.update();
+        assert_eq!(app.world().resource::<Recorded>().0, vec![vec![Value::from("x"), Value::from(2)]]);
+    }
+
+    #[test]
+    fn interaction_events() {
+        let mut app = event_app();
+        let root = spawn(
+            &mut app,
+            r#"<div><p @click="record('click')">a</p><p @mouseover>b</p><p @custom="record()">c</p><p>d</p></div>"#,
+            Value::empty_dict(),
+        );
+        let [click, hover, custom, plain] = children(app.world(), root)[..] else { panic!() };
+
+        // Only nodes listening to interaction events get `Interaction`.
+        let interactive = nodes_with::<With<Interaction>>(&mut app);
+        assert!(interactive.contains(&click) && interactive.contains(&hover));
+        assert!(!interactive.contains(&custom) && !interactive.contains(&plain) && !interactive.contains(&root));
+
+        // Nodes let interaction pass through to listening ancestors (Bevy's default for `Node`).
+        for node in [root, click, hover, custom, plain] {
+            assert_eq!(app.world().get::<FocusPolicy>(node), Some(&FocusPolicy::Pass));
+        }
+
+        set_interaction(&mut app, click, Interaction::Hovered);
+        set_interaction(&mut app, click, Interaction::Pressed);
+        set_interaction(&mut app, click, Interaction::Hovered);
+        set_interaction(&mut app, click, Interaction::None);
+        assert_eq!(log_names(&mut app), vec!["mouseover", "click", "mouseleave"]);
+        assert_eq!(app.world().resource::<Recorded>().0, vec![vec![Value::from("click")]]);
+
+        // Releasing outside the node is not a click.
+        set_interaction(&mut app, click, Interaction::Pressed);
+        set_interaction(&mut app, click, Interaction::None);
+        assert_eq!(log_names(&mut app), vec!["mouseover", "mouseleave"]);
+
+        // A listener without a handler still gets events for external observers.
+        set_interaction(&mut app, hover, Interaction::Hovered);
+        assert_eq!(app.world().resource::<EventLog>().0[0].0, hover);
+        assert_eq!(log_names(&mut app), vec!["mouseover"]);
+    }
+
+    #[test]
+    fn handler_mutates_props_in_the_same_frame() {
+        fn add_user(In(ctx): In<BevueCtx>, mut props: Query<&mut BevueProps>) {
+            props.get_mut(ctx.root).unwrap().get_mut("users").unwrap().push("new");
+        }
+
+        let mut app = event_app();
+        app.register_bevue_function("add_user", add_user);
+        let root = spawn(
+            &mut app,
+            r#"<div><p @click="add_user()">add</p><span v-for="u in users">{{u}}</span></div>"#,
+            value!({ "users": ["ana"] }),
+        );
+        let button = children(app.world(), root)[0];
+        set_interaction(&mut app, button, Interaction::Pressed);
+        set_interaction(&mut app, button, Interaction::Hovered);
+        assert_eq!(texts(app.world(), root), vec!["add", "ana", "new"]);
+    }
+
+    #[test]
+    fn emit_triggers_on_root() {
+        let mut app = event_app();
+        let root = spawn(
+            &mut app,
+            r#"<div @buy="record($args)">
+                <span v-for="item in items" :key="item.id" @click="$emit('buy', item.id, 2)">{{item.id}}</span>
+                <p @click="$emit(1)">bad</p>
+            </div>"#,
+            value!({ "items": [{ "id": "a" }, { "id": "b" }] }),
+        );
+        let [_, b, bad] = children(app.world(), root)[..] else { panic!() };
+
+        app.world_mut().trigger(BevueEvent::new(b, "click", vec![]));
+        app.update();
+        let log = std::mem::take(&mut app.world_mut().resource_mut::<EventLog>().0);
+        assert_eq!(
+            log,
+            vec![
+                (b, "click".to_owned(), vec![]),
+                (root, "buy".to_owned(), vec![Value::from("b"), Value::from(2)]),
+            ]
+        );
+        assert_eq!(app.world().resource::<Recorded>().0, vec![vec![value!(["b", 2])]]);
+
+        app.world_mut().trigger(BevueEvent::new(bad, "click", vec![]));
+        app.update();
+        assert_eq!(log_names(&mut app), vec!["click"]);
+    }
+
+    #[test]
+    fn re_emitting_listener_is_cut_off() {
+        let mut app = event_app();
+        let root = spawn(&mut app, r#"<div @ping="$emit('ping')"><p>x</p></div>"#, Value::empty_dict());
+        app.world_mut().trigger(BevueEvent::new(root, "ping", vec![]));
+        app.update();
+        let pings = log_names(&mut app).len() as u32;
+        assert_eq!(pings, crate::runtime::events::MAX_DISPATCH_DEPTH + 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "reserved")]
+    fn reserved_names_panic() {
+        app().register_bevue_function("$mine", record);
+    }
+
+    #[test]
+    fn template_local_functions() {
+        fn local(In(_): In<BevueCtx>) -> &'static str {
+            "local"
+        }
+        fn global(In(_): In<BevueCtx>) -> &'static str {
+            "global"
+        }
+
+        let mut app = event_app();
+        let template = crate::parser::parse_template(r#"<div><p>{{f()}}{{g()}}</p></div>"#).unwrap();
+        let handle = app.world_mut().resource_mut::<Assets<BevueTemplate>>().add(template);
+        let with_local = Template::new(handle.clone()).with_function("f", local).with_function("g", local);
+        let a = app.world_mut().spawn(with_local.clone()).id();
+        let b = app.world_mut().spawn(with_local).id();
+        let plain = app.world_mut().spawn(Template::new(handle.clone())).id();
+        app.register_bevue_function("g", global);
+        app.update();
+
+        assert_eq!(texts(app.world(), a), vec!["locallocal"]);
+        assert_eq!(texts(app.world(), b), vec!["locallocal"]);
+        assert_eq!(texts(app.world(), plain), vec!["global"], "unknown `f` is null, global `g` is used");
+
+        // Clones register independent systems.
+        let id_a = app.world().get::<TemplateFunctions>(a).unwrap().0["f"];
+        let id_b = app.world().get::<TemplateFunctions>(b).unwrap().0["f"];
+        assert_ne!(id_a, id_b);
+
+        // Removing the template or despawning the entity unregisters its systems.
+        app.world_mut().entity_mut(a).remove::<Template>();
+        app.world_mut().despawn(b);
+        app.update();
+        assert!(app.world().get::<TemplateFunctions>(a).is_none());
+        let ctx = |entity| BevueCtx { entity, root: entity, args: vec![] };
+        assert!(app.world_mut().run_system_with(id_a, ctx(a)).is_err());
+        assert!(app.world_mut().run_system_with(id_b, ctx(b)).is_err());
+
+        // Replacing the template swaps its functions.
+        app.world_mut().entity_mut(a).insert(Template::new(handle).with_function("f", global));
+        app.update();
+        let id_new = app.world().get::<TemplateFunctions>(a).unwrap().0["f"];
+        assert_eq!(app.world_mut().run_system_with(id_new, ctx(a)).unwrap(), Value::from("global"));
     }
 }
