@@ -1,18 +1,35 @@
 use bevy::{
-    app::{App, Plugin, PostUpdate}, asset::AssetEventSystems, ecs::{message::Messages, schedule::IntoScheduleConfigs}, window::{RequestRedraw, WindowEvent},
+    app::{App, Plugin, PostUpdate}, asset::AssetEventSystems, ecs::{message::Messages, schedule::{IntoScheduleConfigs, SystemSet}}, window::{RequestRedraw, WindowEvent},
 };
 use bevy_flair::{FlairPlugin, parser::FlairCssParserPlugin};
 
 use crate::asset::BevueAssetPlugin;
 
+pub mod instance;
 pub mod interpolation;
+pub mod props;
 pub mod render;
 
 pub use crate::core::template::TemplateRef;
+pub use instance::TemplateInstance;
+pub use props::{BevueProps, BevuePropsAppExt, PropsResource, PropsSource};
 pub use render::{
-    apply_template_classes_and_styles, on_render_template, watch_template_components, Template,
+    apply_template_classes_and_styles, on_render_template, update_templates, watch_template_components, Template,
     TemplateRendered, WaitingForTemplate,
 };
+
+/// The systems of the Bevue runtime, run in this order in `PostUpdate`.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub enum BevueSystems {
+    /// Copies changed `Props` components and resources into `BevueProps`.
+    SyncProps,
+    /// Renders templates whose asset was added, loaded or modified.
+    Render,
+    /// Applies `BevueProps` changes to rendered templates.
+    Update,
+    /// Attaches stylesheets.
+    Style,
+}
 
 pub struct BevueRuntimePlugin;
 
@@ -27,14 +44,22 @@ impl Plugin for BevueRuntimePlugin {
         app.init_resource::<Messages<WindowEvent>>();
         app.init_resource::<Messages<RequestRedraw>>();
         app.add_observer(on_render_template);
+        app.configure_sets(
+            PostUpdate,
+            (BevueSystems::SyncProps, BevueSystems::Render, BevueSystems::Update, BevueSystems::Style)
+                .chain()
+                .after(AssetEventSystems),
+        );
         app.add_systems(
             PostUpdate,
             (
-                watch_template_components.after(AssetEventSystems),
-                apply_template_classes_and_styles.after(watch_template_components),
+                watch_template_components.in_set(BevueSystems::Render),
+                update_templates.in_set(BevueSystems::Update),
+                apply_template_classes_and_styles.in_set(BevueSystems::Style),
             ),
         );
     }
 }
 
-
+#[cfg(test)]
+mod tests;

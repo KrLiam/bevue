@@ -79,11 +79,11 @@ pub fn traverse_dom<'a>(dom: &'a VDom<'a>) -> HtmlIterator<'a> {
 pub mod expr;
 pub use expr::{
     parse_expression, parse_for, parse_template_text, try_parse_expression, try_parse_for,
-    try_parse_template_text, ExprParseError,
+    try_parse_template_text, ExprParseError, ForParts,
 };
 
 pub use crate::core::template::{
-    BevueTemplate, ConditionDirective, Expression, Identifier, ListDirective, NodeId, TemplateNode,
+    BevueTemplate, ConditionDirective, ConditionKind, Expression, Identifier, ListDirective, NodeId, TemplateNode,
     TemplateRef, TemplateStyle, TemplateText, TextFragment,
 };
 
@@ -170,15 +170,25 @@ pub fn parse_template(source: &str) -> Result<BevueTemplate> {
                 for (name, value) in tag.attributes().iter() {
                     let val_str = value.as_deref();
                     if name == "v-for" {
-                        if let Some(val) = val_str {
-                            let (target, iterable) = try_parse_for(val)?;
-                            list_directive = Some(ListDirective::new(target, iterable));
-                        }
+                        let val = val_str.ok_or_else(|| {
+                            ParseError::InvalidDirective("v-for requires a value".to_owned())
+                        })?;
+                        let (target, index, iterable) = try_parse_for(val)?;
+                        let mut directive = ListDirective::new(target, iterable);
+                        directive.index = index;
+                        list_directive = Some(directive);
                     } else if name == "v-if" || name == "v-else-if" {
-                        if let Some(val) = val_str {
-                            let condition = try_parse_expression(val)?;
-                            condition_directive = Some(ConditionDirective::new(condition));
-                        }
+                        let val = val_str.ok_or_else(|| {
+                            ParseError::InvalidDirective(format!("{name} requires a value"))
+                        })?;
+                        let condition = try_parse_expression(val)?;
+                        condition_directive = Some(if name == "v-if" {
+                            ConditionDirective::new(condition)
+                        } else {
+                            ConditionDirective::else_if(condition)
+                        });
+                    } else if name == "v-else" {
+                        condition_directive = Some(ConditionDirective::otherwise());
                     } else if let Some(stripped) = name.strip_prefix(':') {
                         if let Some(val) = val_str {
                             let expr = try_parse_expression(val)?;
@@ -199,6 +209,13 @@ pub fn parse_template(source: &str) -> Result<BevueTemplate> {
                             .attributes
                             .push((name.to_string().into(), Expression::Bool(true)));
                     }
+                }
+
+                // `:key` belongs to the list directive, not to the element.
+                if let Some(directive) = &mut list_directive
+                    && let Some(pos) = template_node.attributes.iter().position(|(name, _)| name == "key")
+                {
+                    directive.key = Some(template_node.attributes.remove(pos).1);
                 }
 
                 template_node.list = list_directive;
@@ -351,15 +368,12 @@ use super::*;
                     target: Box::new(Expression::Identifier("menu".into())),
                     field: "actions".into(),
                 }
-            ))
-        );
-        assert_eq!(
-            result.nodes[5].attributes,
-            vec![("key".into(), Expression::Access {
+            ).with_key(Expression::Access {
                 target: Box::new(Expression::Identifier("action".into())),
                 field: "id".into(),
-            })]
+            }))
         );
+        assert_eq!(result.nodes[5].attributes, vec![]);
         assert_eq!(result.nodes[5].children, vec![NodeId(6)]);
 
         // Node 6: <span>{{action.label}}</span>
@@ -406,6 +420,26 @@ use super::*;
         assert_eq!(
             world.get::<ChildOf>(div_root).expect("ChildOf parent").parent(),
             root
+        );
+    }
+
+    #[test]
+    fn test_parse_conditions() {
+        let source = r#"
+            <div>
+                <p v-if="a">A</p>
+                <p v-else-if="b">B</p>
+                <p v-else>C</p>
+                <span v-for="(item, i) in items">{{item}}</span>
+            </div>
+        "#;
+        let template = parse_template(source).expect("Failed to parse template");
+        assert_eq!(template.nodes[1].condition, Some(ConditionDirective::new(Identifier::new("a"))));
+        assert_eq!(template.nodes[2].condition, Some(ConditionDirective::else_if(Identifier::new("b"))));
+        assert_eq!(template.nodes[3].condition, Some(ConditionDirective::otherwise()));
+        assert_eq!(
+            template.nodes[4].list,
+            Some(ListDirective::new("item", Identifier::new("items")).with_index("i"))
         );
     }
 

@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use winnow::ascii::multispace0;
-use winnow::combinator::{delimited, opt};
+use winnow::combinator::{alt, delimited, opt};
 use winnow::error::ContextError;
 use winnow::prelude::*;
 use winnow::token::{literal, one_of, take_while};
@@ -136,7 +136,7 @@ fn parse_atom(input: &mut &str) -> ModalResult<Expression> {
     }
 }
 
-/// Parses expression with chained member access: `target.field1.field2`
+/// Parses expression with chained member access and indexing: `target.field1[0].field2`
 fn parse_expr_internal(input: &mut &str) -> ModalResult<Expression> {
     let _: &str = multispace0.parse_next(input)?;
     let mut current = parse_atom.parse_next(input)?;
@@ -161,6 +161,12 @@ fn parse_expr_internal(input: &mut &str) -> ModalResult<Expression> {
                     break;
                 }
             }
+        } else if input.starts_with('[') {
+            let index = delimited('[', parse_expr_internal, ']').parse_next(input)?;
+            current = Expression::Index {
+                target: Box::new(current),
+                index: Box::new(index),
+            };
         } else {
             break;
         }
@@ -170,14 +176,36 @@ fn parse_expr_internal(input: &mut &str) -> ModalResult<Expression> {
     Ok(current)
 }
 
-fn parse_for_internal(input: &mut &str) -> ModalResult<(Identifier, Expression)> {
+/// Parses the left-hand side of a `v-for`: `item` or `(item, index)`.
+fn parse_for_aliases(input: &mut &str) -> ModalResult<(Identifier, Option<Identifier>)> {
+    let _: &str = multispace0.parse_next(input)?;
+    if !input.starts_with('(') {
+        return Ok((parse_identifier.parse_next(input)?, None));
+    }
+    let _ = literal("(").parse_next(input)?;
+    let _: &str = multispace0.parse_next(input)?;
     let target = parse_identifier.parse_next(input)?;
     let _: &str = multispace0.parse_next(input)?;
-    let _ = literal("in").parse_next(input)?;
+    let mut index = None;
+    if input.starts_with(',') {
+        let _ = literal(",").parse_next(input)?;
+        let _: &str = multispace0.parse_next(input)?;
+        index = Some(parse_identifier.parse_next(input)?);
+        let _: &str = multispace0.parse_next(input)?;
+    }
+    let _ = literal(")").parse_next(input)?;
+    Ok((target, index))
+}
+
+fn parse_for_internal(input: &mut &str) -> ModalResult<(Identifier, Option<Identifier>, Expression)> {
+    let (target, index) = parse_for_aliases.parse_next(input)?;
     let _: &str = multispace0.parse_next(input)?;
+    let _ = alt((literal("in"), literal("of"))).parse_next(input)?;
+    // The keyword must be followed by whitespace, so `item inside` is not `item in side`.
+    let _: &str = take_while(1.., (' ', '\t', '\n', '\r')).parse_next(input)?;
     let iterable = parse_expr_internal.parse_next(input)?;
     let _: &str = multispace0.parse_next(input)?;
-    Ok((target, iterable))
+    Ok((target, index, iterable))
 }
 
 /// Parses expression from string, ensuring all input is consumed.
@@ -195,8 +223,12 @@ pub fn parse_expression(value: &str) -> Expression {
     try_parse_expression(value).unwrap_or_else(|e| panic!("{e}"))
 }
 
-/// Parses `<identifier> in <expression>` from `v-for` attributes.
-pub fn try_parse_for(value: &str) -> Result<(Identifier, Expression), ExprParseError> {
+/// The parts of a `v-for` attribute: element alias, optional index alias and iterable.
+pub type ForParts = (Identifier, Option<Identifier>, Expression);
+
+/// Parses `<identifier> in <expression>` or `(<identifier>, <identifier>) in <expression>` from
+/// `v-for` attributes.
+pub fn try_parse_for(value: &str) -> Result<ForParts, ExprParseError> {
     let mut input = value.trim();
     match parse_for_internal.parse_next(&mut input) {
         Ok(res) if input.is_empty() => Ok(res),
@@ -206,7 +238,7 @@ pub fn try_parse_for(value: &str) -> Result<(Identifier, Expression), ExprParseE
 }
 
 /// Parses `<identifier> in <expression>` from `v-for` attributes. Panics on syntax error.
-pub fn parse_for(value: &str) -> (Identifier, Expression) {
+pub fn parse_for(value: &str) -> ForParts {
     try_parse_for(value).unwrap_or_else(|e| panic!("{e}"))
 }
 
@@ -295,8 +327,9 @@ mod tests {
 
     #[test]
     fn test_for() {
-        let (id, expr) = parse_for("action in menu.actions");
+        let (id, index, expr) = parse_for("action in menu.actions");
         assert_eq!(id, Identifier::new("action"));
+        assert_eq!(index, None);
         assert_eq!(
             expr,
             Expression::Access {
@@ -304,6 +337,49 @@ mod tests {
                 field: "actions".into(),
             }
         );
+    }
+
+    #[test]
+    fn test_for_with_index() {
+        let (id, index, expr) = parse_for("( action , i ) of actions");
+        assert_eq!(id, Identifier::new("action"));
+        assert_eq!(index, Some(Identifier::new("i")));
+        assert_eq!(expr, Expression::Identifier("actions".into()));
+
+        assert!(try_parse_for("item inside").is_err());
+        assert!(try_parse_for("(a, b in list").is_err());
+    }
+
+    #[test]
+    fn test_index() {
+        let expr = parse_expression("a.b[0].c");
+        assert_eq!(
+            expr,
+            Expression::Access {
+                target: Box::new(Expression::Index {
+                    target: Box::new(Expression::Access {
+                        target: Box::new(Expression::Identifier("a".into())),
+                        field: "b".into(),
+                    }),
+                    index: Box::new(Expression::Integer(0)),
+                }),
+                field: "c".into(),
+            }
+        );
+
+        let dynamic = parse_expression("rows[ i ][\"k\"]");
+        assert_eq!(
+            dynamic,
+            Expression::Index {
+                target: Box::new(Expression::Index {
+                    target: Box::new(Expression::Identifier("rows".into())),
+                    index: Box::new(Expression::Identifier("i".into())),
+                }),
+                index: Box::new(Expression::String("k".into())),
+            }
+        );
+
+        assert!(try_parse_expression("a[0").is_err());
     }
 
     #[test]

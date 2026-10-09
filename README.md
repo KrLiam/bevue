@@ -16,6 +16,34 @@ Bevue is only inspired by Vue, it won't:
 - [X] Loading components from assets with hot reloading;
 - [X] Easy styling with CSS through `bevy-flair` crate;
 - [X] Rendering static components to Bevy UI;
-- [ ] Text and attribute interpolation e.g `Hello {{ user }}!`;
-- [ ] Conditional rendering using the `v-if` directive;
-- [ ] List rendering using the `v-for` directive;
+- [X] Text and class interpolation e.g `Hello {{ user.name }}!`, `:class="state"`;
+- [X] Conditional rendering using the `v-if`, `v-else-if` and `v-else` directives;
+- [X] Keyed list rendering using the `v-for` directive, e.g. `v-for="(item, i) in items" :key="item.id"`;
+- [X] Fine-grained reactivity: only UI nodes bound to the props that changed are updated;
+- [X] `#[derive(Props)]` to render Bevy components and resources, with path access like `a.b[0].c`;
+
+# Reactivity
+
+A template renders the `BevueProps` component on its entity. Mutate it through the `Value`
+mutators (`get_mut`, `at_mut`, `set`, `push`, `insert`, ...), which record exactly what changed:
+
+```rust
+fn rename(mut props: Query<&mut BevueProps>) {
+    for mut props in &mut props {
+        props.at_mut(&"user.name".parse().unwrap()).unwrap().set("Ana");
+    }
+}
+```
+
+Or derive `Props` on a component or resource and let Bevy change detection sync it:
+
+```rust
+#[derive(Resource, Props)]
+struct Menu { title: String, actions: Vec<Action> }
+
+app.register_props_resource::<Menu>();
+commands.spawn((Template::new(asset_server.load("menu.html")), PropsResource::<Menu>::at("menu")));
+```
+
+Changed Rust data is diffed into the props, so editing `menu.actions[1].label` only updates the
+text bound to that label.

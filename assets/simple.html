@@ -1,14 +1,10 @@
 <template>
     <div class="root">
-        <p>Hello!</p>
-        <div class="button">
-            <span>1</span>
-        </div>
-        <div class="button">
-            <span>2</span>
-        </div>
-        <div class="button">
-            <span>3</span>
+        <p>Hello! {{ counter.seconds }}s</p>
+        <p v-if="counter.even">Even second</p>
+        <p v-else>Odd second</p>
+        <div class="button" v-for="item in counter.items" :key="item">
+            <span>{{ item }}</span>
         </div>
     </div>
 </template>

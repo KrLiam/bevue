@@ -156,12 +156,23 @@ impl Identifier {
     pub fn new(name: impl Into<Cow<'static, str>>) -> Self {
         Self(name.into())
     }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for Identifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expression {
     Identifier(Identifier),
     Access { target: Box<Expression>, field: Identifier },
+    Index { target: Box<Expression>, index: Box<Expression> },
     Float(f32),
     Integer(i32),
     String(Cow<'static, str>),
@@ -246,24 +257,67 @@ impl TemplateText {
 }
 
 
+/// A `v-for="item in iterable"` or `v-for="(item, index) in iterable"` directive.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ListDirective {
+    /// The alias bound to each element.
     pub target: Identifier,
+    /// The optional alias bound to each element's index.
+    pub index: Option<Identifier>,
     pub iterable: Expression,
+    /// The `:key` expression used to match elements across updates.
+    pub key: Option<Expression>,
 }
 
 impl ListDirective {
     pub fn new(target: impl Into<Identifier>, iterable: impl Into<Expression>) -> Self {
-        Self { target: target.into(), iterable: iterable.into() }
+        Self { target: target.into(), index: None, iterable: iterable.into(), key: None }
+    }
+
+    pub fn with_index(mut self, index: impl Into<Identifier>) -> Self {
+        self.index = Some(index.into());
+        self
+    }
+
+    pub fn with_key(mut self, key: impl Into<Expression>) -> Self {
+        self.key = Some(key.into());
+        self
     }
 }
 
+/// The kind of a conditional rendering directive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionKind {
+    /// `v-if`, starts a chain.
+    If,
+    /// `v-else-if`, continues the chain started by a preceding sibling.
+    ElseIf,
+    /// `v-else`, ends the chain started by a preceding sibling.
+    Else,
+}
+
+/// A `v-if`, `v-else-if` or `v-else` directive.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ConditionDirective(pub Expression);
+pub struct ConditionDirective {
+    pub kind: ConditionKind,
+    /// The condition; `None` only for `v-else`.
+    pub expr: Option<Expression>,
+}
 
 impl ConditionDirective {
+    /// Creates a `v-if` directive.
     pub fn new(condition: impl Into<Expression>) -> Self {
-        Self(condition.into())
+        Self { kind: ConditionKind::If, expr: Some(condition.into()) }
+    }
+
+    /// Creates a `v-else-if` directive.
+    pub fn else_if(condition: impl Into<Expression>) -> Self {
+        Self { kind: ConditionKind::ElseIf, expr: Some(condition.into()) }
+    }
+
+    /// Creates a `v-else` directive.
+    pub fn otherwise() -> Self {
+        Self { kind: ConditionKind::Else, expr: None }
     }
 }
 

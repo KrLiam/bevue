@@ -21,6 +21,7 @@ pub enum BevueTemplateLoaderError {
     Io(std::io::Error),
     Utf8(std::str::Utf8Error),
     Parse(crate::parser::ParseError),
+    Compile(crate::core::compile::CompileError),
 }
 
 impl std::fmt::Display for BevueTemplateLoaderError {
@@ -29,6 +30,7 @@ impl std::fmt::Display for BevueTemplateLoaderError {
             BevueTemplateLoaderError::Io(e) => write!(f, "Could not read template file: {e}"),
             BevueTemplateLoaderError::Utf8(e) => write!(f, "Template source is not valid UTF-8: {e}"),
             BevueTemplateLoaderError::Parse(e) => write!(f, "Could not parse template: {e}"),
+            BevueTemplateLoaderError::Compile(e) => write!(f, "Invalid template: {e}"),
         }
     }
 }
@@ -72,6 +74,8 @@ impl AssetLoader for BevueTemplateLoader {
         reader.read_to_end(&mut bytes).await?;
         let source = std::str::from_utf8(&bytes)?;
         let template = parse_template(source)?;
+        // Report directive and scoping errors at load time rather than at render time.
+        crate::core::compile::CompiledTemplate::compile(&template).map_err(BevueTemplateLoaderError::Compile)?;
         Ok(template)
     }
 

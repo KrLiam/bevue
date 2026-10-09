@@ -3,7 +3,11 @@ name = "bevue"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["crates/bevue_macros"]
+
 [dependencies]
+bevue_macros = { path = "crates/bevue_macros", version = "0.1.0" }
 bevy = { version = "0.19", default-features = false, features = [
     "ui",
     "file_watcher",
