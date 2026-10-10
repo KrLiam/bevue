@@ -1,0 +1,70 @@
+<template>
+    <div class="window">
+        <div class="root">
+            <p>Hello, {{ player_name.value }}!</p>
+
+            <div class="top">
+                <button class="button" @click="add_item()">Add Item</button>
+            </div>
+            <ul class="items">
+                <li class="item" v-for="(item, i) in inventory.items">
+                    <p>{{ item.id }}</p>
+                    <p class="item_count">{{ item.count }}</p>
+                    <button class="button" @click="remove_item(i)">X</button>
+                </li>
+            </ul>
+        </div>
+    </div>
+</template>
+
+<style>
+.button {
+    padding: 5px;
+    background-color: #444;
+}
+
+.button:hover {
+    background-color: #36357a;
+}
+
+.window {
+    width: 100%;
+    height: 100%;
+    justify-content: center;
+    align-items: start;
+    padding: 50px;
+}
+
+.root {
+    background-color: gray;
+    flex-direction: column;
+    row-gap: 20px;
+    padding: 50px;
+}
+
+.top {
+    flex-direction: row;
+}
+
+.items {
+    display: grid;
+
+    grid: repeat(5, 1fr) / repeat(2, 1fr);
+    grid-auto-flow: row;
+
+    gap: 10px;
+    padding: 5px;
+}
+
+.item {
+    flex-direction: row;
+    column-gap: 10px;
+    background-color: #333;
+    align-items: center;
+    padding: 5px;
+}
+.item_count {
+    font-size: 15;
+    color: #aaa;
+}
+</style>

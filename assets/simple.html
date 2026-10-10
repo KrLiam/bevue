@@ -1,19 +1,30 @@
 <template>
-    <div class="root">
-        <p>Hello! {{ counter.seconds }}s</p>
-        <p v-if="counter.even">Even second</p>
-        <p v-else>Odd second</p>
-        <div class="button" @click="add_item()">
-            <span>Add item</span>
-        </div>
-        <div class="item" v-for="item in counter.items" :key="item">
-            <span>{{ label(item) }}</span>
+    <div class="window">
+        <div class="root">
+            <p>Hello! {{ counter.seconds }}s</p>
+            <p v-if="counter.even">Even second</p>
+            <p v-else>Odd second</p>
+            <div class="button" @click="add_item()">
+                <span>Add item</span>
+            </div>
+            <div class="item" v-for="item in counter.items" :key="item">
+                <span>{{ label(item) }}</span>
+            </div>
         </div>
     </div>
 </template>
 
 <style>
+.window {
+    width: 100%;
+    height: 100%;
+    padding: 50px;
+    align-items: center;
+    justify-content: start;
+}
+
 .root {
+    width: 300px;
     flex-direction: column;
     row-gap: 10px;
     padding: 10px;

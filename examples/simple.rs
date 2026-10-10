@@ -11,6 +11,8 @@ use bevy::{
         resource::Resource,
         system::{Commands, In, Res, ResMut},
     },
+    log::LogPlugin,
+    prelude::PluginGroup,
     time::Time,
 };
 
@@ -27,7 +29,10 @@ struct Counter {
 fn main() {
     let mut app = App::new();
 
-    app.add_plugins((BevueAssetPlugin, DefaultPlugins, BevueRuntimePlugin))
+    // `bevue=debug` logs how long each props sync, render and update took.
+    let log = LogPlugin { filter: "wgpu=error,naga=warn,bevue=debug".into(), ..Default::default() };
+
+    app.add_plugins((BevueAssetPlugin, DefaultPlugins.set(log), BevueRuntimePlugin))
         .register_props_resource::<Counter>()
         .init_resource::<Counter>()
         .register_bevue_function("add_item", add_item)
