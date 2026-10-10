@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use bevy::{
     asset::Asset,
     ecs::{component::Component, entity::Entity, hierarchy::ChildOf, system::Commands},
-    prelude::Deref,
+    prelude::{Deref, DerefMut},
     reflect::TypePath,
 };
 
@@ -362,7 +362,7 @@ impl TemplateRef {
     }
 }
 
-#[derive(Asset, TypePath, Debug, Clone, Default, PartialEq)]
+#[derive(Asset, TypePath, Debug, Clone, Default, PartialEq, Deref, DerefMut)]
 pub struct BevueTemplate {
     pub nodes: Vec<TemplateNode>,
 }
@@ -476,20 +476,6 @@ impl BevueTemplate {
 
         let root_id = self.root_index().unwrap_or(NodeId(0));
         entities[*root_id]
-    }
-}
-
-impl std::ops::Deref for BevueTemplate {
-    type Target = Vec<TemplateNode>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.nodes
-    }
-}
-
-impl std::ops::DerefMut for BevueTemplate {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.nodes
     }
 }
 

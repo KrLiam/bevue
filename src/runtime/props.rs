@@ -1,9 +1,6 @@
 //! The `BevueProps` component holding the data a template renders.
 
-use std::{
-    marker::PhantomData,
-    ops::{Deref, DerefMut},
-};
+use std::marker::PhantomData;
 
 use bevy::{
     app::{App, PostUpdate},
@@ -17,6 +14,7 @@ use bevy::{
     },
     log::{debug, trace},
     platform::time::Instant,
+    prelude::{Deref, DerefMut},
 };
 
 use crate::{
@@ -29,7 +27,7 @@ use crate::{
 /// Mutate the value through the precise [`Value`] mutators (`get_mut`, `set`, `push`, ...) so the
 /// runtime only updates the UI nodes bound to what changed. Replacing `value` wholesale works too,
 /// but re-evaluates every binding of the template.
-#[derive(Component, Debug, Clone, PartialEq)]
+#[derive(Component, Debug, Clone, PartialEq, Deref, DerefMut)]
 pub struct BevueProps {
     pub value: Value,
 }
@@ -43,20 +41,6 @@ impl BevueProps {
 impl Default for BevueProps {
     fn default() -> Self {
         Self { value: Value::empty_dict() }
-    }
-}
-
-impl Deref for BevueProps {
-    type Target = Value;
-
-    fn deref(&self) -> &Self::Target {
-        &self.value
-    }
-}
-
-impl DerefMut for BevueProps {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.value
     }
 }
 

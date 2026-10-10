@@ -2,6 +2,8 @@
 
 use std::{borrow::Cow, fmt, str::FromStr};
 
+use bevy::prelude::Deref;
+
 /// A single step of a [`PropPath`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PathSegment {
@@ -37,7 +39,7 @@ impl fmt::Display for PathSegment {
 }
 
 /// A path into a nested value, such as `a.b[0].c`. The empty path refers to the value itself.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Deref)]
 pub struct PropPath(pub Vec<PathSegment>);
 
 impl PropPath {
@@ -102,14 +104,6 @@ impl PropPath {
         let mut path = self.clone();
         path.push(segment);
         path
-    }
-}
-
-impl std::ops::Deref for PropPath {
-    type Target = [PathSegment];
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
     }
 }
 

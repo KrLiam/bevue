@@ -9,14 +9,11 @@
 //! - [`ChangeFlags::SHAPE`]: a list or dict had elements added, removed or reordered.
 //! - [`ChangeFlags::SUBTREE`]: some descendant may have changed.
 //!
-//! Reading through [`Deref`] is free. Mutating through [`DerefMut`] conservatively marks the node
+//! Reading through [`Deref`](std::ops::Deref) is free. Mutating through [`DerefMut`] conservatively marks the node
 //! as [`ChangeFlags::SELF`]; prefer the typed mutators ([`Value::set`], [`Value::get_mut`],
 //! [`Value::push`], [`Value::insert`], ...) which mark only what actually changed.
 
-use std::{
-    fmt,
-    ops::{Deref, DerefMut},
-};
+use std::{fmt, ops::DerefMut};
 
 use bevy::platform::collections::HashMap;
 
@@ -77,9 +74,10 @@ impl fmt::Debug for ChangeFlags {
 }
 
 /// An attribute value.
-#[derive(Default)]
+#[derive(Default, bevy::prelude::Deref)]
 pub struct Value {
     /// The type variant of this value.
+    #[deref]
     t: ValueType,
     /// How this node changed since the last [`Value::clear_changes`].
     flags: ChangeFlags,
@@ -111,14 +109,6 @@ impl fmt::Debug for Value {
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.t.fmt(f)
-    }
-}
-
-impl Deref for Value {
-    type Target = ValueType;
-
-    fn deref(&self) -> &Self::Target {
-        &self.t
     }
 }
 

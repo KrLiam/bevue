@@ -1,5 +1,3 @@
-use std::ops::{Deref, DerefMut};
-
 use bevy::{
     app::{App, Plugin},
     asset::{
@@ -10,6 +8,7 @@ use bevy::{
         AssetApp, AssetLoader, AssetServer, Assets, LoadContext,
     },
     ecs::resource::Resource,
+    prelude::{Deref, DerefMut},
     reflect::TypePath,
 };
 use bevy_flair::style::StyleSheet;
@@ -85,7 +84,7 @@ impl AssetLoader for BevueTemplateLoader {
 }
 
 /// Resource storing an in-memory virtual filesystem [`Dir`] for Bevue assets (such as fabricated CSS stylesheets).
-#[derive(Resource, Clone, Default, Debug)]
+#[derive(Resource, Clone, Default, Debug, Deref, DerefMut)]
 pub struct BevueAssetRegistry {
     pub dir: Dir,
 }
@@ -95,20 +94,6 @@ impl BevueAssetRegistry {
         Self {
             dir: Dir::default(),
         }
-    }
-}
-
-impl Deref for BevueAssetRegistry {
-    type Target = Dir;
-
-    fn deref(&self) -> &Self::Target {
-        &self.dir
-    }
-}
-
-impl DerefMut for BevueAssetRegistry {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.dir
     }
 }
 
