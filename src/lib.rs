@@ -9,7 +9,7 @@ pub mod runtime;
 pub use asset::{BevueAssetPlugin, BevueAssetRegistry, BevueAssets};
 pub use core::template::{TemplateRef, TemplateStyle};
 pub use runtime::{
-    BevueCtx, BevueEvent, BevueFunctionsAppExt, BevueProps, BevuePropsAppExt, BevueSystems, FromArgs, PropsComponent,
+    BevueComponents, BevueComponentsAppExt, BevueCtx, BevueEvent, BevueFunctionsAppExt, BevueProps, BevuePropsAppExt, BevueSystems, FromArgs, PropsComponent,
     PropsResource, RegisterableProps, Template,
 };
 pub use core::value::Value;

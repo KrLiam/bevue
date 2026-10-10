@@ -197,7 +197,8 @@ pub fn call_function(world: &mut World, root: Entity, entity: Entity, name: &str
 }
 
 /// The built-in `$emit(name, ...args)`: triggers a [`BevueEvent`] named `name` with the remaining
-/// arguments on the template root. Only usable in event handlers.
+/// arguments on the template root, or inside a component on the root element of the component.
+/// Only usable in event handlers.
 pub fn emit(In(ctx): In<BevueCtx>, mut commands: Commands) {
     let mut args = ctx.args.into_iter();
     let Some(name) = args.next().and_then(|name| name.as_string().cloned()) else {

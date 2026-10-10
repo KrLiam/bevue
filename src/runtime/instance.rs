@@ -27,7 +27,7 @@ use crate::{
             CompileError, CompiledExpr, CompiledHandler, CompiledSegment, CompiledTemplate, IfChain, ScopeRef, Slot,
         },
         path::PathSegment,
-        template::{BevueTemplate, NodeId, TemplateRef},
+        template::{BevueTemplate, NodeId, TemplateRef, TemplateStyle},
         value::{ChangeFlags, Value},
     },
     runtime::{
@@ -265,6 +265,16 @@ struct Pending {
     fresh: HashSet<ItemId>,
 }
 
+/// An event handler to run: the function to call with its evaluated arguments.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedHandler {
+    pub function: String,
+    pub args: Vec<Value>,
+    /// Where `$emit` in this handler triggers its event: the root element of the component the
+    /// handler was written in, or the template root.
+    pub emit_target: Entity,
+}
+
 /// Counters describing a template instance, for tests and diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InstanceStats {
@@ -326,12 +336,29 @@ impl TemplateInstance {
         props: &Value,
     ) -> Result<Self, CompileError> {
         let compiled = Arc::new(CompiledTemplate::compile(&template)?);
+        Ok(Self::render_compiled(world, root, template, compiled, props))
+    }
+
+    /// Spawns the UI tree of an already compiled `template` under `root`, evaluated against
+    /// `props`.
+    pub fn render_compiled(
+        world: &mut World,
+        root: Entity,
+        template: Arc<BevueTemplate>,
+        compiled: Arc<CompiledTemplate>,
+        props: &Value,
+    ) -> Self {
         let mut instance = Self { root, template, compiled, ..Default::default() };
         if let Some(root_id) = instance.compiled.root {
             let mut pending = Pending::default();
             instance.spawn_element(world, props, &mut pending, root_id, Some(root), None, &[], OwnerRef::Root);
         }
-        Ok(instance)
+        instance
+    }
+
+    /// The styles of the template and of the components it uses.
+    pub fn styles(&self) -> &[TemplateStyle] {
+        &self.compiled.styles
     }
 
     pub fn template(&self) -> &Arc<BevueTemplate> {
@@ -819,8 +846,8 @@ impl TemplateInstance {
         frames
     }
 
-    /// Resolves the handler of `entity`'s listener for the event `name`: the function to call and
-    /// its evaluated arguments. Returns `None` if the node has no handler for the event.
+    /// Resolves the handlers of `entity`'s listeners for the event `name`. The root element of a
+    /// component can have two: its own and the one of the component element.
     pub fn resolve_event(
         &self,
         world: &mut World,
@@ -828,21 +855,42 @@ impl TemplateInstance {
         entity: Entity,
         name: &str,
         args: &[Value],
-    ) -> Option<(String, Vec<Value>)> {
-        let (node_id, scope) = self.listeners.get(&entity)?;
+    ) -> Vec<ResolvedHandler> {
+        let Some((node_id, scope)) = self.listeners.get(&entity) else { return Vec::new() };
         let compiled = self.compiled.clone();
-        let handler = compiled.get(*node_id).listener(name)?.handler.as_ref()?;
-        match handler {
-            CompiledHandler::Function(function) => Some((function.to_string(), args.to_vec())),
-            CompiledHandler::Call { function, args: exprs } => {
-                let frames = self.frames(world, scope, props);
-                let mut call = caller(world, self.root, entity);
-                let mut ctx = EvalCtx::new(&frames, props, &mut call);
-                ctx.event_args = Some(args);
-                let values = exprs.iter().map(|expr| eval(expr, &mut ctx).into_owned()).collect();
-                Some((function.to_string(), values))
-            }
+        let mut resolved = Vec::new();
+        for listener in compiled.get(*node_id).listeners_for(name) {
+            let Some(handler) = &listener.handler else { continue };
+            let (function, args) = match handler {
+                CompiledHandler::Function(function) => (function.to_string(), args.to_vec()),
+                CompiledHandler::Call { function, args: exprs } => {
+                    let frames = self.frames(world, scope, props);
+                    let mut call = caller(world, self.root, entity);
+                    let mut ctx = EvalCtx::new(&frames, props, &mut call);
+                    ctx.event_args = Some(args);
+                    let values = exprs.iter().map(|expr| eval(expr, &mut ctx).into_owned()).collect();
+                    (function.to_string(), values)
+                }
+            };
+            let emit_target = self.emit_target(world, entity, listener.emit_root);
+            resolved.push(ResolvedHandler { function, args, emit_target });
         }
+        resolved
+    }
+
+    /// Finds the element rendered for node `emit_root` that contains `entity`: the root element of
+    /// the component a listener was written in. Without one it is the template root.
+    fn emit_target(&self, world: &World, entity: Entity, emit_root: Option<NodeId>) -> Entity {
+        let Some(node) = emit_root else { return self.root };
+        let mut current = entity;
+        while current != self.root {
+            if world.get::<TemplateRef>(current).is_some_and(|r| r.root == self.root && r.node == node) {
+                return current;
+            }
+            let Some(parent) = world.get::<ChildOf>(current) else { break };
+            current = parent.0;
+        }
+        self.root
     }
 
     fn trie_owner(&self, root: ScopeRef, scope: &[ItemId]) -> Option<TrieOwner> {

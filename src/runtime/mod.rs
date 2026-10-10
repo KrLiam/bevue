@@ -5,6 +5,7 @@ use bevy_flair::{FlairPlugin, parser::FlairCssParserPlugin};
 
 use crate::asset::BevueAssetPlugin;
 
+pub mod components;
 pub mod events;
 pub mod functions;
 pub mod instance;
@@ -13,6 +14,7 @@ pub mod props;
 pub mod render;
 
 pub use crate::core::template::TemplateRef;
+pub use components::{BevueComponents, BevueComponentsAppExt, ComponentDependencies};
 pub use events::{BevueEvent, LastInteraction};
 pub use functions::{BevueCtx, BevueFunctions, BevueFunctionsAppExt, FromArgs, TemplateFunctions};
 pub use instance::{TemplateInstance, UpdateStats};
@@ -64,7 +66,9 @@ impl Plugin for BevueRuntimePlugin {
         app.add_systems(
             PostUpdate,
             (
-                watch_template_components.in_set(BevueSystems::Render),
+                (components::load_components, watch_template_components)
+                    .chain()
+                    .in_set(BevueSystems::Render),
                 update_templates.in_set(BevueSystems::Update),
                 apply_template_classes_and_styles.in_set(BevueSystems::Style),
             ),

@@ -3,13 +3,19 @@
 //! Compilation resolves every identifier against the enclosing `v-for` scopes, so `item.label`
 //! inside `v-for="item in menu.items"` becomes "field `label` of the element of loop level 0"
 //! instead of a prop lookup. It also groups sibling `v-if`/`v-else-if`/`v-else` nodes into chains.
+//!
+//! Component elements (`<Foo :item="it"/>`) are expanded here: the nodes of the component's
+//! template are compiled into the host's node list, with every identifier naming an attribute
+//! replaced by the host's expression for it. The runtime never sees a component, so using one
+//! costs the same as writing its elements in place.
 
 use std::{borrow::Cow, fmt};
 
 use crate::core::{
     path::PathSegment,
     template::{
-        BevueTemplate, ConditionKind, ElementType, Expression, Identifier, NodeId, TextFragment,
+        BevueTemplate, ConditionKind, ElementType, Expression, Identifier, NodeId, PropsDeclaration, TemplateNode,
+        TemplateStyle, TextFragment,
     },
     value::Value,
 };
@@ -144,6 +150,9 @@ pub enum CompiledHandler {
 pub struct CompiledListener {
     pub name: Cow<'static, str>,
     pub handler: Option<CompiledHandler>,
+    /// The root node of the component the listener was written in, where its `$emit` triggers
+    /// events. `None` for listeners of the template itself, which emit on the template root.
+    pub emit_root: Option<NodeId>,
 }
 
 /// Events that Bevue triggers from `Interaction`.
@@ -170,16 +179,53 @@ impl CompiledNode {
         self.listeners.iter().any(|l| INTERACTION_EVENTS.contains(&l.name.as_ref()))
     }
 
+    /// The first listener for the event `name`.
     pub fn listener(&self, name: &str) -> Option<&CompiledListener> {
         self.listeners.iter().find(|l| l.name == name)
     }
+
+    /// Every listener for the event `name`. The root element of a component has its own listeners
+    /// followed by those of the component element.
+    pub fn listeners_for<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a CompiledListener> + 'a {
+        self.listeners.iter().filter(move |l| l.name == name)
+    }
 }
 
-/// The compiled form of a template, indexed by [`NodeId`] like [`BevueTemplate::nodes`].
+/// What a component name refers to.
+pub enum ResolvedComponent<'a> {
+    /// The component's template.
+    Ready(&'a BevueTemplate),
+    /// The component exists but its template is not available yet. An empty node is compiled in
+    /// its place.
+    Pending,
+    /// No component has this name, which is a compile error.
+    Unknown,
+}
+
+/// Finds the templates of the components a template uses.
+pub trait ComponentResolver {
+    fn resolve(&self, name: &str) -> ResolvedComponent<'_>;
+}
+
+/// A [`ComponentResolver`] for which every component is [`ResolvedComponent::Pending`].
+pub struct NoComponents;
+
+impl ComponentResolver for NoComponents {
+    fn resolve(&self, _name: &str) -> ResolvedComponent<'_> {
+        ResolvedComponent::Pending
+    }
+}
+
+/// The compiled form of a template. Its own nodes are indexed by [`NodeId`] like
+/// [`BevueTemplate::nodes`]; the nodes of the components it uses come after them.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CompiledTemplate {
     pub root: Option<NodeId>,
     pub nodes: Vec<CompiledNode>,
+    /// The styles of the components used, followed by the template's own.
+    pub styles: Vec<TemplateStyle>,
+    /// The props declared by the template and by the components used.
+    pub props: Vec<PropsDeclaration>,
 }
 
 impl CompiledTemplate {
@@ -187,10 +233,18 @@ impl CompiledTemplate {
         &self.nodes[*id]
     }
 
+    /// Compiles `template` without its components: an empty node takes the place of each one.
     pub fn compile(template: &BevueTemplate) -> Result<Self, CompileError> {
+        Self::compile_with(template, &NoComponents)
+    }
+
+    /// Compiles `template`, expanding the components found by `components`.
+    pub fn compile_with(template: &BevueTemplate, components: &dyn ComponentResolver) -> Result<Self, CompileError> {
         let mut compiled = Self {
             root: template.root_index(),
             nodes: vec![CompiledNode::default(); template.nodes.len()],
+            styles: Vec::new(),
+            props: template.props.clone(),
         };
         let Some(root) = compiled.root else {
             return Ok(compiled);
@@ -200,11 +254,31 @@ impl CompiledTemplate {
         if root_node.list.is_some() || root_node.condition.is_some() {
             return Err(CompileError::new(root, "the root element cannot have v-if or v-for"));
         }
+        if let ElementType::Component(name) = &root_node.element {
+            return Err(CompileError::new(root, format!("the root element cannot be a component: <{name}>")));
+        }
 
-        let mut compiler =
-            Compiler { template, scopes: Vec::new(), visited: vec![false; template.nodes.len()], in_handler: false };
+        let mut compiler = Compiler {
+            template,
+            components,
+            offset: 0,
+            scopes: Vec::new(),
+            visited: vec![false; template.nodes.len()],
+            in_handler: false,
+            envs: Vec::new(),
+        };
         compiler.compile_node(root, &mut compiled)?;
+        // Last, so the template's own rules win over those of its components.
+        if let Some(style) = &root_node.style {
+            compiled.add_style(style);
+        }
         Ok(compiled)
+    }
+
+    fn add_style(&mut self, style: &TemplateStyle) {
+        if !self.styles.contains(style) {
+            self.styles.push(style.clone());
+        }
     }
 }
 
@@ -214,24 +288,146 @@ struct ScopeFrame {
     index: Option<Identifier>,
 }
 
+/// The component whose template is being expanded.
+struct ComponentEnv<'a> {
+    name: &'a str,
+    /// The attributes of the component element, compiled in the scope of the element.
+    props: Vec<(String, CompiledExpr)>,
+    /// The first `v-for` frame the component can see: those of its own template.
+    visible_from: usize,
+    /// The compiled root node of this use of the component.
+    root: NodeId,
+}
+
 struct Compiler<'a> {
+    /// The template being compiled: the host's, or that of the component being expanded.
     template: &'a BevueTemplate,
+    components: &'a dyn ComponentResolver,
+    /// Where the nodes of `template` start in the compiled node list.
+    offset: usize,
     scopes: Vec<ScopeFrame>,
     visited: Vec<bool>,
     /// Set while compiling an event handler, where `$event`, `$args` and `$emit` are allowed.
     in_handler: bool,
+    /// The components being expanded, outermost first.
+    envs: Vec<ComponentEnv<'a>>,
 }
 
-impl Compiler<'_> {
-    /// Compiles `id` in the current scope, which already includes its own `v-for` frame if any.
-    fn compile_node(&mut self, id: NodeId, out: &mut CompiledTemplate) -> Result<(), CompileError> {
+impl<'a> Compiler<'a> {
+    /// The compiled id of node `id` of the template being compiled.
+    fn out_id(&self, id: NodeId) -> NodeId {
+        NodeId(self.offset + *id)
+    }
+
+    fn visit(&mut self, id: NodeId) -> Result<(), CompileError> {
         if std::mem::replace(&mut self.visited[*id], true) {
             return Err(CompileError::new(id, "node is the child of more than one element"));
         }
-        let node = &self.template.nodes[*id];
-        if let ElementType::Component(name) = &node.element {
-            return Err(CompileError::new(id, format!("components are not supported yet: <{name}>")));
+        Ok(())
+    }
+
+    /// Compiles the child `id` and returns its compiled id: its own, or for a component element
+    /// the root of the expanded component.
+    fn compile_child(&mut self, id: NodeId, out: &mut CompiledTemplate) -> Result<NodeId, CompileError> {
+        let template = self.template;
+        match &template.nodes[*id].element {
+            ElementType::Component(name) => self.expand(id, name, out).map_err(|e| e.at(id)),
+            ElementType::Native(_) => {
+                self.compile_node(id, out)?;
+                Ok(self.out_id(id))
+            }
         }
+    }
+
+    /// Compiles the template of the component element `id` in its place.
+    fn expand(&mut self, id: NodeId, name: &'a str, out: &mut CompiledTemplate) -> Result<NodeId, CompileError> {
+        self.visit(id)?;
+        let node = &self.template.nodes[*id];
+        if !node.children.is_empty() || node.text.is_some() {
+            return Err(CompileError::unplaced(format!("component elements cannot have children: <{name}>")));
+        }
+        let component = match self.components.resolve(name) {
+            ResolvedComponent::Ready(component) => component,
+            ResolvedComponent::Pending => return Ok(self.out_id(id)),
+            ResolvedComponent::Unknown => {
+                return Err(CompileError::unplaced(format!(
+                    "unknown component <{name}>; register it with `app.register_component`"
+                )));
+            }
+        };
+        if self.envs.iter().any(|env| env.name == name) {
+            return Err(CompileError::unplaced(format!("component <{name}> contains itself")));
+        }
+        let Some(root) = component.root_index() else { return Ok(self.out_id(id)) };
+        let root_node = &component.nodes[*root];
+        if root_node.list.is_some() || root_node.condition.is_some() {
+            return Err(CompileError::unplaced(format!("the root element of <{name}> cannot have v-if or v-for")));
+        }
+        if matches!(root_node.element, ElementType::Component(_)) {
+            return Err(CompileError::unplaced(format!("the root element of <{name}> cannot be a component")));
+        }
+
+        // Everything written on the element belongs to the scope the element is in.
+        let mut props = Vec::new();
+        let mut classes = Vec::new();
+        for (attribute, expr) in &node.attributes {
+            let expr = self.expr(expr)?;
+            if attribute == "class" {
+                classes.push(expr);
+            } else {
+                props.push((attribute.replace('-', "_"), expr));
+            }
+        }
+        let listeners = self.listeners(node)?;
+
+        let offset = out.nodes.len();
+        out.nodes.resize(offset + component.nodes.len(), CompiledNode::default());
+        let target = NodeId(offset + *root);
+
+        self.envs.push(ComponentEnv { name, props, visible_from: self.scopes.len(), root: target });
+        let template = std::mem::replace(&mut self.template, component);
+        let host_offset = std::mem::replace(&mut self.offset, offset);
+        let visited = std::mem::replace(&mut self.visited, vec![false; component.nodes.len()]);
+        let result = self.compile_node(root, out);
+        self.template = template;
+        self.offset = host_offset;
+        self.visited = visited;
+        self.envs.pop();
+        result.map_err(|e| e.in_component(name))?;
+
+        let compiled = &mut out.nodes[*target];
+        compiled.classes.extend(classes);
+        compiled.listeners.extend(listeners);
+        if let Some(style) = &root_node.style {
+            out.add_style(style);
+        }
+        for declaration in &component.props {
+            if !out.props.contains(declaration) {
+                out.props.push(declaration.clone());
+            }
+        }
+        Ok(target)
+    }
+
+    fn listeners(&mut self, node: &TemplateNode) -> Result<Vec<CompiledListener>, CompileError> {
+        let emit_root = self.envs.last().map(|env| env.root);
+        self.in_handler = true;
+        let listeners = node
+            .events
+            .iter()
+            .map(|(name, handler)| {
+                let handler = handler.as_ref().map(|h| self.handler(h)).transpose()?;
+                Ok(CompiledListener { name: name.clone(), handler, emit_root })
+            })
+            .collect();
+        self.in_handler = false;
+        listeners
+    }
+
+    /// Compiles `id` in the current scope, which already includes its own `v-for` frame if any.
+    fn compile_node(&mut self, id: NodeId, out: &mut CompiledTemplate) -> Result<(), CompileError> {
+        self.visit(id)?;
+        let node = &self.template.nodes[*id];
 
         let text = match &node.text {
             Some(text) => Some(CompiledText(
@@ -254,18 +450,7 @@ impl Compiler<'_> {
             .collect::<Result<_, _>>()
             .map_err(|e| e.at(id))?;
 
-        self.in_handler = true;
-        let listeners = node
-            .events
-            .iter()
-            .map(|(name, handler)| {
-                let handler = handler.as_ref().map(|h| self.handler(h)).transpose()?;
-                Ok(CompiledListener { name: name.clone(), handler })
-            })
-            .collect::<Result<_, CompileError>>()
-            .map_err(|e| e.at(id));
-        self.in_handler = false;
-        let listeners = listeners?;
+        let listeners = self.listeners(node).map_err(|e| e.at(id))?;
 
         let mut slots = Vec::new();
         let mut open_chain: Option<IfChain> = None;
@@ -283,11 +468,11 @@ impl Compiler<'_> {
                     return Err(CompileError::new(child_id, "v-for on a v-else/v-else-if element is not supported"));
                 }
                 let expr = condition.expr.as_ref().map(|e| self.expr(e)).transpose().map_err(|e| e.at(child_id))?;
-                chain.0.push((expr, child_id));
+                let target = self.compile_child(child_id, out)?;
+                chain.0.push((expr, target));
                 if condition.kind == ConditionKind::Else {
                     slots.push(Slot::If(open_chain.take().unwrap()));
                 }
-                self.compile_node(child_id, out)?;
                 continue;
             }
 
@@ -303,30 +488,29 @@ impl Compiler<'_> {
                     ));
                 }
                 let expr = condition.expr.as_ref().map(|e| self.expr(e)).transpose().map_err(|e| e.at(child_id))?;
-                open_chain = Some(IfChain(vec![(expr, child_id)]));
-                self.compile_node(child_id, out)?;
+                let target = self.compile_child(child_id, out)?;
+                open_chain = Some(IfChain(vec![(expr, target)]));
             } else if let Some(list) = &child.list {
                 let iterable = self.expr(&list.iterable).map_err(|e| e.at(child_id))?;
                 let level = self.scopes.len();
                 self.scopes.push(ScopeFrame { item: list.target.clone(), index: list.index.clone() });
                 let key = list.key.as_ref().map(|k| self.expr(k)).transpose().map_err(|e| e.at(child_id));
                 let result = key.and_then(|key| {
-                    out.nodes[*child_id].list = Some(CompiledList { iterable, key, level });
-                    self.compile_node(child_id, out)
+                    let target = self.compile_child(child_id, out)?;
+                    out.nodes[*target].list = Some(CompiledList { iterable, key, level });
+                    Ok(target)
                 });
                 self.scopes.pop();
-                result?;
-                slots.push(Slot::For(child_id));
+                slots.push(Slot::For(result?));
             } else {
-                self.compile_node(child_id, out)?;
-                slots.push(Slot::Static(child_id));
+                slots.push(Slot::Static(self.compile_child(child_id, out)?));
             }
         }
         if let Some(chain) = open_chain.take() {
             slots.push(Slot::If(chain));
         }
 
-        let compiled = &mut out.nodes[*id];
+        let compiled = &mut out.nodes[self.offset + *id];
         compiled.text = text;
         compiled.classes = classes;
         compiled.slots = slots;
@@ -389,13 +573,20 @@ impl Compiler<'_> {
             };
             return Ok(CompiledExpr::Path { root: ScopeRef::Event, segments });
         }
-        for (level, frame) in self.scopes.iter().enumerate().rev() {
+        // Inside a component, only the loops of its own template are in scope.
+        let env = self.envs.last();
+        let visible_from = env.map_or(0, |env| env.visible_from);
+        for (level, frame) in self.scopes.iter().enumerate().skip(visible_from).rev() {
             if frame.item == *ident {
                 return Ok(CompiledExpr::Path { root: ScopeRef::Item(level), segments: Vec::new() });
             }
             if frame.index.as_ref() == Some(ident) {
                 return Ok(CompiledExpr::Path { root: ScopeRef::Index(level), segments: Vec::new() });
             }
+        }
+        // An attribute of the component element stands for the expression it was given.
+        if let Some((_, expr)) = env.and_then(|env| env.props.iter().rev().find(|(name, _)| name == ident.as_str())) {
+            return Ok(expr.clone());
         }
         Ok(CompiledExpr::Path {
             root: ScopeRef::Props,
@@ -449,6 +640,14 @@ impl CompileError {
 
     fn at(mut self, node: NodeId) -> Self {
         self.node.get_or_insert(node);
+        self
+    }
+
+    /// Marks the error as found in the template of component `name`. The node is then the
+    /// component element, as node ids of the component's template mean nothing to the host.
+    fn in_component(mut self, name: &str) -> Self {
+        self.message = format!("in <{name}>: {}", self.message);
+        self.node = None;
         self
     }
 }
@@ -624,6 +823,180 @@ mod tests {
         }
         let ok = parse_template(r#"<div><p @click="$emit('buy', $args)">x</p></div>"#).unwrap();
         assert!(CompiledTemplate::compile(&ok).is_ok());
+    }
+
+    struct Components(Vec<(&'static str, BevueTemplate)>);
+
+    impl Components {
+        fn new(components: &[(&'static str, &str)]) -> Self {
+            Self(components.iter().map(|(name, source)| (*name, parse_template(source).unwrap())).collect())
+        }
+    }
+
+    impl ComponentResolver for Components {
+        fn resolve(&self, name: &str) -> ResolvedComponent<'_> {
+            match self.0.iter().find(|(n, _)| *n == name) {
+                Some((_, template)) => ResolvedComponent::Ready(template),
+                None => ResolvedComponent::Unknown,
+            }
+        }
+    }
+
+    fn compile_with(source: &str, components: &Components) -> Result<CompiledTemplate, CompileError> {
+        CompiledTemplate::compile_with(&parse_template(source).unwrap(), components)
+    }
+
+    /// The compiled tree below `id` without node ids, to compare templates laid out differently.
+    fn shape(compiled: &CompiledTemplate, id: NodeId) -> String {
+        let node = compiled.get(id);
+        let listeners: Vec<_> = node.listeners.iter().map(|l| (&l.name, &l.handler)).collect();
+        let slots: Vec<String> = node
+            .slots
+            .iter()
+            .map(|slot| match slot {
+                Slot::Static(child) => shape(compiled, *child),
+                Slot::For(child) => format!("for {}", shape(compiled, *child)),
+                Slot::If(chain) => {
+                    let branches: Vec<_> =
+                        chain.0.iter().map(|(cond, child)| format!("{cond:?} => {}", shape(compiled, *child))).collect();
+                    format!("if {branches:?}")
+                }
+            })
+            .collect();
+        format!("({:?} {:?} {:?} {listeners:?} {slots:?})", node.text, node.classes, node.list)
+    }
+
+    #[test]
+    fn components_compile_like_inlined_markup() {
+        let components = Components::new(&[
+            (
+                "Row",
+                r#"<li class="row" @click="$emit('remove', item.id)">
+                    <p>{{ item.label }} {{ n }} {{ title }} {{ fmt(total) }}</p>
+                    <Tag v-for="tag in item.tags" :key="tag" :label="tag"/>
+                    <b v-if="open">open</b>
+                    <b v-else>{{ size.w }}</b>
+                </li>"#,
+            ),
+            ("Tag", r#"<span :class="label">{{ label }}</span>"#),
+        ]);
+        let with_components = compile_with(
+            r#"<div>
+                <Row v-for="(it, i) in rows[0].items" :key="it.id" class="x" :class="it.kind"
+                     :item="it" :n="i" title="T" open :total="sum(it.prices)" :size="sizes[i]"
+                     @remove="remove(i, $event)"/>
+            </div>"#,
+            &components,
+        )
+        .unwrap();
+        let inlined = compile_with(
+            r#"<div>
+                <li v-for="(it, i) in rows[0].items" :key="it.id" class="row" class="x" :class="it.kind"
+                    @click="$emit('remove', it.id)" @remove="remove(i, $event)">
+                    <p>{{ it.label }} {{ i }} {{ 'T' }} {{ fmt(sum(it.prices)) }}</p>
+                    <span v-for="tag in it.tags" :key="tag" :class="tag">{{ tag }}</span>
+                    <b v-if="true">open</b>
+                    <b v-else>{{ sizes[i].w }}</b>
+                </li>
+            </div>"#,
+            &components,
+        )
+        .unwrap();
+        assert_eq!(shape(&with_components, NodeId(0)), shape(&inlined, NodeId(0)));
+
+        // `$emit` in the component triggers on its root, the element's own handler does not.
+        let Slot::For(row) = with_components.get(NodeId(0)).slots[0] else { panic!("expected a list") };
+        assert!(*row >= 2, "component nodes come after the template's own");
+        let listeners = &with_components.get(row).listeners;
+        assert_eq!(listeners[0].emit_root, Some(row));
+        assert_eq!(listeners[1].emit_root, None);
+    }
+
+    #[test]
+    fn component_scope() {
+        let components = Components::new(&[("Row", r#"<p>{{ it }} {{ item }} {{ menu.title }}</p>"#)]);
+        let compiled =
+            compile_with(r#"<div><Row v-for="it in items" :item-name="it" :item="it"/></div>"#, &components).unwrap();
+        let Slot::For(row) = compiled.get(NodeId(0)).slots[0] else { panic!("expected a list") };
+        let exprs: Vec<_> = compiled
+            .get(row)
+            .text
+            .as_ref()
+            .unwrap()
+            .0
+            .iter()
+            .filter_map(|f| match f {
+                CompiledFragment::Expr(e) => Some(e.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            exprs,
+            vec![
+                // The loop alias of the host is not visible: `it` is a prop of the host template.
+                CompiledExpr::Path { root: ScopeRef::Props, segments: vec![key("it")] },
+                CompiledExpr::Path { root: ScopeRef::Item(0), segments: vec![] },
+                CompiledExpr::Path { root: ScopeRef::Props, segments: vec![key("menu"), key("title")] },
+            ]
+        );
+
+        let kebab = Components::new(&[("Row", r#"<p>{{ item_name }}</p>"#)]);
+        let compiled = compile_with(r#"<div><Row item-name="x"/></div>"#, &kebab).unwrap();
+        let Slot::Static(row) = compiled.get(NodeId(0)).slots[0] else { panic!("expected an element") };
+        assert_eq!(
+            compiled.get(row).text.as_ref().unwrap().0,
+            vec![CompiledFragment::Expr(CompiledExpr::Literal(Value::from("x")))]
+        );
+    }
+
+    #[test]
+    fn component_styles_and_props() {
+        let components = Components::new(&[
+            ("A", r#"<props><resource type="Menu"/></props><p>a</p><style>.a {}</style>"#),
+            ("B", r#"<props><resource type="Menu"/><resource type="User"/></props><p>b</p><style src="b.css"></style>"#),
+        ]);
+        let compiled = compile_with(
+            r#"<props><resource type="Host"/></props><div><A/><A/><B/></div><style>.host {}</style>"#,
+            &components,
+        )
+        .unwrap();
+        assert_eq!(
+            compiled.styles,
+            vec![TemplateStyle::from_inline(".a {}"), TemplateStyle::from_src("b.css"), TemplateStyle::from_inline(".host {}")]
+        );
+        assert_eq!(
+            compiled.props,
+            vec![PropsDeclaration::resource("Host"), PropsDeclaration::resource("Menu"), PropsDeclaration::resource("User")]
+        );
+    }
+
+    #[test]
+    fn component_errors() {
+        let components = Components::new(&[
+            ("Leaf", r#"<p>x</p>"#),
+            ("Loop", r#"<div><Other/></div>"#),
+            ("Other", r#"<div><Loop/></div>"#),
+            ("Broken", r#"<div><p v-else>x</p></div>"#),
+            ("Nested", r#"<Leaf/>"#),
+        ]);
+        for (source, expected) in [
+            (r#"<div><Nope/></div>"#, "unknown component <Nope>"),
+            (r#"<div><Leaf><p>x</p></Leaf></div>"#, "cannot have children"),
+            (r#"<div><Leaf>text</Leaf></div>"#, "cannot have children"),
+            (r#"<div><Loop/></div>"#, "in <Loop>: in <Other>: component <Loop> contains itself"),
+            (r#"<div><Broken/></div>"#, "in <Broken>: v-else"),
+            (r#"<div><Nested/></div>"#, "the root element of <Nested> cannot be a component"),
+            (r#"<Leaf/>"#, "the root element cannot be a component"),
+        ] {
+            let error = compile_with(source, &components).unwrap_err();
+            assert!(error.message.contains(expected), "{source}: {error}");
+        }
+
+        // Without a resolver, components are left out.
+        let template = parse_template(r#"<div><Nope :a="b"/><p>x</p></div>"#).unwrap();
+        let compiled = CompiledTemplate::compile(&template).unwrap();
+        assert_eq!(compiled.get(NodeId(0)).slots, vec![Slot::Static(NodeId(1)), Slot::Static(NodeId(2))]);
+        assert_eq!(*compiled.get(NodeId(1)), CompiledNode::default());
     }
 
     #[test]

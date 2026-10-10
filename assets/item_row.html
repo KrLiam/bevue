@@ -1,0 +1,21 @@
+<template>
+    <li class="item">
+        <p>{{ item.id }}</p>
+        <p class="item_count">{{ item.count }}</p>
+        <button class="button" @click="$emit('remove')">X</button>
+    </li>
+</template>
+
+<style>
+.item {
+    flex-direction: row;
+    column-gap: 10px;
+    background-color: #333;
+    align-items: center;
+    padding: 5px;
+}
+.item_count {
+    font-size: 15;
+    color: #aaa;
+}
+</style>

@@ -24,6 +24,7 @@ Bevue is only inspired by Vue, it won't:
 - [X] Props declared in the component file with `<props>`;
 - [X] Function calls in expressions, backed by Bevy systems, e.g. `{{ format(price) }}`;
 - [X] Event handling with `@click`, `@mouseover`, `@mouseleave`, custom events and `$emit`;
+- [X] Component elements such as `<ItemRow :item="item" @remove="remove_item(i)"/>`, at the cost of inlined markup;
 
 # Reactivity
 
@@ -108,6 +109,48 @@ a `BevueEvent { entity, name, args }` for them. Trigger your own with
 `commands.trigger(BevueEvent { .. })`, and observe any of them with `On<BevueEvent>`. Handlers can
 read `$event` (the first event argument) and `$args` (all of them). `$emit(name, ...args)` triggers
 an event on the template root.
+
+# Components
+
+Register a template file under a capitalised name and use it as an element in any template:
+
+```rust
+app.register_component("ItemRow", "item_row.html");
+```
+
+```html
+<!-- inventory.html -->
+<ItemRow v-for="(item, i) in inventory.items" :item="item" @remove="remove_item(i)"/>
+
+<!-- item_row.html -->
+<li class="item">
+    <p>{{ item.id }}</p>
+    <button @click="$emit('remove')">X</button>
+</li>
+```
+
+- Attributes are the component's props: `:item="expr"` is evaluated in the template using the
+  component, `title="text"` is a string and a bare `open` is `true`. A `-` in a name becomes `_`
+  (`:item-count` is read as `item_count`).
+- `class`, `:class`, `v-if`, `v-else-if`, `v-else`, `v-for` and `:key` apply to the root element of
+  the component, which takes the place of the component element.
+- `$emit(name, ...args)` inside a component triggers the event on the component's root element,
+  where the `@name` listener of the component element handles it.
+
+Components are expanded when the template using them is compiled: `{{ item.id }}` above becomes the
+same binding as if the `<li>` was written inside `inventory.html`. A component has no entity,
+component or props of its own, so splitting a template into components costs nothing at runtime.
+This also means that:
+
+- An identifier that is not an attribute reads the props of the template the component is used in
+  (but not its `v-for` aliases). The `<props>` declared by a component file are mounted on that
+  template's entity.
+- The `<style>` of a component is added to the stylesheet of the template, it is not scoped.
+- An attribute expression is evaluated wherever the component uses it.
+- A component cannot contain itself, and cannot have children (there are no slots yet).
+- A template or component cannot have a component as its root element.
+
+A template is rendered again when the file of a component it uses is loaded or changed.
 
 # Debugging performance
 

@@ -495,12 +495,8 @@ impl BevueTemplate {
                 root: root_entity,
                 node: NodeId(i),
             });
-            match &node.element {
-                ElementType::Native(_) => {
-                    entity_commands.insert(bevy::ui::Node::default());
-                }
-                ElementType::Component(_) => panic!("Components not supported yet."),
-            }
+            // Components are only expanded by the runtime; here they are empty nodes.
+            entity_commands.insert(bevy::ui::Node::default());
             if let Some(text) = &node.text {
                 let mut acc = String::new();
                 for fragment in &text.0 {

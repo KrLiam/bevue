@@ -238,11 +238,35 @@ fn parse_props_declaration(tag: &HTMLTag<'_>) -> Result<PropsDeclaration> {
     })
 }
 
+/// Puts a space before every `/>` that directly follows a tag name, as in `<Foo/>`.
+///
+/// `tl` reads the name of such a tag as `Foo/` and does not close it, so the elements after it
+/// would become its children.
+fn separate_self_closing(source: &str) -> Cow<'_, str> {
+    let bytes = source.as_bytes();
+    let follows_name = |at: usize| at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || matches!(bytes[at - 1], b'-' | b'_'));
+    if !source.match_indices("/>").any(|(at, _)| follows_name(at)) {
+        return Cow::Borrowed(source);
+    }
+    let mut out = String::with_capacity(source.len() + 16);
+    let mut last = 0;
+    for (at, _) in source.match_indices("/>") {
+        if follows_name(at) {
+            out.push_str(&source[last..at]);
+            out.push(' ');
+            last = at;
+        }
+    }
+    out.push_str(&source[last..]);
+    Cow::Owned(out)
+}
+
 /// Parses a template source string into a `BevueTemplate`.
 /// Supports a `<template>` wrapper, `<style src="...">` tags and a top-level `<props>` element
 /// declaring the template's props.
 pub fn parse_template(source: &str) -> Result<BevueTemplate> {
-    let dom = tl::parse(source, ParserOptions::default())
+    let source = separate_self_closing(source);
+    let dom = tl::parse(&source, ParserOptions::default())
         .map_err(|e| ParseError::InvalidHtml(format!("{e:?}")))?;
 
     let mut nodes: Vec<TemplateNode> = Vec::new();
@@ -470,6 +494,38 @@ use super::*;
             </div>
         </layout>
     "#;
+
+    #[test]
+    fn component_elements() {
+        let result = parse_template(r#"<div><Foo :a="x" b="y" c @close="f()"/><p>after</p></div>"#).unwrap();
+        assert_eq!(result.nodes.len(), 3);
+        assert_eq!(result.nodes[0].children, vec![NodeId(1), NodeId(2)]);
+
+        let foo = &result.nodes[1];
+        assert_eq!(foo.element, crate::core::template::ElementType::Component("Foo".into()));
+        assert!(foo.children.is_empty());
+        assert_eq!(
+            foo.attributes,
+            vec![
+                ("a".into(), Expression::Identifier("x".into())),
+                ("b".into(), Expression::String("y".into())),
+                ("c".into(), Expression::Bool(true)),
+            ]
+        );
+        assert_eq!(foo.events.len(), 1);
+        assert_eq!(foo.events[0].0, "close");
+        assert_eq!(result.nodes[2].element, "p".into());
+    }
+
+    #[test]
+    fn self_closing_without_attributes() {
+        let result = parse_template(r#"<div><Foo/><Bar-baz/><p>after</p></div>"#).unwrap();
+        assert_eq!(result.nodes.len(), 4);
+        assert_eq!(result.nodes[0].children, vec![NodeId(1), NodeId(2), NodeId(3)]);
+        assert_eq!(result.nodes[1].element, crate::core::template::ElementType::Component("Foo".into()));
+        assert_eq!(result.nodes[2].element, crate::core::template::ElementType::Component("Bar-baz".into()));
+        assert_eq!(result.nodes[3].text, Some(TemplateText::new(["after".into()])));
+    }
 
     #[test]
     fn simple() {

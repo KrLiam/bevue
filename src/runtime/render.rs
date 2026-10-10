@@ -21,9 +21,11 @@ use bevy::{
 use bevy_flair::prelude::{Styled, StyleSheet};
 
 use crate::asset::BevueAssetRegistry;
+use crate::core::compile::CompiledTemplate;
 use crate::core::template::{BevueTemplate, TemplateRef};
 use crate::core::value::Value;
 use crate::runtime::{
+    components::{load_components, ComponentDependencies, WorldComponents},
     functions::{
         assert_not_reserved, box_function, BevueCtx, BevueFunctionFactory, BoxedBevueFunction, TemplateFunctions,
     },
@@ -165,24 +167,34 @@ pub fn watch_template_components(
     mut asset_events: MessageReader<AssetEvent<BevueTemplate>>,
     changed_templates: Query<(Entity, &Template), Changed<Template>>,
     waiting_templates: Query<(Entity, &Template), With<WaitingForTemplate>>,
-    all_templates: Query<(Entity, &Template)>,
+    all_templates: Query<(Entity, &Template, Option<&ComponentDependencies>)>,
 ) {
     let mut triggered_entities = HashSet::new();
 
     // 1. Process modified or reloaded asset events (for hot reload / file watching).
+    // Assets that became available: templates waiting for a component render again.
     let mut modified_asset_ids = HashSet::new();
+    let mut added_asset_ids = HashSet::new();
     for event in asset_events.read() {
         match event {
             AssetEvent::Modified { id } | AssetEvent::LoadedWithDependencies { id } => {
                 modified_asset_ids.insert(id);
             }
+            AssetEvent::Added { id } => {
+                added_asset_ids.insert(id);
+            }
             _ => {}
         }
     }
 
-    if !modified_asset_ids.is_empty() {
-        for (entity, template) in &all_templates {
-            if modified_asset_ids.contains(&template.handle.id()) && assets.contains(&template.handle) {
+    if !modified_asset_ids.is_empty() || !added_asset_ids.is_empty() {
+        for (entity, template, dependencies) in &all_templates {
+            // A template is rendered again when one of the components it uses changes.
+            let modified = modified_asset_ids.contains(&template.handle.id())
+                || dependencies.is_some_and(|d| {
+                    d.0.iter().any(|id| modified_asset_ids.contains(id) || added_asset_ids.contains(id))
+                });
+            if modified && assets.contains(&template.handle) {
                 commands.trigger(RenderTemplate {
                     template: template.handle.clone(),
                     ui_root: Some(entity),
@@ -234,7 +246,8 @@ pub fn watch_template_components(
 
 pub fn render_template(input: In<RenderTemplate>, world: &mut World) {
     let start = Instant::now();
-    let template = {
+    load_components(world);
+    let (template, compiled, dependencies) = {
         let Some(templates) = world.get_resource::<Assets<BevueTemplate>>() else {
             error!("Assets<BevueTemplate> resource not found");
             return;
@@ -243,7 +256,9 @@ pub fn render_template(input: In<RenderTemplate>, world: &mut World) {
             warn!("BevueTemplate asset not loaded yet");
             return;
         };
-        Arc::new(template.clone())
+        let components = WorldComponents::new(world, templates);
+        let compiled = CompiledTemplate::compile_with(template, &components);
+        (Arc::new(template.clone()), compiled, components.into_dependencies())
     };
 
     let root_entity = match input.ui_root {
@@ -258,25 +273,33 @@ pub fn render_template(input: In<RenderTemplate>, world: &mut World) {
     // Discard any previous render (e.g. on hot reload).
     root.remove::<TemplateInstance>();
     root.despawn_children();
+    if dependencies.is_empty() {
+        root.remove::<ComponentDependencies>();
+    } else {
+        root.insert(ComponentDependencies(dependencies));
+    }
 
-    mount_declared_props(world, root_entity, &template.props);
+    let compiled = match compiled {
+        Ok(compiled) => Arc::new(compiled),
+        Err(e) => {
+            error!("Could not render template {:?}: {e}", input.template.path());
+            return;
+        }
+    };
+    mount_declared_props(world, root_entity, &compiled.props);
 
     let mut props = take_props(world, root_entity);
-    match TemplateInstance::render(world, root_entity, template, &props) {
-        Ok(instance) => {
-            let stats = instance.stats();
-            world.entity_mut(root_entity).insert(instance);
-            debug!(
-                "rendered {} on {root_entity}: {} bindings, {} blocks, {} list items, in {:?}",
-                template_name(&input.template),
-                stats.bindings,
-                stats.blocks,
-                stats.items,
-                start.elapsed()
-            );
-        }
-        Err(e) => error!("Could not render template {:?}: {e}", input.template.path()),
-    }
+    let instance = TemplateInstance::render_compiled(world, root_entity, template, compiled, &props);
+    let stats = instance.stats();
+    world.entity_mut(root_entity).insert(instance);
+    debug!(
+        "rendered {} on {root_entity}: {} bindings, {} blocks, {} list items, in {:?}",
+        template_name(&input.template),
+        stats.bindings,
+        stats.blocks,
+        stats.items,
+        start.elapsed()
+    );
     // The render reflects the current props, so pending changes are already applied.
     props.clear_changes();
     restore_props(world, root_entity, props);
@@ -342,56 +365,59 @@ pub(crate) fn restore_props(world: &mut World, entity: Entity, value: Value) {
     }
 }
 
-/// Attaches the template's stylesheet to its root entity. Classes are applied when nodes are
-/// spawned and kept up to date by bindings.
+/// Attaches the template's stylesheet to its root entity: its own styles and those of the
+/// components it uses. Classes are applied when nodes are spawned and kept up to date by bindings.
 pub fn apply_template_classes_and_styles(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     bevue_assets: Res<BevueAssetRegistry>,
     template_nodes: Query<(Entity, &TemplateRef), Changed<TemplateRef>>,
-    root_templates: Query<&Template>,
-    templates: Res<Assets<BevueTemplate>>,
+    root_templates: Query<(&Template, &TemplateInstance)>,
 ) {
     for (entity, template_ref) in &template_nodes {
         if template_ref.root != entity {
             continue;
         }
-        let Ok(root_template) = root_templates.get(entity) else {
-            continue;
-        };
-        let Some(template) = templates.get(&root_template.handle) else {
-            continue;
-        };
-        let Some(style) = template.get(template_ref.node).and_then(|node| node.style.as_ref()) else {
+        let Ok((root_template, instance)) = root_templates.get(entity) else {
             continue;
         };
 
-        let mut style_path = style.src.as_ref().map(|s| s.to_string());
+        let style_path = match instance.styles() {
+            [] => None,
+            // A single external stylesheet is used as it is.
+            [style] if style.inline.trim().is_empty() => style.src.as_ref().map(|s| s.to_string()),
+            styles => {
+                let html_path_str = if let Some(p) = root_template.handle.path() {
+                    p.path().to_string_lossy().to_string()
+                } else {
+                    format!("inline_{entity}")
+                };
 
-        let inline = style.inline.trim();
-        if !inline.is_empty() {
-            let html_path_str = if let Some(p) = root_template.handle.path() {
-                p.path().to_string_lossy().to_string()
-            } else {
-                format!("inline_{entity}")
-            };
+                let css_file_name = format!("{html_path_str}.css");
+                let css_asset_path = format!("bevue://{css_file_name}");
 
-            let css_file_name = format!("{html_path_str}.css");
-            let css_asset_path = format!("bevue://{css_file_name}");
+                // `@import` rules must come before any other rule.
+                let mut full_css = String::new();
+                for src in styles.iter().filter_map(|style| style.src.as_ref()) {
+                    full_css.push_str(&format!("@import \"{src}\";\n"));
+                }
+                for style in styles {
+                    full_css.push_str(&style.inline);
+                    full_css.push('\n');
+                }
 
-            let mut full_css = String::new();
-            if let Some(src) = &style.src {
-                let import_stmt = format!("@import \"{src}\";\n");
-                full_css.push_str(&import_stmt);
+                // Only reload the stylesheet if this render changed it.
+                let path = Path::new(&css_file_name);
+                let unchanged =
+                    bevue_assets.dir.get_asset(path).is_some_and(|asset| asset.value() == full_css.as_bytes());
+                if !unchanged {
+                    bevue_assets.dir.insert_asset_text(path, &full_css);
+                    asset_server.reload(&css_asset_path);
+                }
+
+                Some(css_asset_path)
             }
-            full_css.push_str(&style.inline);
-
-            let path = Path::new(&css_file_name);
-            bevue_assets.dir.insert_asset_text(path, &full_css);
-            asset_server.reload(&css_asset_path);
-
-            style_path = Some(css_asset_path);
-        }
+        };
 
         if let Some(path) = style_path {
             let style_handle: Handle<StyleSheet> = asset_server.load(path);

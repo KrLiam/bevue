@@ -12,11 +12,7 @@
                 <button class="button" @click="add_item()">Add Item</button>
             </div>
             <ul class="items">
-                <li class="item" v-for="(item, i) in inventory.items">
-                    <p>{{ item.id }}</p>
-                    <p class="item_count">{{ item.count }}</p>
-                    <button class="button" @click="remove_item(i)">X</button>
-                </li>
+                <ItemRow v-for="(item, i) in inventory.items" :item="item" @remove="remove_item(i)"/>
             </ul>
         </div>
     </div>
@@ -59,17 +55,5 @@
 
     gap: 10px;
     padding: 5px;
-}
-
-.item {
-    flex-direction: row;
-    column-gap: 10px;
-    background-color: #333;
-    align-items: center;
-    padding: 5px;
-}
-.item_count {
-    font-size: 15;
-    color: #aaa;
 }
 </style>

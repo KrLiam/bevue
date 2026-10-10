@@ -96,7 +96,7 @@ pub const MAX_DISPATCH_DEPTH: u32 = 32;
 #[derive(Resource, Default)]
 struct DispatchDepth(u32);
 
-/// Resolves the handler of the event's target node and runs its function.
+/// Resolves the handlers of the event's target node and runs their functions.
 ///
 /// This is a plain function rather than a registered system: handlers may trigger events (as
 /// `$emit` does) that are dispatched while the outer handler is still running.
@@ -117,14 +117,18 @@ pub fn dispatch_bevue_event(world: &mut World, event: BevueEvent) {
         *slot = instance;
     }
 
-    // Run the handler with everything back in place, so it can freely mutate the template.
-    let Some((function, args)) = resolved else { return };
-    let depth = world.get_resource_or_init::<DispatchDepth>().0;
-    if depth >= MAX_DISPATCH_DEPTH {
-        warn!("Dropped event '{}': more than {MAX_DISPATCH_DEPTH} nested event handlers", event.name);
-        return;
+    // Run the handlers with everything back in place, so they can freely mutate the template.
+    for handler in resolved {
+        let depth = world.get_resource_or_init::<DispatchDepth>().0;
+        if depth >= MAX_DISPATCH_DEPTH {
+            warn!("Dropped event '{}': more than {MAX_DISPATCH_DEPTH} nested event handlers", event.name);
+            return;
+        }
+        // `$emit` triggers on the root it is called for: inside a component, that is the root
+        // element of the component.
+        let root = if handler.function == "$emit" { handler.emit_target } else { root };
+        world.resource_mut::<DispatchDepth>().0 += 1;
+        call_function(world, root, event.entity, &handler.function, handler.args);
+        world.resource_mut::<DispatchDepth>().0 -= 1;
     }
-    world.resource_mut::<DispatchDepth>().0 += 1;
-    call_function(world, root, event.entity, &function, args);
-    world.resource_mut::<DispatchDepth>().0 -= 1;
 }

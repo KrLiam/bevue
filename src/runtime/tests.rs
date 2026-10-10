@@ -944,3 +944,351 @@ mod update_stats {
         assert_eq!(stats, UpdateStats { fired: 4, reconciled: 1, full: true });
     }
 }
+
+mod components {
+    use bevy::{
+        asset::Handle,
+        ecs::{
+            observer::On,
+            resource::Resource,
+            system::{In, ResMut},
+        },
+    };
+    use bevy_flair::prelude::Styled;
+
+    use super::*;
+    use crate::{
+        asset::BevueAssetRegistry,
+        core::template::TemplateRef,
+        runtime::{
+            BevueComponents, BevueCtx, BevueEvent, BevueFunctionsAppExt, BevuePropsAppExt, ComponentDependencies,
+            PropsResource, UpdateStats,
+        },
+    };
+
+    #[derive(Resource, Default)]
+    struct Recorded(Vec<Vec<Value>>);
+
+    #[derive(Resource, Default)]
+    struct EventLog(Vec<(Entity, String)>);
+
+    #[derive(crate::Props, Resource)]
+    struct Menu {
+        title: String,
+    }
+
+    fn record(In(ctx): In<BevueCtx>, mut recorded: ResMut<Recorded>) {
+        recorded.0.push(ctx.args);
+    }
+
+    fn component_app() -> App {
+        let mut app = app();
+        app.init_resource::<Recorded>()
+            .init_resource::<EventLog>()
+            .register_bevue_function("record", record)
+            .add_observer(|event: On<BevueEvent>, mut log: ResMut<EventLog>| {
+                log.0.push((event.entity, event.name.to_string()));
+            });
+        app
+    }
+
+    /// Registers `source` as the component `name`.
+    fn component(app: &mut App, name: &str, source: &str) -> Handle<BevueTemplate> {
+        let template = crate::parser::parse_template(source).unwrap();
+        let handle = app.world_mut().resource_mut::<Assets<BevueTemplate>>().add(template);
+        app.world_mut().get_resource_or_init::<BevueComponents>().insert(name, handle.clone());
+        handle
+    }
+
+    fn node_count(app: &mut App) -> usize {
+        app.world_mut().query::<&TemplateRef>().iter(app.world()).count()
+    }
+
+    fn update(app: &mut App, root: Entity) -> UpdateStats {
+        let world = app.world_mut();
+        let mut instance = std::mem::take(&mut *world.get_mut::<TemplateInstance>(root).unwrap());
+        let mut value = std::mem::take(&mut world.get_mut::<BevueProps>(root).unwrap().value);
+        let stats = instance.update(world, &value, !value.is_dirty());
+        value.clear_changes();
+        world.get_mut::<BevueProps>(root).unwrap().value = value;
+        *world.get_mut::<TemplateInstance>(root).unwrap() = instance;
+        stats
+    }
+
+    const ROW: &str = r#"
+        <li class="row" @click="record('own', item.id)">
+            <p>{{ item.label }}</p>
+            <span>{{ n }}</span>
+            <b v-if="item.done">done</b>
+        </li>
+    "#;
+
+    fn items() -> Value {
+        value!({ "items": [
+            { "id": 1, "label": "a", "done": false },
+            { "id": 2, "label": "b", "done": true },
+            { "id": 3, "label": "c", "done": false },
+        ] })
+    }
+
+    #[test]
+    fn costs_the_same_as_inlined_markup() {
+        // The same template written with a component and by hand.
+        let mut with_component = component_app();
+        component(&mut with_component, "Row", ROW);
+        let a = spawn(
+            &mut with_component,
+            r#"<div><Row v-for="(it, i) in items" :key="it.id" class="x" :item="it" :n="i" @custom="record(i)"/></div>"#,
+            items(),
+        );
+        let mut inlined = component_app();
+        let b = spawn(
+            &mut inlined,
+            r#"<div>
+                <li v-for="(it, i) in items" :key="it.id" class="row" class="x" @click="record('own', it.id)" @custom="record(i)">
+                    <p>{{ it.label }}</p>
+                    <span>{{ i }}</span>
+                    <b v-if="it.done">done</b>
+                </li>
+            </div>"#,
+            items(),
+        );
+
+        let compare = |with_component: &mut App, inlined: &mut App| {
+            assert_eq!(texts(with_component.world(), a), texts(inlined.world(), b));
+            assert_eq!(stats(with_component.world(), a), stats(inlined.world(), b));
+            assert_eq!(node_count(with_component), node_count(inlined));
+            // Every element carries the same components: a component adds none.
+            let (rows_a, rows_b) = (children(with_component.world(), a), children(inlined.world(), b));
+            assert_eq!(rows_a.len(), rows_b.len());
+            for (row_a, row_b) in rows_a.into_iter().zip(rows_b) {
+                let count = |world: &World, entity: Entity| world.entity(entity).archetype().components().len();
+                assert_eq!(count(with_component.world(), row_a), count(inlined.world(), row_b));
+                assert_eq!(
+                    with_component.world().get::<ClassList>(row_a),
+                    inlined.world().get::<ClassList>(row_b)
+                );
+            }
+        };
+        compare(&mut with_component, &mut inlined);
+        assert_eq!(texts(with_component.world(), a), vec!["a", "0", "b", "1", "done", "c", "2"]);
+        assert!(with_component.world().get::<ClassList>(children(with_component.world(), a)[0]).unwrap().contains("x"));
+
+        // The same prop changes do the same work.
+        let changes: [fn(&mut Value); 4] = [
+            |props| {
+                props.at_mut(&path("items[1].label")).unwrap().set("B");
+            },
+            |props| {
+                props.at_mut(&path("items[0].done")).unwrap().set(true);
+            },
+            |props| props.get_mut("items").unwrap().push(value!({ "id": 4, "label": "d", "done": true })),
+            |props| {
+                props.get_mut("items").unwrap().remove_at(0);
+            },
+        ];
+        for change in changes {
+            change(&mut props(&mut with_component, a).value);
+            change(&mut props(&mut inlined, b).value);
+            assert_eq!(update(&mut with_component, a), update(&mut inlined, b));
+            compare(&mut with_component, &mut inlined);
+        }
+        assert_eq!(texts(with_component.world(), a), vec!["B", "0", "done", "c", "1", "d", "2", "done"]);
+    }
+
+    #[test]
+    fn attributes() {
+        let mut app = component_app();
+        component(&mut app, "Card", r#"<div><p>{{ title }}</p><p v-if="open">open</p><p>{{ item_count }}</p></div>"#);
+        let root = spawn(
+            &mut app,
+            r#"<div><Card title="Hi" open :item-count="n"/><Card :title="name" :item-count="2"/></div>"#,
+            value!({ "n": 1, "name": "ana" }),
+        );
+        assert_eq!(texts(app.world(), root), vec!["Hi", "open", "1", "ana", "2"]);
+
+        let first = children(app.world(), root)[0];
+        let [title, _, count] = children(app.world(), first)[..] else { panic!("expected three children") };
+        let title_tick = text_changed_tick(app.world(), title);
+        let count_tick = text_changed_tick(app.world(), count);
+
+        props(&mut app, root).get_mut("n").unwrap().set(5);
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["Hi", "open", "5", "ana", "2"]);
+        assert_eq!(text_changed_tick(app.world(), title), title_tick);
+        assert_ne!(text_changed_tick(app.world(), count), count_tick);
+    }
+
+    #[test]
+    fn keyed_components_and_conditions() {
+        let mut app = component_app();
+        component(&mut app, "Row", ROW);
+        let root = spawn(
+            &mut app,
+            r#"<div>
+                <Row v-for="(it, i) in items" :key="it.id" :item="it" :n="i"/>
+                <Row v-if="extra" :item="extra" n="x"/>
+                <p v-else>none</p>
+            </div>"#,
+            items(),
+        );
+        assert_eq!(texts(app.world(), root), vec!["a", "0", "b", "1", "done", "c", "2", "none"]);
+        let [a, b, c, _] = children(app.world(), root)[..] else { panic!("expected four children") };
+
+        // Reordering moves the entities of the components.
+        props(&mut app, root).get_mut("items").unwrap().remove_at(0);
+        props(&mut app, root).get_mut("items").unwrap().push(value!({ "id": 1, "label": "a", "done": false }));
+        props(&mut app, root).insert("extra", value!({ "id": 9, "label": "z", "done": true }));
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["b", "0", "done", "c", "1", "a", "2", "z", "x", "done"]);
+        assert_eq!(children(app.world(), root)[..3], [b, c, a], "keyed components are reused");
+    }
+
+    #[test]
+    fn nested_components() {
+        let mut app = component_app();
+        component(&mut app, "Tag", r#"<span>{{ label }}:{{ owner }}</span>"#);
+        component(
+            &mut app,
+            "Row",
+            r#"<li><p>{{ item.name }}</p><Tag v-for="tag in item.tags" :label="tag" :owner="item.name"/></li>"#,
+        );
+        let root = spawn(
+            &mut app,
+            r#"<div><Row v-for="item in items" :item="item"/></div>"#,
+            value!({ "items": [{ "name": "a", "tags": ["x", "y"] }, { "name": "b", "tags": [] }] }),
+        );
+        assert_eq!(texts(app.world(), root), vec!["a", "x:a", "y:a", "b"]);
+
+        props(&mut app, root).at_mut(&path("items[1].tags")).unwrap().push("z");
+        props(&mut app, root).at_mut(&path("items[0].name")).unwrap().set("A");
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["A", "x:A", "y:A", "b", "z:b"]);
+    }
+
+    #[test]
+    fn emit_reaches_the_component_element() {
+        let mut app = component_app();
+        component(
+            &mut app,
+            "Row",
+            r#"<li @click="record('own')"><button @custom="$emit('remove', item.label, $event)">x</button></li>"#,
+        );
+        let root = spawn(
+            &mut app,
+            r#"<div><Row v-for="(it, i) in items" :key="it.id" :item="it" @remove="record(i, it.id, $args)" @click="record('host', i)"/></div>"#,
+            items(),
+        );
+        let row = children(app.world(), root)[1];
+        let button = children(app.world(), row)[0];
+
+        app.world_mut().trigger(BevueEvent::new(button, "custom", vec![Value::from("!")]));
+        app.update();
+        assert_eq!(
+            std::mem::take(&mut app.world_mut().resource_mut::<Recorded>().0),
+            vec![vec![Value::from(1), Value::from(2), value!(["b", "!"])]]
+        );
+        let log = std::mem::take(&mut app.world_mut().resource_mut::<EventLog>().0);
+        assert_eq!(log, vec![(button, "custom".to_owned()), (row, "remove".to_owned())]);
+
+        // The root of the component and the element both listen to `click`.
+        app.world_mut().trigger(BevueEvent::new(row, "click", vec![]));
+        app.update();
+        assert_eq!(
+            app.world().resource::<Recorded>().0,
+            vec![vec![Value::from("own")], vec![Value::from("host"), Value::from(1)]]
+        );
+    }
+
+    #[test]
+    fn nested_emit() {
+        let mut app = component_app();
+        component(&mut app, "Inner", r#"<b @custom="$emit('ping', 1)">x</b>"#);
+        component(&mut app, "Outer", r#"<section><Inner @ping="$emit('pong', $event, 2)"/></section>"#);
+        let root = spawn(&mut app, r#"<div><Outer @pong="$emit('done', $args)"/></div>"#, Value::empty_dict());
+        let outer = children(app.world(), root)[0];
+        let inner = children(app.world(), outer)[0];
+
+        app.world_mut().trigger(BevueEvent::new(inner, "custom", vec![]));
+        app.update();
+        let log = std::mem::take(&mut app.world_mut().resource_mut::<EventLog>().0);
+        let expected = [(inner, "custom"), (inner, "ping"), (outer, "pong"), (root, "done")];
+        assert_eq!(log, expected.map(|(entity, name)| (entity, name.to_owned())));
+    }
+
+    #[test]
+    fn props_and_styles_of_components_are_the_hosts() {
+        let mut app = component_app();
+        app.register_props::<Menu>();
+        app.insert_resource(Menu { title: "File".into() });
+        component(
+            &mut app,
+            "Title",
+            r#"<props><resource type="Menu"/></props><template><p>{{ menu.title }}</p></template><style>.title { color: red; }</style>"#,
+        );
+        let root = spawn(
+            &mut app,
+            r#"<template><div><Title/><Title/><span>{{ menu.title }}</span></div></template><style>.host { color: blue; }</style>"#,
+            Value::empty_dict(),
+        );
+        assert_eq!(texts(app.world(), root), vec!["File", "File", "File"]);
+        assert!(app.world().get::<PropsResource<Menu>>(root).is_some());
+
+        app.world_mut().resource_mut::<Menu>().title = "Edit".into();
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["Edit", "Edit", "Edit"]);
+
+        let Some(Styled::StyleSheet(sheet)) = app.world().get::<Styled>(root) else { panic!("expected a stylesheet") };
+        let registry = app.world().resource::<BevueAssetRegistry>();
+        let css = registry.get_asset(sheet.path().unwrap().path()).unwrap();
+        let css = std::str::from_utf8(css.value()).unwrap();
+        let (title, host) = (css.find(".title").unwrap(), css.find(".host").unwrap());
+        assert!(title < host, "the host's rules come last: {css}");
+        assert_eq!(css.matches(".title").count(), 1);
+    }
+
+    #[test]
+    fn late_and_modified_component_assets() {
+        let mut app = component_app();
+        let handle = app.world_mut().resource_mut::<Assets<BevueTemplate>>().reserve_handle();
+        app.world_mut().get_resource_or_init::<BevueComponents>().insert("Row", handle.clone());
+
+        let root = spawn(&mut app, r#"<div><Row :label="name"/><p>after</p></div>"#, value!({ "name": "ana" }));
+        assert_eq!(texts(app.world(), root), vec!["after"]);
+        assert_eq!(children(app.world(), root).len(), 2, "an empty node takes the component's place");
+        assert_eq!(app.world().get::<ComponentDependencies>(root).unwrap().0, vec![handle.id()]);
+
+        // The component arrives.
+        let parse = |source: &str| crate::parser::parse_template(source).unwrap();
+        let _ = app.world_mut().resource_mut::<Assets<BevueTemplate>>().insert(&handle, parse(r#"<b>{{ label }}</b>"#));
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["ana", "after"]);
+
+        // Props set in the meantime survive a reload of the component.
+        props(&mut app, root).get_mut("name").unwrap().set("bo");
+        *app.world_mut().resource_mut::<Assets<BevueTemplate>>().get_mut(&handle).unwrap() = parse(r#"<i>{{ label }}!</i>"#);
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["bo!", "after"]);
+
+        props(&mut app, root).get_mut("name").unwrap().set("cy");
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["cy!", "after"]);
+    }
+
+    #[test]
+    fn invalid_components_do_not_render() {
+        let mut app = component_app();
+        component(&mut app, "Loop", r#"<div><Loop/></div>"#);
+        for source in [r#"<div><Nope/></div>"#, r#"<div><Loop/></div>"#] {
+            let root = spawn(&mut app, source, Value::empty_dict());
+            assert!(app.world().get::<TemplateInstance>(root).is_none(), "{source}");
+            assert!(children(app.world(), root).is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "uppercase")]
+    fn component_names_are_capitalised() {
+        BevueComponents::default().register("row", "row.html");
+    }
+}

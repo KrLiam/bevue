@@ -1,5 +1,5 @@
 use bevue::{
-    BevueCtx, BevuePropsAppExt, Props, Template, asset::BevueAssetPlugin, runtime::BevueRuntimePlugin,
+    BevueComponentsAppExt, BevueCtx, BevuePropsAppExt, Props, Template, asset::BevueAssetPlugin, runtime::BevueRuntimePlugin,
 };
 use bevy::{
     DefaultPlugins, app::{App, Startup, Update}, asset::AssetServer, camera::Camera2d, ecs::{
@@ -50,6 +50,8 @@ fn main() {
         .init_resource::<Inventory>()
         .register_props::<PlayerName>()
         .insert_resource(PlayerName { value: "John".to_owned() })
+        // `<ItemRow/>` in a template renders this file.
+        .register_component("ItemRow", "item_row.html")
         .add_systems(Startup, startup)
         .add_systems(Update, inventory_changed.run_if(resource_changed::<Inventory>));
 
