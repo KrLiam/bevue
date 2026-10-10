@@ -46,9 +46,9 @@ fn main() {
     let mut app = App::new();
 
     app.add_plugins((BevueAssetPlugin, DefaultPlugins, BevueRuntimePlugin))
-        .register_props_resource::<Inventory>()
+        .register_props::<Inventory>()
         .init_resource::<Inventory>()
-        .register_props_resource::<PlayerName>()
+        .register_props::<PlayerName>()
         .insert_resource(PlayerName { value: "John".to_owned() })
         .add_systems(Startup, startup)
         .add_systems(Update, inventory_changed.run_if(resource_changed::<Inventory>));

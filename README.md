@@ -43,7 +43,7 @@ Or derive `Props` on a component or resource and let Bevy change detection sync 
 #[derive(Resource, Props)]
 struct Menu { title: String, actions: Vec<Action> }
 
-app.register_props_resource::<Menu>();
+app.register_props::<Menu>();
 commands.spawn((Template::new(asset_server.load("menu.html")), PropsResource::<Menu>::at("menu")));
 ```
 

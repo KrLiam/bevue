@@ -16,7 +16,7 @@ pub use crate::core::template::TemplateRef;
 pub use events::{BevueEvent, LastInteraction};
 pub use functions::{BevueCtx, BevueFunctions, BevueFunctionsAppExt, TemplateFunctions};
 pub use instance::{TemplateInstance, UpdateStats};
-pub use props::{BevueProps, BevuePropsAppExt, PropsResource, PropsSource};
+pub use props::{BevueProps, BevuePropsAppExt, PropsComponent, PropsResource, RegisterableProps};
 pub use render::{
     apply_template_classes_and_styles, on_render_template, update_templates, watch_template_components, Template,
     TemplateRendered, WaitingForTemplate,

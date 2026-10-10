@@ -8,9 +8,10 @@ use bevy::{
         change_detection::{DetectChanges, DetectChangesMut, Mut, Ref},
         component::Component,
         entity::Entity,
-        resource::Resource,
+        query::With,
+        resource::{IsResource, Resource},
         schedule::IntoScheduleConfigs,
-        system::{Query, Res},
+        system::Query,
     },
     log::{debug, trace},
     platform::time::Instant,
@@ -54,18 +55,18 @@ impl From<Value> for BevueProps {
 
 /// Renders component `T` into the [`BevueProps`] of this template.
 ///
-/// `T` is read from this entity, or from [`PropsSource::from_entity`]. With a key, it is mounted
+/// `T` is read from this entity, or from [`PropsComponent::from_entity`]. With a key, it is mounted
 /// at that path of the props (`{{inventory.slots}}`); without one it becomes the props root
 /// (`{{slots}}`). Register `T` with [`BevuePropsAppExt::register_props`].
 #[derive(Component)]
 #[require(BevueProps)]
-pub struct PropsSource<T: Send + Sync + 'static> {
+pub struct PropsComponent<T: Send + Sync + 'static> {
     pub key: Option<PropPath>,
     pub entity: Option<Entity>,
     _marker: PhantomData<fn() -> T>,
 }
 
-impl<T: Send + Sync + 'static> PropsSource<T> {
+impl<T: Send + Sync + 'static> PropsComponent<T> {
     /// Uses `T` as the props root.
     pub fn root() -> Self {
         Self { key: None, entity: None, _marker: PhantomData }
@@ -85,7 +86,7 @@ impl<T: Send + Sync + 'static> PropsSource<T> {
 }
 
 /// Renders resource `R` into the [`BevueProps`] of this template, at `key` or as the props root.
-/// Register `R` with [`BevuePropsAppExt::register_props_resource`].
+/// Register `R` with [`BevuePropsAppExt::register_props`].
 #[derive(Component)]
 #[require(BevueProps)]
 pub struct PropsResource<R: Send + Sync + 'static> {
@@ -93,7 +94,7 @@ pub struct PropsResource<R: Send + Sync + 'static> {
     _marker: PhantomData<fn() -> R>,
 }
 
-impl<R: Send + Sync + 'static> PropsResource<R> {
+impl<R: Resource> PropsResource<R> {
     /// Uses `R` as the props root.
     pub fn root() -> Self {
         Self { key: None, _marker: PhantomData }
@@ -148,9 +149,9 @@ impl SyncTimer {
     }
 }
 
-/// Copies changed `T` components into the props of templates with a [`PropsSource<T>`].
+/// Copies changed `T` components into the props of templates with a [`PropsComponent<T>`].
 pub fn sync_component_props<T: Component + Props>(
-    mut targets: Query<(Entity, Ref<PropsSource<T>>, &mut BevueProps)>,
+    mut targets: Query<(Entity, Ref<PropsComponent<T>>, &mut BevueProps)>,
     sources: Query<Ref<T>>,
 ) {
     let mut timer = SyncTimer::default();
@@ -164,11 +165,14 @@ pub fn sync_component_props<T: Component + Props>(
 }
 
 /// Copies a changed `R` resource into the props of templates with a [`PropsResource<R>`].
-pub fn sync_resource_props<R: Resource + Props>(
-    resource: Option<Res<R>>,
+///
+/// A resource is a component of its resource entity, so `R` is read from there. This lets the
+/// system be registered for any component, see [`RegisterableProps`].
+pub fn sync_resource_props<R: Component + Props>(
+    resource: Query<Ref<R>, With<IsResource>>,
     mut targets: Query<(Ref<PropsResource<R>>, &mut BevueProps)>,
 ) {
-    let Some(resource) = resource else { return };
+    let Some(resource) = resource.iter().next() else { return };
     let mut timer = SyncTimer::default();
     for (source, mut props) in &mut targets {
         if resource.is_changed() || source.is_changed() {
@@ -178,21 +182,36 @@ pub fn sync_resource_props<R: Resource + Props>(
     timer.log::<R>();
 }
 
+/// A [`Props`] type that can be registered as a template props source with
+/// [`BevuePropsAppExt::register_props`].
+///
+/// It is implemented for every [`Props`] component. Resources are components too, so the same
+/// impl covers them: a registered type can be mounted with a [`PropsComponent`] and, if it is a
+/// resource, with a [`PropsResource`].
+pub trait RegisterableProps: Props + Sized {
+    /// Adds what is needed to sync `Self` into template props.
+    fn register(app: &mut App);
+}
+
+impl<T: Component + Props> RegisterableProps for T {
+    fn register(app: &mut App) {
+        app.add_systems(
+            PostUpdate,
+            (sync_component_props::<T>, sync_resource_props::<T>).in_set(BevueSystems::SyncProps),
+        );
+    }
+}
+
 /// Registers [`Props`] components and resources as template props sources.
 pub trait BevuePropsAppExt {
-    /// Syncs component `T` into templates with a [`PropsSource<T>`] whenever it changes.
-    fn register_props<T: Component + Props>(&mut self) -> &mut Self;
-
-    /// Syncs resource `R` into templates with a [`PropsResource<R>`] whenever it changes.
-    fn register_props_resource<R: Resource + Props>(&mut self) -> &mut Self;
+    /// Syncs `T` into templates with a [`PropsComponent<T>`] or a [`PropsResource<T>`] whenever it
+    /// changes.
+    fn register_props<T: RegisterableProps>(&mut self) -> &mut Self;
 }
 
 impl BevuePropsAppExt for App {
-    fn register_props<T: Component + Props>(&mut self) -> &mut Self {
-        self.add_systems(PostUpdate, sync_component_props::<T>.in_set(BevueSystems::SyncProps))
-    }
-
-    fn register_props_resource<R: Resource + Props>(&mut self) -> &mut Self {
-        self.add_systems(PostUpdate, sync_resource_props::<R>.in_set(BevueSystems::SyncProps))
+    fn register_props<T: RegisterableProps>(&mut self) -> &mut Self {
+        T::register(self);
+        self
     }
 }

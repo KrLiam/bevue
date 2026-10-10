@@ -14,7 +14,7 @@
 use std::time::{Duration, Instant};
 
 use bevue::{
-    BevueProps, BevuePropsAppExt, Props, PropsResource, PropsSource, Template, Value,
+    BevueProps, BevuePropsAppExt, Props, PropsComponent, PropsResource, Template, Value,
     core::{path::PropPath, template::BevueTemplate},
     parser::parse_template,
     runtime::{
@@ -119,7 +119,7 @@ impl Bench {
     fn new(source: Source) -> Self {
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, AssetPlugin::default(), BevueRuntimePlugin))
-            .register_props_resource::<Inventory>()
+            .register_props::<Inventory>()
             .register_props::<InventoryComponent>();
         app.finish();
         app.cleanup();
@@ -148,7 +148,7 @@ impl Bench {
             }
             Source::Component => {
                 let data = InventoryComponent::from(inventory(n));
-                world.spawn((template, data, PropsSource::<InventoryComponent>::at("inv"))).id()
+                world.spawn((template, data, PropsComponent::<InventoryComponent>::at("inv"))).id()
             }
             Source::Direct => world.spawn((template, BevueProps::new(props_value(n)))).id(),
         };
@@ -273,7 +273,7 @@ fn render_scratch(c: &mut Criterion) {
             bench(&mut group, phase, n, || {
                 let world = b.app.world_mut();
                 let entity = match source {
-                    Source::Component => world.spawn((data.clone(), PropsSource::<InventoryComponent>::at("inv"))).id(),
+                    Source::Component => world.spawn((data.clone(), PropsComponent::<InventoryComponent>::at("inv"))).id(),
                     _ => world.spawn(PropsResource::<Inventory>::at("inv")).id(),
                 };
                 let elapsed = timed(|| b.sync());

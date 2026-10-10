@@ -388,7 +388,7 @@ mod props_sources {
     use bevy::ecs::{component::Component, resource::Resource};
 
     use super::*;
-    use crate::runtime::{BevuePropsAppExt, PropsResource, PropsSource};
+    use crate::runtime::{BevuePropsAppExt, PropsComponent, PropsResource};
 
     #[derive(crate::Props, Resource, Default)]
     struct Menu {
@@ -423,7 +423,7 @@ mod props_sources {
     #[test]
     fn resource_changes_update_bound_nodes() {
         let mut app = app();
-        app.register_props_resource::<Menu>();
+        app.register_props::<Menu>();
         app.insert_resource(menu());
 
         let template = crate::parser::parse_template(MENU).unwrap();
@@ -464,12 +464,12 @@ mod props_sources {
         let handle = app.world_mut().resource_mut::<Assets<BevueTemplate>>().add(template);
         let local = app
             .world_mut()
-            .spawn((Template::new(handle.clone()), Player { name: "ana".into(), hp: 10 }, PropsSource::<Player>::root()))
+            .spawn((Template::new(handle.clone()), Player { name: "ana".into(), hp: 10 }, PropsComponent::<Player>::root()))
             .id();
         let player = app.world_mut().spawn(Player { name: "bo".into(), hp: 3 }).id();
         let remote = app
             .world_mut()
-            .spawn((Template::new(handle), PropsSource::<Player>::root().from_entity(player)))
+            .spawn((Template::new(handle), PropsComponent::<Player>::root().from_entity(player)))
             .id();
         app.update();
         assert_eq!(texts(app.world(), local), vec!["ana: 10"]);

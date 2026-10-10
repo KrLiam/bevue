@@ -33,7 +33,7 @@ fn main() {
     let log = LogPlugin { filter: "wgpu=error,naga=warn,bevue=debug".into(), ..Default::default() };
 
     app.add_plugins((BevueAssetPlugin, DefaultPlugins.set(log), BevueRuntimePlugin))
-        .register_props_resource::<Counter>()
+        .register_props::<Counter>()
         .init_resource::<Counter>()
         .register_bevue_function("add_item", add_item)
         .add_systems(Startup, startup)
