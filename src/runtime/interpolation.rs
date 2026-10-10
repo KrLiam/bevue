@@ -3,6 +3,7 @@
 use std::{borrow::Cow, sync::Arc};
 
 use bevy::log::warn;
+use bevy_flair::prelude::InlineStyle;
 
 use crate::core::{
     compile::{CompiledExpr, CompiledFragment, CompiledSegment, CompiledText, ScopeRef},
@@ -103,6 +104,13 @@ pub fn eval<'r, 'p: 'r>(expr: &'r CompiledExpr, ctx: &mut EvalCtx<'p, '_, '_>) -
             }
             Cow::Owned(navigate(&result, segments, ctx).cloned().unwrap_or_default())
         }
+        CompiledExpr::Object(entries) => {
+            let mut dict = Value::empty_dict();
+            for (key, value) in entries {
+                dict.insert(key.as_ref(), eval(value, ctx).into_owned());
+            }
+            Cow::Owned(dict)
+        }
     }
 }
 
@@ -186,6 +194,76 @@ fn push_classes(value: &Value, out: &mut Vec<String>) {
         }
         _ => {}
     }
+}
+
+/// Evaluates style attributes like Vue: a string holds CSS declarations, an object or dict maps
+/// property names to values and a list holds any of these. Later declarations of a property win.
+pub fn inline_style(styles: &[CompiledExpr], ctx: &mut EvalCtx<'_, '_, '_>) -> InlineStyle {
+    let mut out = InlineStyle::default();
+    for expr in styles {
+        match expr {
+            // Read entry by entry: a dict would lose the order the declarations were written in.
+            CompiledExpr::Object(entries) => {
+                for (key, value) in entries {
+                    set_declaration(&mut out, key, &eval(value, ctx));
+                }
+            }
+            _ => push_styles(&eval(expr, ctx), &mut out),
+        }
+    }
+    out
+}
+
+fn push_styles(value: &Value, out: &mut InlineStyle) {
+    match value.value_type() {
+        ValueType::String(s) => {
+            for declaration in s.split(';') {
+                if let Some((name, value)) = declaration.split_once(':') {
+                    out.set(name.trim(), value.trim().to_owned());
+                }
+            }
+        }
+        ValueType::List(list) => list.iter().for_each(|v| push_styles(v, out)),
+        ValueType::Dict(map) => {
+            // Dict iteration order is unspecified; sorting keeps the style stable and puts a
+            // shorthand before its longhands (`margin` before `margin-left`).
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            for (key, value) in entries {
+                set_declaration(out, key, value);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Sets the property `key`, or removes it if the value is `null` or `false`.
+fn set_declaration(out: &mut InlineStyle, key: &str, value: &Value) {
+    let name = css_property_name(key);
+    match value.value_type() {
+        ValueType::Null | ValueType::Boolean(false) => out.remove(&name),
+        _ => out.set(name.into_owned(), value.to_text()),
+    }
+}
+
+/// Converts `backgroundColor` and `background_color` to `background-color`. Custom properties
+/// (`--name`) are case sensitive and returned unchanged.
+pub fn css_property_name(key: &str) -> Cow<'_, str> {
+    if key.starts_with("--") || !key.contains(|c: char| c == '_' || c.is_ascii_uppercase()) {
+        return Cow::Borrowed(key);
+    }
+    let mut out = String::with_capacity(key.len() + 2);
+    for c in key.chars() {
+        match c {
+            '_' => out.push('-'),
+            c if c.is_ascii_uppercase() => {
+                out.push('-');
+                out.push(c.to_ascii_lowercase());
+            }
+            c => out.push(c),
+        }
+    }
+    Cow::Owned(out)
 }
 
 #[cfg(test)]

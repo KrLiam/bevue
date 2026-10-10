@@ -97,14 +97,19 @@ pub fn load_components(world: &mut World) {
 /// The component templates the last render of this template asked for, loaded or not. The
 /// template is rendered again when one of them is loaded or modified.
 #[derive(Component, Debug, Default, Clone, PartialEq, Eq)]
-pub struct ComponentDependencies(pub Vec<AssetId<BevueTemplate>>);
+pub struct ComponentDependencies {
+    pub assets: Vec<AssetId<BevueTemplate>>,
+    /// Those of `assets` that were not available, for which an empty node was rendered. The
+    /// template is rendered again when one of them is added.
+    pub pending: Vec<AssetId<BevueTemplate>>,
+}
 
 /// Resolves components from the registry and the loaded template assets, recording the ones
 /// asked for.
 pub(crate) struct WorldComponents<'w> {
     components: Option<&'w BevueComponents>,
     templates: &'w Assets<BevueTemplate>,
-    used: RefCell<Vec<AssetId<BevueTemplate>>>,
+    used: RefCell<ComponentDependencies>,
 }
 
 impl<'w> WorldComponents<'w> {
@@ -112,7 +117,7 @@ impl<'w> WorldComponents<'w> {
         Self { components: world.get_resource::<BevueComponents>(), templates, used: RefCell::default() }
     }
 
-    pub(crate) fn into_dependencies(self) -> Vec<AssetId<BevueTemplate>> {
+    pub(crate) fn into_dependencies(self) -> ComponentDependencies {
         self.used.into_inner()
     }
 }
@@ -124,12 +129,17 @@ impl ComponentResolver for WorldComponents<'_> {
         };
         let Some(handle) = &component.handle else { return ResolvedComponent::Pending };
         let mut used = self.used.borrow_mut();
-        if !used.contains(&handle.id()) {
-            used.push(handle.id());
+        if !used.assets.contains(&handle.id()) {
+            used.assets.push(handle.id());
         }
         match self.templates.get(handle) {
             Some(template) => ResolvedComponent::Ready(template),
-            None => ResolvedComponent::Pending,
+            None => {
+                if !used.pending.contains(&handle.id()) {
+                    used.pending.push(handle.id());
+                }
+                ResolvedComponent::Pending
+            }
         }
     }
 }

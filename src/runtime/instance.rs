@@ -19,7 +19,7 @@ use bevy::{
     ecs::{component::Component, entity::Entity, hierarchy::ChildOf, world::World},
     ui::{Interaction, Node, widget::Text},
 };
-use bevy_flair::prelude::ClassList;
+use bevy_flair::prelude::{ClassList, InlineStyle};
 
 use crate::{
     core::{
@@ -32,7 +32,7 @@ use crate::{
     },
     runtime::{
         functions::call_function,
-        interpolation::{class_names, eval, eval_path, no_calls, render_text, EvalCtx, Frame, FrameElement},
+        interpolation::{class_names, eval, eval_path, inline_style, no_calls, render_text, EvalCtx, Frame, FrameElement},
     },
 };
 
@@ -180,6 +180,7 @@ enum TrieOwner {
 enum BindingKind {
     Text,
     Class,
+    Style,
     If(BlockId),
     For(BlockId),
 }
@@ -286,7 +287,7 @@ pub struct InstanceStats {
 /// What a [`TemplateInstance::update`] did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UpdateStats {
-    /// Text, class and `v-if` bindings that were re-evaluated.
+    /// Text, class, style and `v-if` bindings that were re-evaluated.
     pub fired: usize,
     /// Lists that were reconciled against their elements.
     pub reconciled: usize,
@@ -354,6 +355,11 @@ impl TemplateInstance {
             instance.spawn_element(world, props, &mut pending, root_id, Some(root), None, &[], OwnerRef::Root);
         }
         instance
+    }
+
+    /// Returns true if any node of the template has a `style` or `:style` attribute.
+    pub fn has_inline_styles(&self) -> bool {
+        self.compiled.nodes.iter().any(|node| !node.styles.is_empty())
     }
 
     /// The styles of the template and of the components it uses.
@@ -521,6 +527,14 @@ impl TemplateInstance {
         } else if !node.classes.is_empty() {
             let names = class_names(&node.classes, &mut EvalCtx::new(&[], props, &mut no_calls));
             world.entity_mut(entity).insert(ClassList::new_with_classes(names));
+        }
+
+        if node.has_dynamic_styles() {
+            let id = self.add_binding(entity, node_id, BindingKind::Style, scope, owner, node.styles.iter(), DepMode::Deep);
+            self.apply(world, props, id);
+        } else if !node.styles.is_empty() {
+            let style = inline_style(&node.styles, &mut EvalCtx::new(&[], props, &mut no_calls));
+            world.entity_mut(entity).insert(style);
         }
 
         let mut slots = Vec::with_capacity(node.slots.len());
@@ -789,7 +803,7 @@ impl TemplateInstance {
         id
     }
 
-    /// Re-evaluates a text or class binding and writes it to its entity if it changed.
+    /// Re-evaluates a text, class or style binding and writes it to its entity if it changed.
     fn apply(&mut self, world: &mut World, props: &Value, id: BindingId) {
         let Some(binding) = self.bindings.get(id) else { return };
         let node = self.compiled.get(binding.node);
@@ -820,6 +834,18 @@ impl TemplateInstance {
                 let Ok(mut entity) = world.get_entity_mut(binding.entity) else { return };
                 if entity.get::<ClassList>() != Some(&classes) {
                     entity.insert(classes);
+                }
+            }
+            BindingKind::Style => {
+                let frames = self.frames(world, &binding.scope, props);
+                let mut call = caller(world, self.root, binding.entity);
+                let style = inline_style(&node.styles, &mut EvalCtx::new(&frames, props, &mut call));
+                drop(call);
+                let Ok(mut entity) = world.get_entity_mut(binding.entity) else { return };
+                // An emptied style still replaces the previous one, or flair keeps applying it.
+                let current = entity.get::<InlineStyle>();
+                if current != Some(&style) && (current.is_some() || style != InlineStyle::default()) {
+                    entity.insert(style);
                 }
             }
             BindingKind::If(_) | BindingKind::For(_) => {}

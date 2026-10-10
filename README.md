@@ -17,6 +17,7 @@ Bevue is only inspired by Vue, it won't:
 - [X] Easy styling with CSS through `bevy-flair` crate;
 - [X] Rendering static components to Bevy UI;
 - [X] Text and class interpolation e.g `Hello {{ user.name }}!`, `:class="state"`;
+- [X] Dynamic styles with `:style`, e.g. `:style="{ 'background-color': theme.color }"`;
 - [X] Conditional rendering using the `v-if`, `v-else-if` and `v-else` directives;
 - [X] Keyed list rendering using the `v-for` directive, e.g. `v-for="(item, i) in items" :key="item.id"`;
 - [X] Fine-grained reactivity: only UI nodes bound to the props that changed are updated;
@@ -73,6 +74,34 @@ A template can also declare the registered types it renders, in a `<props>` elem
   name refers to the one registered last.
 - `name` is the key in the props. Without it, the default name of the type is used.
 - A `PropsResource` or `PropsComponent` you inserted yourself for the same type is kept as it is.
+
+# Dynamic styles
+
+`:style` sets CSS properties of a node from props. They are written to the node's `InlineStyle`
+component, which `bevy-flair` applies over the rules of the stylesheet.
+
+```html
+<div :style="{ backgroundColor: theme.color, 'border-radius': '4px', '--gap': theme.gap }"></div>
+<div style="width: 200px" :style="theme.panel"></div>
+```
+
+`{ key: value, 'quoted-key': value }` is an object literal. It can be used in any expression, for
+example `:class="{ active: item.selected }"`.
+
+- The value of `:style` is an object literal, a dict from props, a string of CSS declarations
+  (which is what a plain `style` attribute is) or a list of these. Several `style` and `:style`
+  attributes are merged, and the last declaration of a property wins.
+- `backgroundColor` and `background_color` are read as `background-color`, so a `#[derive(Props)]`
+  struct can be used as a style. Custom properties (`--gap`) are passed unchanged.
+- Values are written as they are: numbers get no unit, so use `'10px'` or a function that formats
+  the number. A `null` or `false` value leaves the property out.
+- A style is re-evaluated only when a prop it reads changes, and is applied in the same frame:
+  `BevueSystems` run before `bevy-flair`'s `StyleSystems`.
+- `bevy-flair` only applies inline styles to nodes that have a stylesheet. A template that uses
+  `style` attributes and has neither a `<style>` block nor an ancestor with a stylesheet gets an
+  empty one.
+- If a style is not valid CSS, `bevy-flair` logs the error and, in that frame, stops reading the
+  other styles that changed. Those are applied the next time they change.
 
 # Functions and events
 
@@ -132,7 +161,7 @@ app.register_component("ItemRow", "item_row.html");
 - Attributes are the component's props: `:item="expr"` is evaluated in the template using the
   component, `title="text"` is a string and a bare `open` is `true`. A `-` in a name becomes `_`
   (`:item-count` is read as `item_count`).
-- `class`, `:class`, `v-if`, `v-else-if`, `v-else`, `v-for` and `:key` apply to the root element of
+- `class`, `:class`, `style`, `:style`, `v-if`, `v-else-if`, `v-else`, `v-for` and `:key` apply to the root element of
   the component, which takes the place of the component element.
 - `$emit(name, ...args)` inside a component triggers the event on the component's root element,
   where the `@name` listener of the component element handles it.

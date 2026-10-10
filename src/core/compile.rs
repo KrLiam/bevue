@@ -49,11 +49,22 @@ pub enum CompiledExpr {
     Path { root: ScopeRef, segments: Vec<CompiledSegment> },
     /// A call to a registered function; `segments` are applied to its result.
     Call { function: Cow<'static, str>, args: Vec<CompiledExpr>, segments: Vec<CompiledSegment> },
+    /// An object literal, which evaluates to a dict. Entries are in source order.
+    Object(Vec<(Cow<'static, str>, CompiledExpr)>),
 }
 
 impl CompiledExpr {
     pub fn is_literal(&self) -> bool {
         matches!(self, CompiledExpr::Literal(_))
+    }
+
+    /// Returns true if evaluating the expression reads nothing: a literal, or an object of them.
+    pub fn is_static(&self) -> bool {
+        match self {
+            CompiledExpr::Literal(_) => true,
+            CompiledExpr::Object(entries) => entries.iter().all(|(_, value)| value.is_static()),
+            CompiledExpr::Path { .. } | CompiledExpr::Call { .. } => false,
+        }
     }
 
     /// Appends the paths this expression reads. A dynamic segment cuts the path there, so
@@ -87,6 +98,11 @@ impl CompiledExpr {
                     if let CompiledSegment::Dynamic(index) = segment {
                         index.dependencies(out);
                     }
+                }
+            }
+            CompiledExpr::Object(entries) => {
+                for (_, value) in entries {
+                    value.dependencies(out);
                 }
             }
         }
@@ -163,6 +179,8 @@ pub struct CompiledNode {
     pub text: Option<CompiledText>,
     /// All `class` and `:class` attributes, merged at render time.
     pub classes: Vec<CompiledExpr>,
+    /// All `style` and `:style` attributes, merged at render time with later ones winning.
+    pub styles: Vec<CompiledExpr>,
     pub slots: Vec<Slot>,
     pub list: Option<CompiledList>,
     pub listeners: Vec<CompiledListener>,
@@ -171,7 +189,12 @@ pub struct CompiledNode {
 impl CompiledNode {
     /// Returns true if any class attribute needs evaluating.
     pub fn has_dynamic_classes(&self) -> bool {
-        self.classes.iter().any(|c| !c.is_literal())
+        self.classes.iter().any(|c| !c.is_static())
+    }
+
+    /// Returns true if any style attribute needs evaluating.
+    pub fn has_dynamic_styles(&self) -> bool {
+        self.styles.iter().any(|s| !s.is_static())
     }
 
     /// Returns true if the node listens to an event triggered from `Interaction`.
@@ -370,10 +393,13 @@ impl<'a> Compiler<'a> {
         // Everything written on the element belongs to the scope the element is in.
         let mut props = Vec::new();
         let mut classes = Vec::new();
+        let mut styles = Vec::new();
         for (attribute, expr) in &node.attributes {
             let expr = self.expr(expr)?;
             if attribute == "class" {
                 classes.push(expr);
+            } else if attribute == "style" {
+                styles.push(expr);
             } else {
                 props.push((attribute.replace('-', "_"), expr));
             }
@@ -397,6 +423,7 @@ impl<'a> Compiler<'a> {
 
         let compiled = &mut out.nodes[*target];
         compiled.classes.extend(classes);
+        compiled.styles.extend(styles);
         compiled.listeners.extend(listeners);
         if let Some(style) = &root_node.style {
             out.add_style(style);
@@ -442,13 +469,16 @@ impl<'a> Compiler<'a> {
             )),
             None => None,
         };
-        let classes = node
-            .attributes
-            .iter()
-            .filter(|(name, _)| name == "class")
-            .map(|(_, expr)| self.expr(expr))
-            .collect::<Result<_, _>>()
-            .map_err(|e| e.at(id))?;
+        let attributes = |name: &str| {
+            node.attributes
+                .iter()
+                .filter(|(attribute, _)| attribute == name)
+                .map(|(_, expr)| self.expr(expr))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.at(id))
+        };
+        let classes = attributes("class")?;
+        let styles = attributes("style")?;
 
         let listeners = self.listeners(node).map_err(|e| e.at(id))?;
 
@@ -513,6 +543,7 @@ impl<'a> Compiler<'a> {
         let compiled = &mut out.nodes[self.offset + *id];
         compiled.text = text;
         compiled.classes = classes;
+        compiled.styles = styles;
         compiled.slots = slots;
         compiled.listeners = listeners;
         Ok(())
@@ -538,6 +569,12 @@ impl<'a> Compiler<'a> {
             Expression::String(s) => CompiledExpr::Literal(Value::from(s.as_ref())),
             Expression::Bool(b) => CompiledExpr::Literal(Value::from(*b)),
             Expression::Identifier(ident) => self.resolve(ident)?,
+            Expression::Object(entries) => CompiledExpr::Object(
+                entries
+                    .iter()
+                    .map(|(key, value)| Ok((key.clone(), self.expr(value)?)))
+                    .collect::<Result<_, CompileError>>()?,
+            ),
             Expression::Call { function, args } => {
                 if function.as_str() == "$emit" && !self.in_handler {
                     return Err(CompileError::unplaced("$emit can only be used in event handlers"));
@@ -607,7 +644,9 @@ impl<'a> Compiler<'a> {
                 segments.push(segment);
                 Ok(CompiledExpr::Call { function, args, segments })
             }
-            CompiledExpr::Literal(_) => Err(CompileError::unplaced("cannot access a field of a literal")),
+            CompiledExpr::Literal(_) | CompiledExpr::Object(_) => {
+                Err(CompileError::unplaced("cannot access a field of a literal"))
+            }
         }
     }
 }
@@ -946,6 +985,63 @@ mod tests {
         assert_eq!(
             compiled.get(row).text.as_ref().unwrap().0,
             vec![CompiledFragment::Expr(CompiledExpr::Literal(Value::from("x")))]
+        );
+    }
+
+    #[test]
+    fn style_attributes() {
+        let template = parse_template(
+            r#"<ul><li v-for="(it, i) in items" style="top: 1px" :style="{ color: it.color, order: i, left: '2px' }">x</li></ul>"#,
+        )
+        .unwrap();
+        let compiled = CompiledTemplate::compile(&template).unwrap();
+        let node = compiled.get(NodeId(1));
+        assert!(node.has_dynamic_styles());
+        assert_eq!(
+            node.styles,
+            vec![
+                CompiledExpr::Literal(Value::from("top: 1px")),
+                CompiledExpr::Object(vec![
+                    ("color".into(), CompiledExpr::Path { root: ScopeRef::Item(0), segments: vec![key("color")] }),
+                    ("order".into(), CompiledExpr::Path { root: ScopeRef::Index(0), segments: vec![] }),
+                    ("left".into(), CompiledExpr::Literal(Value::from("2px"))),
+                ]),
+            ]
+        );
+        let mut dependencies = Vec::new();
+        node.styles[1].dependencies(&mut dependencies);
+        assert_eq!(
+            dependencies,
+            vec![(ScopeRef::Item(0), vec![PathSegment::Key("color".into())]), (ScopeRef::Index(0), vec![])]
+        );
+
+        let template = parse_template(r#"<p style="top: 1px" :style="{ left: '2px' }">x</p>"#).unwrap();
+        assert!(!CompiledTemplate::compile(&template).unwrap().get(NodeId(0)).has_dynamic_styles());
+
+        let template = parse_template(r#"<p>{{ { a: 1 }.a }}</p>"#).unwrap();
+        assert!(CompiledTemplate::compile(&template).is_err());
+    }
+
+    #[test]
+    fn component_style_attributes() {
+        let components = Components::new(&[("Box", r#"<p style="top: 1px" :style="{ color: tint, style: style }">x</p>"#)]);
+        let compiled =
+            compile_with(r#"<div><Box v-for="it in items" :tint="it.color" :style="{ left: it.x }"/></div>"#, &components)
+                .unwrap();
+        let Slot::For(root) = compiled.get(NodeId(0)).slots[0] else { panic!("expected a list") };
+        let item = |field| CompiledExpr::Path { root: ScopeRef::Item(0), segments: vec![key(field)] };
+        assert_eq!(
+            compiled.get(root).styles,
+            vec![
+                CompiledExpr::Literal(Value::from("top: 1px")),
+                // `style` on the element is not a prop of the component.
+                CompiledExpr::Object(vec![
+                    ("color".into(), item("color")),
+                    ("style".into(), CompiledExpr::Path { root: ScopeRef::Props, segments: vec![key("style")] }),
+                ]),
+                // The element's own style comes last, so it wins.
+                CompiledExpr::Object(vec![("left".into(), item("x"))]),
+            ]
         );
     }
 

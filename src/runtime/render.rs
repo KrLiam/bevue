@@ -8,6 +8,7 @@ use bevy::{
         entity::Entity,
         error::FallbackErrorHandler,
         event::Event,
+        hierarchy::ChildOf,
         message::MessageReader,
         observer::On,
         lifecycle::HookContext,
@@ -192,7 +193,8 @@ pub fn watch_template_components(
             // A template is rendered again when one of the components it uses changes.
             let modified = modified_asset_ids.contains(&template.handle.id())
                 || dependencies.is_some_and(|d| {
-                    d.0.iter().any(|id| modified_asset_ids.contains(id) || added_asset_ids.contains(id))
+                    d.assets.iter().any(|id| modified_asset_ids.contains(id))
+                        || d.pending.iter().any(|id| added_asset_ids.contains(id))
                 });
             if modified && assets.contains(&template.handle) {
                 commands.trigger(RenderTemplate {
@@ -273,10 +275,10 @@ pub fn render_template(input: In<RenderTemplate>, world: &mut World) {
     // Discard any previous render (e.g. on hot reload).
     root.remove::<TemplateInstance>();
     root.despawn_children();
-    if dependencies.is_empty() {
+    if dependencies.assets.is_empty() {
         root.remove::<ComponentDependencies>();
     } else {
-        root.insert(ComponentDependencies(dependencies));
+        root.insert(dependencies);
     }
 
     let compiled = match compiled {
@@ -373,6 +375,8 @@ pub fn apply_template_classes_and_styles(
     bevue_assets: Res<BevueAssetRegistry>,
     template_nodes: Query<(Entity, &TemplateRef), Changed<TemplateRef>>,
     root_templates: Query<(&Template, &TemplateInstance)>,
+    parents: Query<&ChildOf>,
+    styled: Query<&Styled>,
 ) {
     for (entity, template_ref) in &template_nodes {
         if template_ref.root != entity {
@@ -382,8 +386,16 @@ pub fn apply_template_classes_and_styles(
             continue;
         };
 
+        // `bevy_flair` only applies inline styles to entities that have a stylesheet, their own or
+        // an inherited one. A template with `style` attributes and neither gets an empty one.
+        let needs_stylesheet = || {
+            instance.has_inline_styles()
+                && std::iter::once(entity)
+                    .chain(parents.iter_ancestors(entity))
+                    .all(|e| matches!(styled.get(e), Ok(Styled::Inherited) | Err(_)))
+        };
         let style_path = match instance.styles() {
-            [] => None,
+            [] if !needs_stylesheet() => None,
             // A single external stylesheet is used as it is.
             [style] if style.inline.trim().is_empty() => style.src.as_ref().map(|s| s.to_string()),
             styles => {
@@ -630,7 +642,9 @@ mod test {
             *asset = updated_template;
         }
 
-        // Update to trigger file watching re-render
+        // Update to trigger file watching re-render. The asset event is emitted at the end of a
+        // frame and read on the next one.
+        app.update();
         app.update();
 
         let (new_count, new_texts) = count_children(&mut app);

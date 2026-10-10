@@ -142,6 +142,195 @@ fn class_binding() {
     assert!(!classes.contains("on"));
 }
 
+mod styles {
+    use bevy::{color::Color, ecs::change_detection::Tick, ui::BackgroundColor};
+    use bevy_flair::prelude::{InlineStyle, Styled};
+
+    use super::*;
+
+    fn style(world: &World, entity: Entity) -> InlineStyle {
+        world.get::<InlineStyle>(entity).cloned().expect("expected an inline style")
+    }
+
+    fn style_tick(world: &World, entity: Entity) -> Tick {
+        world.entity(entity).get_ref::<InlineStyle>().unwrap().last_changed()
+    }
+
+    fn background(world: &World, entity: Entity) -> Color {
+        world.get::<BackgroundColor>(entity).expect("expected a background color").0
+    }
+
+    #[test]
+    fn style_values() {
+        let mut app = app();
+        let root = spawn(
+            &mut app,
+            r#"
+            <div>
+                <p :style="{ backgroundColor: theme.color, 'border-radius': '4px', width: 10, '--Gap': theme.gap }">a</p>
+                <p :style="theme.panel">b</p>
+                <p style="width: 200px; color: red" :style="{ color: theme.color }" :style="theme.list">c</p>
+                <p style="left: 1px">d</p>
+                <p :style="{ top: '2px', left: false }">e</p>
+                <p>f</p>
+            </div>
+            "#,
+            value!({ "theme": { "color": "blue", "gap": "2px", "panel": { "margin_left": "3px", "margin": "1px" }, "list": [{ "margin_left": "3px", "margin": "1px" }, "top: 1px"] } }),
+        );
+        let [a, b, c, d, e, f] = children(app.world(), root)[..] else { panic!("expected six children") };
+        // Declarations keep the order they were written in, which `InlineStyle` compares by.
+        let expected = [("background-color", "blue"), ("border-radius", "4px"), ("width", "10"), ("--Gap", "2px")];
+        assert_eq!(style(app.world(), a), InlineStyle::from_iter(expected));
+        assert_eq!(format!("{:?}", style(app.world(), a)), format!("{:?}", InlineStyle::from_iter(expected)));
+        assert_eq!(style(app.world(), b), InlineStyle::new("margin: 1px; margin-left: 3px"));
+        assert_eq!(
+            style(app.world(), c),
+            InlineStyle::new("width: 200px; color: blue; margin: 1px; margin-left: 3px; top: 1px")
+        );
+        assert_eq!(style(app.world(), d), InlineStyle::new("left: 1px"));
+        assert_eq!(style(app.world(), e), InlineStyle::new("top: 2px"));
+        assert!(app.world().get::<InlineStyle>(f).is_none());
+        // Static styles need no binding.
+        assert_eq!(stats(app.world(), root).bindings, 3);
+    }
+
+    #[test]
+    fn style_updates_only_bound_nodes() {
+        let mut app = app();
+        let root = spawn(
+            &mut app,
+            r#"<div><p :style="{ color: a }">x</p><p :style="{ color: b, top: t }">y</p></div>"#,
+            value!({ "a": "red", "b": "blue" }),
+        );
+        let [first, second] = children(app.world(), root)[..] else { panic!("expected two children") };
+        assert_eq!(style(app.world(), second), InlineStyle::new("color: blue"));
+        let (first_tick, second_tick) = (style_tick(app.world(), first), style_tick(app.world(), second));
+
+        props(&mut app, root).get_mut("a").unwrap().set("green");
+        app.update();
+        assert_eq!(style(app.world(), first), InlineStyle::new("color: green"));
+        assert_ne!(style_tick(app.world(), first), first_tick);
+        assert_eq!(style_tick(app.world(), second), second_tick);
+
+        // A value that goes away removes its declaration; an emptied style stays as an empty one.
+        props(&mut app, root).insert("t", "1px");
+        app.update();
+        assert_eq!(style(app.world(), second), InlineStyle::new("color: blue; top: 1px"));
+        props(&mut app, root).insert("t", Value::null());
+        props(&mut app, root).insert("b", Value::null());
+        app.update();
+        assert_eq!(style(app.world(), second), InlineStyle::default());
+    }
+
+    #[test]
+    fn no_style_until_a_value_exists() {
+        let mut app = app();
+        let root = spawn(&mut app, r#"<div><p :style="{ color: a }">x</p></div>"#, Value::empty_dict());
+        let p = children(app.world(), root)[0];
+        assert!(app.world().get::<InlineStyle>(p).is_none());
+
+        props(&mut app, root).insert("a", "red");
+        app.update();
+        assert_eq!(style(app.world(), p), InlineStyle::new("color: red"));
+    }
+
+    #[test]
+    fn styles_in_lists() {
+        let mut app = app();
+        let root = spawn(
+            &mut app,
+            r#"<ul><li v-for="(item, i) in items" :key="item.id" :style="{ color: item.color, order: i }">x</li></ul>"#,
+            value!({ "items": [{ "id": 1, "color": "red" }, { "id": 2, "color": "blue" }] }),
+        );
+        let [one, two] = children(app.world(), root)[..] else { panic!("expected two children") };
+        assert_eq!(style(app.world(), two), InlineStyle::new("color: blue; order: 1"));
+
+        props(&mut app, root).get_mut("items").unwrap().swap(0, 1);
+        app.update();
+        assert_eq!(children(app.world(), root), vec![two, one]);
+        assert_eq!(style(app.world(), two), InlineStyle::new("color: blue; order: 0"));
+        assert_eq!(style(app.world(), one), InlineStyle::new("color: red; order: 1"));
+    }
+
+    #[test]
+    fn object_literals_in_class() {
+        let mut app = app();
+        let root =
+            spawn(&mut app, r#"<div class="base" :class="{ active: on, 'is-big': big }"></div>"#, value!({ "on": true }));
+        let classes = app.world().get::<ClassList>(root).unwrap();
+        assert!(classes.contains("base") && classes.contains("active") && !classes.contains("is-big"));
+
+        props(&mut app, root).insert("on", false);
+        props(&mut app, root).insert("big", true);
+        app.update();
+        let classes = app.world().get::<ClassList>(root).unwrap();
+        assert!(!classes.contains("active") && classes.contains("is-big"));
+    }
+
+    /// An app whose generated stylesheets can be loaded: the `bevue://` asset source has to be
+    /// registered before `AssetPlugin` is added.
+    fn styled_app() -> App {
+        let mut app = App::new();
+        app.add_plugins((crate::asset::BevueAssetPlugin, MinimalPlugins, AssetPlugin::default(), BevueRuntimePlugin));
+        app.finish();
+        app
+    }
+
+    /// Updates until `bevy_flair` has loaded the template's stylesheet and styled `entity`.
+    fn wait_for_background(app: &mut App, entity: Entity, expected: Color) {
+        for _ in 0..500 {
+            if app.world().get::<BackgroundColor>(entity).is_some_and(|c| c.0 == expected) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            app.update();
+        }
+        panic!("expected {expected:?}, found {:?}", app.world().get::<BackgroundColor>(entity));
+    }
+
+    /// The whole way through `bevy_flair`: a style wins over the stylesheet and is applied in the
+    /// frame it was set.
+    #[test]
+    fn applied_by_flair_in_the_same_frame() {
+        let mut app = styled_app();
+        let root = spawn(
+            &mut app,
+            r#"
+            <template><div><p class="box" :style="{ 'background-color': color }">x</p><p class="box">y</p></div></template>
+            <style>.box { background-color: #00ff00; }</style>
+            "#,
+            value!({ "color": "#ff0000" }),
+        );
+        let [p, plain] = children(app.world(), root)[..] else { panic!("expected two children") };
+        wait_for_background(&mut app, p, Color::srgb(1.0, 0.0, 0.0));
+        assert_eq!(background(app.world(), plain), Color::srgb(0.0, 1.0, 0.0));
+
+        props(&mut app, root).get_mut("color").unwrap().set("#0000ff");
+        app.update();
+        assert_eq!(background(app.world(), p), Color::srgb(0.0, 0.0, 1.0));
+
+        // Without a value the stylesheet rule applies again.
+        props(&mut app, root).insert("color", Value::null());
+        app.update();
+        assert_eq!(background(app.world(), p), Color::srgb(0.0, 1.0, 0.0));
+    }
+
+    /// `bevy_flair` ignores inline styles of entities without a stylesheet, so a template that
+    /// has none gets an empty one.
+    #[test]
+    fn applied_without_a_style_block() {
+        let mut app = styled_app();
+        let root = spawn(&mut app, r#"<div><p :style="{ backgroundColor: color }">x</p></div>"#, value!({ "color": "#ff0000" }));
+        let p = children(app.world(), root)[0];
+        assert!(matches!(app.world().get::<Styled>(root), Some(Styled::StyleSheet(_))));
+        wait_for_background(&mut app, p, Color::srgb(1.0, 0.0, 0.0));
+
+        // A template without style attributes is left without a stylesheet.
+        let other = spawn(&mut app, r#"<div><p>x</p></div>"#, Value::empty_dict());
+        assert!(!matches!(app.world().get::<Styled>(other), Some(Styled::StyleSheet(_))));
+    }
+}
+
 #[test]
 fn if_chain_swaps_branches_in_place() {
     let mut app = app();
@@ -615,6 +804,8 @@ mod declared_props {
         )
         .unwrap();
         *app.world_mut().resource_mut::<Assets<BevueTemplate>>().get_mut(&handle).unwrap() = reloaded;
+        // Asset events are emitted at the end of a frame and read on the next one.
+        app.update();
         app.update();
 
         assert_eq!(texts(app.world(), declared), vec!["ana"]);
@@ -1256,17 +1447,20 @@ mod components {
         let root = spawn(&mut app, r#"<div><Row :label="name"/><p>after</p></div>"#, value!({ "name": "ana" }));
         assert_eq!(texts(app.world(), root), vec!["after"]);
         assert_eq!(children(app.world(), root).len(), 2, "an empty node takes the component's place");
-        assert_eq!(app.world().get::<ComponentDependencies>(root).unwrap().0, vec![handle.id()]);
+        assert_eq!(app.world().get::<ComponentDependencies>(root).unwrap().assets, vec![handle.id()]);
 
-        // The component arrives.
+        // The component arrives. Asset events are emitted at the end of a frame and read on the
+        // next one.
         let parse = |source: &str| crate::parser::parse_template(source).unwrap();
         let _ = app.world_mut().resource_mut::<Assets<BevueTemplate>>().insert(&handle, parse(r#"<b>{{ label }}</b>"#));
+        app.update();
         app.update();
         assert_eq!(texts(app.world(), root), vec!["ana", "after"]);
 
         // Props set in the meantime survive a reload of the component.
         props(&mut app, root).get_mut("name").unwrap().set("bo");
         *app.world_mut().resource_mut::<Assets<BevueTemplate>>().get_mut(&handle).unwrap() = parse(r#"<i>{{ label }}!</i>"#);
+        app.update();
         app.update();
         assert_eq!(texts(app.world(), root), vec!["bo!", "after"]);
 

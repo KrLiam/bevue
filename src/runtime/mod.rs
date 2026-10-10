@@ -1,7 +1,7 @@
 use bevy::{
     app::{App, Plugin, PostUpdate, PreUpdate}, asset::AssetEventSystems, ecs::{message::Messages, schedule::{IntoScheduleConfigs, SystemSet}}, ui::UiSystems, window::{RequestRedraw, WindowEvent},
 };
-use bevy_flair::{FlairPlugin, parser::FlairCssParserPlugin};
+use bevy_flair::{FlairPlugin, parser::FlairCssParserPlugin, style::StyleSystems};
 
 use crate::asset::BevueAssetPlugin;
 
@@ -26,12 +26,13 @@ pub use render::{
     TemplateRendered, WaitingForTemplate,
 };
 
-/// The systems of the Bevue runtime, run in this order in `PostUpdate`.
+/// The systems of the Bevue runtime, run in this order in `PostUpdate`, before `bevy_flair`'s
+/// `StyleSystems`.
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BevueSystems {
     /// Copies changed `Props` components and resources into `BevueProps`.
     SyncProps,
-    /// Renders templates whose asset was added, loaded or modified.
+    /// Renders templates whose asset was added, loaded or modified, the frame after it was.
     Render,
     /// Applies `BevueProps` changes to rendered templates.
     Update,
@@ -57,11 +58,18 @@ impl Plugin for BevueRuntimePlugin {
         // Runs after `Interaction` is updated, so handlers run before `Update` and their prop
         // changes are rendered in the same frame.
         app.add_systems(PreUpdate, events::emit_interaction_events.after(UiSystems::Focus));
+        // Before flair, which reads `ClassList` and `InlineStyle` early in its own sets: a change
+        // made after that would only be applied on the next frame.
+        //
+        // Flair runs before the UI layout and the layout before `AssetEventSystems`, so Bevue
+        // cannot also run after the asset events of the frame: a template asset added or modified
+        // in a frame is rendered on the next one.
         app.configure_sets(
             PostUpdate,
             (BevueSystems::SyncProps, BevueSystems::Render, BevueSystems::Update, BevueSystems::Style)
                 .chain()
-                .after(AssetEventSystems),
+                .before(AssetEventSystems)
+                .before(StyleSystems::Prepare),
         );
         app.add_systems(
             PostUpdate,

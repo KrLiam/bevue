@@ -184,6 +184,8 @@ pub enum Expression {
     Index { target: Box<Expression>, index: Box<Expression> },
     /// A call to a registered function: `function(args...)`.
     Call { function: Identifier, args: Vec<Expression> },
+    /// An object literal: `{ key: expr, 'quoted-key': expr }`, in source order.
+    Object(Vec<(Cow<'static, str>, Expression)>),
     Float(f32),
     Integer(i32),
     String(Cow<'static, str>),

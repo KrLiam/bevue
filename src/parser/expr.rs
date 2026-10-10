@@ -98,6 +98,7 @@ fn parse_int_literal(input: &mut &str) -> ModalResult<i32> {
 /// - string literal
 /// - float literal
 /// - integer literal
+/// - object literal `{ key: expr, 'key': expr }`
 /// - function call `ident(expr, ...)`
 /// - boolean or identifier
 fn parse_atom(input: &mut &str) -> ModalResult<Expression> {
@@ -109,6 +110,11 @@ fn parse_atom(input: &mut &str) -> ModalResult<Expression> {
         return Ok(expr);
     }
     
+    // Object literal
+    if input.starts_with('{') {
+        return parse_object.parse_next(input).map(Expression::Object);
+    }
+
     // String literal
     if input.starts_with('"') || input.starts_with('\'') {
         let s = parse_string_literal.parse_next(input)?;
@@ -164,6 +170,35 @@ fn parse_call_args(input: &mut &str) -> ModalResult<Vec<Expression>> {
         } else {
             let _ = literal(")").parse_next(input)?;
             return Ok(args);
+        }
+    }
+}
+
+/// Parses an object literal: `{ a: 1, 'b-c': d.e }`. Keys are identifiers or quoted strings and a
+/// trailing comma is allowed.
+fn parse_object(input: &mut &str) -> ModalResult<Vec<(Cow<'static, str>, Expression)>> {
+    let _ = literal("{").parse_next(input)?;
+    let mut entries = Vec::new();
+    loop {
+        let _: &str = multispace0.parse_next(input)?;
+        if input.starts_with('}') {
+            let _ = literal("}").parse_next(input)?;
+            return Ok(entries);
+        }
+        let key = if input.starts_with('"') || input.starts_with('\'') {
+            parse_string_literal.parse_next(input)?
+        } else {
+            ident_str.parse_next(input)?.to_owned()
+        };
+        let _: &str = multispace0.parse_next(input)?;
+        let _ = literal(":").parse_next(input)?;
+        entries.push((Cow::Owned(key), parse_expr_internal.parse_next(input)?));
+        let _: &str = multispace0.parse_next(input)?;
+        if input.starts_with(',') {
+            let _ = literal(",").parse_next(input)?;
+        } else {
+            let _ = literal("}").parse_next(input)?;
+            return Ok(entries);
         }
     }
 }
@@ -398,6 +433,32 @@ mod tests {
     fn test_dollar_identifiers() {
         assert_eq!(parse_expression("$event"), Expression::Identifier("$event".into()));
         assert_eq!(parse_expression("a$b"), Expression::Identifier("a$b".into()));
+    }
+
+    #[test]
+    fn test_objects() {
+        assert_eq!(parse_expression("{}"), Expression::Object(vec![]));
+        assert_eq!(
+            parse_expression("{ backgroundColor: theme.color, 'border-radius': \"4px\", n: f({ a: 1 }), }"),
+            Expression::Object(vec![
+                (
+                    "backgroundColor".into(),
+                    Expression::Access { target: Box::new(Expression::Identifier("theme".into())), field: "color".into() },
+                ),
+                ("border-radius".into(), Expression::String("4px".into())),
+                (
+                    "n".into(),
+                    Expression::Call {
+                        function: "f".into(),
+                        args: vec![Expression::Object(vec![("a".into(), Expression::Integer(1))])],
+                    },
+                ),
+            ])
+        );
+        assert!(try_parse_expression("{ a 1 }").is_err());
+        assert!(try_parse_expression("{ a: 1").is_err());
+        assert!(try_parse_expression("{ a: 1 b: 2 }").is_err());
+        assert!(try_parse_expression("{ 1: a }").is_err());
     }
 
     #[test]
