@@ -8,17 +8,17 @@
 
 Rename `register_props_resource` (for resources) and `register_props` (for components) should be the same method `register_props`. Make so `register_props` receives `T: RegisterableProps` and `RegisterableProps` has a blanket impl for `Resource` and `Component` which implement a method for registering the systems for resource/component props handling. Also, might be better to rename `PropsSource` to `PropsComponent`.
 
-## 2. Add indexmap feature
-
-Add a indexmap feature that implements Props to IndexMap and IndexSet (from indexmap crate).
-
-## 3. Default Props names for derive
+## 2. Default Props names for derive
 
 Add a #[props(name="counter")] macro attribute on the Props struct. if not set, this should be the struct name but snake case e.g Counter -> counter, PlayerInventory -> player_inventory. PropsResource::<T>::default() should call PropsResource::<T>::at(<T as Props>::name()).
 
-## 4. Support tuple structs for Props
+## 3. Support tuple structs for Props
 
 Support tuple structs for Props. If it has a single member, the struct is transparent when converting to Value. If it has two or more, it becomes a List. In template expressions, make sure so value.0 and value[0] are identical semantically.
+
+## 4. Add helper for extracting arguments from BevueCtx
+
+BevueCtx should have a get_args::<T> method to easily unwrap and convert the arg list to T. If T is e.g f32, this is equivalent to `ctx.args.get(0).and_then(|v| v.as_number()).and_then(|v| v as f32)`. T could be a tuple e.g (A, B, C), and it would convert multiple arguments simultaneously and return Result<(A, B, C)>.
 
 ## 5. Add props definition in component files
 
@@ -31,11 +31,7 @@ In Bevue components, add a top-level props element (along-side template and styl
 ```
 `name` is optional and it uses the default Props::name() if omitted. This will automatically add `ResourceProps::<Counter>::at("counter")` and `ResourceProps::<path::to::Other>::at("other")` to the `Template` entity. It's very likely that `Counter` and `path::to::Other` need to be registered in a type registry (by `register_props_resource`) to map the type path to a type-erased function that inserts the `ResourceProps` component. Make so `Props` derive `type_path` and `short_type_path` methods (that work just like `TypePath` so we don't need to derive it). Also, for ease of use, both the full path `path::to::Other` and the type name `Other` can be used, the latter might cause name collision, but it's okay that the last struct regitered as `Other` should be used.
 
-## 6. Add helper for extracting arguments from BevueCtx
-
-BevueCtx should have a get_args::<T> method to easily unwrap and convert the arg list to T. If T is e.g f32, this is equivalent to `ctx.args.get(0).and_then(|v| v.as_number()).and_then(|v| v as f32)`. T could be a tuple e.g (A, B, C), and it would convert multiple arguments simultaneously and return Result<(A, B, C)>.
-
-## 7. Add component elements
+## 6. Add component elements
 
 Implement component elements (`ElementType::Component`). They're used in HTML like so
 ```html
@@ -47,7 +43,7 @@ Implement component elements (`ElementType::Component`). They're used in HTML li
 ```
 This will instantiate the template element tree of the component named `Foo`. The component names must be registered on the app e.g `app.register_component("Foo", "path/to/foo.html")`. `attr1` and `attr2` are evaluated on the parent scope and injected on `Foo`'s props. Decide whether the root of `Foo` needs the `Template` component, or if it can be handled by the root `Template`. Find a solution that is lightweight to instantiate multiple components.
 
-## 8. Add dynamic styles
+## 7. Add dynamic styles (Ignore for now)
 
 Implement a `:style` attribute which can be used to define styles based on props.
 ```html
