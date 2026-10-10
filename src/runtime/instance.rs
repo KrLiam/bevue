@@ -273,6 +273,17 @@ pub struct InstanceStats {
     pub items: usize,
 }
 
+/// What a [`TemplateInstance::update`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UpdateStats {
+    /// Text, class and `v-if` bindings that were re-evaluated.
+    pub fired: usize,
+    /// Lists that were reconciled against their elements.
+    pub reconciled: usize,
+    /// Whether every binding was re-evaluated because props carried no change flags.
+    pub full: bool,
+}
+
 /// The runtime state of a rendered template, stored on its root entity.
 #[derive(Component)]
 pub struct TemplateInstance {
@@ -333,7 +344,8 @@ impl TemplateInstance {
 
     /// Applies the changes recorded in `props` to the UI. With `full`, every binding is
     /// re-evaluated, which is used when props were replaced without change flags.
-    pub fn update(&mut self, world: &mut World, props: &Value, full: bool) {
+    pub fn update(&mut self, world: &mut World, props: &Value, full: bool) -> UpdateStats {
+        let mut stats = UpdateStats { full, ..Default::default() };
         let mut pending = Pending::default();
         if full {
             fire_all(&self.root_trie, &mut pending);
@@ -359,6 +371,7 @@ impl TemplateInstance {
                 break;
             }
 
+            stats.reconciled += fors.len();
             for block in fors {
                 let force = pending.force_full.contains(&block);
                 self.reconcile(world, props, &mut pending, block, force);
@@ -378,6 +391,8 @@ impl TemplateInstance {
         for &id in &fired {
             self.apply(world, props, id);
         }
+        stats.fired = fired.len();
+        stats
     }
 
     /// Walks the element at `index` of a list against the item rendering it.

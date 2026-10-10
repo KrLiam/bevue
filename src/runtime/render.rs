@@ -15,7 +15,8 @@ use bevy::{
         system::{Command, Commands, In, IntoSystem, Query, Res, command::run_system_cached_with},
         world::{DeferredWorld, World},
     },
-    log::{error, warn},
+    log::{debug, error, warn},
+    platform::time::Instant,
 };
 use bevy_flair::prelude::{Styled, StyleSheet};
 
@@ -232,6 +233,7 @@ pub fn watch_template_components(
 }
 
 pub fn render_template(input: In<RenderTemplate>, world: &mut World) {
+    let start = Instant::now();
     let template = {
         let Some(templates) = world.get_resource::<Assets<BevueTemplate>>() else {
             error!("Assets<BevueTemplate> resource not found");
@@ -260,13 +262,30 @@ pub fn render_template(input: In<RenderTemplate>, world: &mut World) {
     let mut props = take_props(world, root_entity);
     match TemplateInstance::render(world, root_entity, template, &props) {
         Ok(instance) => {
+            let stats = instance.stats();
             world.entity_mut(root_entity).insert(instance);
+            debug!(
+                "rendered {} on {root_entity}: {} bindings, {} blocks, {} list items, in {:?}",
+                template_name(&input.template),
+                stats.bindings,
+                stats.blocks,
+                stats.items,
+                start.elapsed()
+            );
         }
         Err(e) => error!("Could not render template {:?}: {e}", input.template.path()),
     }
     // The render reflects the current props, so pending changes are already applied.
     props.clear_changes();
     restore_props(world, root_entity, props);
+}
+
+/// A name for a template in logs: its asset path, or its id for templates added in code.
+fn template_name(handle: &Handle<BevueTemplate>) -> String {
+    match handle.path() {
+        Some(path) => path.to_string(),
+        None => format!("{:?}", handle.id()),
+    }
 }
 
 /// Applies prop changes to the UI of every rendered template whose [`BevueProps`] changed.
@@ -278,6 +297,7 @@ pub fn update_templates(
     let entities: Vec<Entity> =
         changed.iter(world).filter(|(_, instance)| !instance.is_added()).map(|(entity, _)| entity).collect();
     for entity in entities {
+        let start = Instant::now();
         let Some(mut instance) = world
             .get_mut::<TemplateInstance>(entity)
             .map(|mut instance| std::mem::take(instance.bypass_change_detection()))
@@ -288,13 +308,20 @@ pub fn update_templates(
 
         // Props without any change flags were replaced or added wholesale.
         let full = !props.is_dirty();
-        instance.update(world, &props, full);
+        let stats = instance.update(world, &props, full);
 
         props.clear_changes();
         restore_props(world, entity, props);
         if let Some(mut slot) = world.get_mut::<TemplateInstance>(entity) {
             *slot.bypass_change_detection() = instance;
         }
+        debug!(
+            "updated template on {entity}: {} bindings, {} lists{} in {:?}",
+            stats.fired,
+            stats.reconciled,
+            if stats.full { ", full refresh," } else { "" },
+            start.elapsed()
+        );
     }
 }
 

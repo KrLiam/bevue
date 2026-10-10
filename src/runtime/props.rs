@@ -15,6 +15,8 @@ use bevy::{
         schedule::IntoScheduleConfigs,
         system::{Query, Res},
     },
+    log::{debug, trace},
+    platform::time::Instant,
 };
 
 use crate::{
@@ -121,12 +123,44 @@ impl<R: Send + Sync + 'static> PropsResource<R> {
 }
 
 /// Diffs `data` into `props` at `key`, marking `props` as changed only if something differs.
-pub fn sync_props(data: &dyn Props, props: &mut Mut<BevueProps>, key: Option<&PropPath>) {
+/// Returns whether the props have changes to render.
+pub fn sync_props(data: &dyn Props, props: &mut Mut<BevueProps>, key: Option<&PropPath>) -> bool {
     let value = &mut props.bypass_change_detection().value;
     let path = key.map(|k| k.segments()).unwrap_or(&[]);
     value.update_at(path, |target| data.sync_value(target));
-    if value.is_dirty() {
+    let dirty = value.is_dirty();
+    if dirty {
         props.set_changed();
+    }
+    dirty
+}
+
+/// Times a sync system's work, logging once per run that synced anything.
+#[derive(Default)]
+struct SyncTimer {
+    start: Option<Instant>,
+    synced: usize,
+    changed: usize,
+}
+
+impl SyncTimer {
+    fn record(&mut self, sync: impl FnOnce() -> bool) {
+        self.start.get_or_insert_with(Instant::now);
+        self.synced += 1;
+        self.changed += sync() as usize;
+    }
+
+    /// Logs at `debug` when a sync found changes, and at `trace` when the data was touched but
+    /// nothing differed (which can happen every frame).
+    fn log<T>(self) {
+        let Some(start) = self.start else { return };
+        let elapsed = start.elapsed();
+        let name = std::any::type_name::<T>();
+        if self.changed > 0 {
+            debug!("synced {name} into {} template(s), {} changed, in {elapsed:?}", self.synced, self.changed);
+        } else {
+            trace!("synced {name} into {} template(s), nothing changed, in {elapsed:?}", self.synced);
+        }
     }
 }
 
@@ -135,12 +169,14 @@ pub fn sync_component_props<T: Component + Props>(
     mut targets: Query<(Entity, Ref<PropsSource<T>>, &mut BevueProps)>,
     sources: Query<Ref<T>>,
 ) {
+    let mut timer = SyncTimer::default();
     for (entity, source, mut props) in &mut targets {
         let Ok(data) = sources.get(source.entity.unwrap_or(entity)) else { continue };
         if data.is_changed() || source.is_changed() {
-            sync_props(&*data, &mut props, source.key.as_ref());
+            timer.record(|| sync_props(&*data, &mut props, source.key.as_ref()));
         }
     }
+    timer.log::<T>();
 }
 
 /// Copies a changed `R` resource into the props of templates with a [`PropsResource<R>`].
@@ -149,11 +185,13 @@ pub fn sync_resource_props<R: Resource + Props>(
     mut targets: Query<(Ref<PropsResource<R>>, &mut BevueProps)>,
 ) {
     let Some(resource) = resource else { return };
+    let mut timer = SyncTimer::default();
     for (source, mut props) in &mut targets {
         if resource.is_changed() || source.is_changed() {
-            sync_props(&*resource, &mut props, source.key.as_ref());
+            timer.record(|| sync_props(&*resource, &mut props, source.key.as_ref()));
         }
     }
+    timer.log::<R>();
 }
 
 /// Registers [`Props`] components and resources as template props sources.

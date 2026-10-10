@@ -763,3 +763,42 @@ mod events_and_functions {
         assert_eq!(app.world_mut().run_system_with(id_new, ctx(a)).unwrap(), Value::from("global"));
     }
 }
+
+mod update_stats {
+    use super::*;
+    use crate::runtime::UpdateStats;
+
+    /// Runs the instance update by hand, as `update_templates` does, to read its stats.
+    fn update(app: &mut App, root: Entity) -> UpdateStats {
+        let world = app.world_mut();
+        let mut instance = std::mem::take(&mut *world.get_mut::<TemplateInstance>(root).unwrap());
+        let mut value = std::mem::take(&mut world.get_mut::<BevueProps>(root).unwrap().value);
+        let stats = instance.update(world, &value, !value.is_dirty());
+        value.clear_changes();
+        world.get_mut::<BevueProps>(root).unwrap().value = value;
+        *world.get_mut::<TemplateInstance>(root).unwrap() = instance;
+        stats
+    }
+
+    #[test]
+    fn reports_what_an_update_did() {
+        let mut app = app();
+        let root = spawn(
+            &mut app,
+            r#"<div><p>{{title}}</p><span v-for="item in items" :key="item.id">{{item.label}}</span></div>"#,
+            value!({ "title": "t", "items": [{ "id": 1, "label": "a" }, { "id": 2, "label": "b" }] }),
+        );
+
+        props(&mut app, root).at_mut(&path("items[1].label")).unwrap().set("B");
+        assert_eq!(update(&mut app, root), UpdateStats { fired: 1, reconciled: 0, full: false });
+        assert_eq!(texts(app.world(), root), vec!["t", "a", "B"]);
+
+        props(&mut app, root).get_mut("items").unwrap().push(value!({ "id": 3, "label": "c" }));
+        assert_eq!(update(&mut app, root), UpdateStats { fired: 0, reconciled: 1, full: false });
+        assert_eq!(texts(app.world(), root), vec!["t", "a", "B", "c"]);
+
+        // Nothing dirty means the props were replaced: everything is re-evaluated.
+        let stats = update(&mut app, root);
+        assert_eq!(stats, UpdateStats { fired: 4, reconciled: 1, full: true });
+    }
+}

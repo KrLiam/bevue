@@ -75,3 +75,24 @@ a `BevueEvent { entity, name, args }` for them. Trigger your own with
 `commands.trigger(BevueEvent { .. })`, and observe any of them with `On<BevueEvent>`. Handlers can
 read `$event` (the first event argument) and `$args` (all of them). `$emit(name, ...args)` triggers
 an event on the template root.
+
+# Debugging performance
+
+Bevue logs how long its work took at the `debug` level. Enable it with Bevy's log filter:
+
+```rust
+DefaultPlugins.set(LogPlugin { filter: "wgpu=error,naga=warn,bevue=debug".into(), ..Default::default() })
+```
+
+```text
+DEBUG bevue::runtime::props: synced simple::Counter into 1 template(s), 1 changed, in 4.1µs
+DEBUG bevue::runtime::render: rendered simple.html on 12v0: 4 bindings, 2 blocks, 0 list items, in 310µs
+DEBUG bevue::runtime::render: updated template on 12v0: 2 bindings, 1 lists in 95µs
+```
+
+- `synced` is the cost of diffing a `Props` component or resource into `BevueProps`. It is logged
+  when the diff found a change; syncs that found nothing are logged at the `trace` level.
+- `rendered` is a full render: the first one, or a re-render after the template asset changed.
+- `updated` is an incremental update: the bindings re-evaluated and the lists reconciled.
+
+`cargo bench --bench reactivity` measures the same phases for lists of 100 to 10 000 items.
