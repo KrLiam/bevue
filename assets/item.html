@@ -1,9 +1,9 @@
 <template>
-    <li class="item">
+    <div class="item">
         <p>{{ item.id }}</p>
         <p class="item_count">{{ item.count }}</p>
         <button class="button" @click="$emit('remove')">X</button>
-    </li>
+    </div>
 </template>
 
 <style>

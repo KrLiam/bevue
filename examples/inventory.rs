@@ -51,7 +51,7 @@ fn main() {
         .register_props::<PlayerName>()
         .insert_resource(PlayerName { value: "John".to_owned() })
         // `<ItemRow/>` in a template renders this file.
-        .register_component("ItemRow", "item_row.html")
+        .register_component("Item", "item_row.html")
         .add_systems(Startup, startup)
         .add_systems(Update, inventory_changed.run_if(resource_changed::<Inventory>));
 

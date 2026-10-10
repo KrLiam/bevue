@@ -11,9 +11,13 @@
             <div class="top">
                 <button class="button" @click="add_item()">Add Item</button>
             </div>
-            <ul class="items">
-                <ItemRow v-for="(item, i) in inventory.items" :item="item" @remove="remove_item(i)"/>
-            </ul>
+            <div class="items">
+                <Item
+                    v-for="(item, i) in inventory.items"
+                    :item="item"
+                    @remove="remove_item(i)"
+                />
+            </div>
         </div>
     </div>
 </template>
