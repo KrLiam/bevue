@@ -1,5 +1,5 @@
 use bevue::{
-    BevueCtx, BevuePropsAppExt, Props, PropsResource, Template, asset::BevueAssetPlugin, runtime::BevueRuntimePlugin,
+    BevueCtx, BevuePropsAppExt, Props, Template, asset::BevueAssetPlugin, runtime::BevueRuntimePlugin,
 };
 use bevy::{
     DefaultPlugins, app::{App, Startup, Update}, asset::AssetServer, camera::Camera2d, ecs::{
@@ -59,12 +59,11 @@ fn main() {
 fn startup(asset_server: Res<AssetServer>, mut cmds: Commands) {
     cmds.spawn(Camera2d);
 
-    cmds.spawn((
+    // `Inventory` and `PlayerName` are declared in the `<props>` of the template.
+    cmds.spawn(
         Template::new(asset_server.load("inventory.html"))
             .with_function("add_item", add_item)
             .with_function("remove_item", remove_item),
-        PropsResource::<Inventory>::default(),
-        PropsResource::<PlayerName>::default(),
-    ));
+    );
 }
 

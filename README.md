@@ -21,6 +21,7 @@ Bevue is only inspired by Vue, it won't:
 - [X] Keyed list rendering using the `v-for` directive, e.g. `v-for="(item, i) in items" :key="item.id"`;
 - [X] Fine-grained reactivity: only UI nodes bound to the props that changed are updated;
 - [X] `#[derive(Props)]` to render Bevy components and resources, with path access like `a.b[0].c`;
+- [X] Props declared in the component file with `<props>`;
 - [X] Function calls in expressions, backed by Bevy systems, e.g. `{{ format(price) }}`;
 - [X] Event handling with `@click`, `@mouseover`, `@mouseleave`, custom events and `$emit`;
 
@@ -53,6 +54,24 @@ case (`menu`, or `player_inventory` for `PlayerInventory`), or the one set with
 
 Changed Rust data is diffed into the props, so editing `menu.actions[1].label` only updates the
 text bound to that label.
+
+A template can also declare the registered types it renders, in a `<props>` element next to
+`<template>` and `<style>`. Then spawning `Template` alone is enough:
+
+```html
+<props>
+    <resource name="menu" type="Menu"/>
+    <resource type="my_game::ui::Settings"/>
+    <component type="Player"/>
+</props>
+```
+
+- `<resource>` mounts a resource, like `PropsResource`. `<component>` mounts a component of the
+  template entity, like `PropsComponent`.
+- `type` is the full path of the type or just its name. If two registered types share a name, the
+  name refers to the one registered last.
+- `name` is the key in the props. Without it, the default name of the type is used.
+- A `PropsResource` or `PropsComponent` you inserted yourself for the same type is kept as it is.
 
 # Functions and events
 

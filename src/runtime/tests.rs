@@ -500,6 +500,130 @@ mod props_sources {
     }
 }
 
+mod declared_props {
+    use bevy::ecs::{component::Component, resource::Resource};
+
+    use super::*;
+    use crate::{
+        core::props::Props,
+        runtime::{BevuePropsAppExt, DeclaredProps, PropsComponent, PropsResource},
+    };
+
+    #[derive(crate::Props, Resource)]
+    struct Menu {
+        title: String,
+    }
+
+    #[derive(crate::Props, Component)]
+    struct Player {
+        name: String,
+    }
+
+    const DECLARED: &str = r#"
+        <props>
+            <resource type="Menu"/>
+            <component name="p" type="Player"/>
+        </props>
+        <template>
+            <div><p>{{menu.title}}</p><span>{{p.name}}</span><b>{{m.title}}</b></div>
+        </template>
+    "#;
+
+    fn declared_app() -> App {
+        let mut app = app();
+        app.register_props::<Menu>().register_props::<Player>();
+        app.insert_resource(Menu { title: "File".into() });
+        app
+    }
+
+    fn add(app: &mut App, source: &str) -> bevy::asset::Handle<BevueTemplate> {
+        let template = crate::parser::parse_template(source).unwrap();
+        app.world_mut().resource_mut::<Assets<BevueTemplate>>().add(template)
+    }
+
+    #[test]
+    fn declared_sources_render_on_the_first_frame() {
+        let mut app = declared_app();
+        let handle = add(&mut app, DECLARED);
+        let root = app.world_mut().spawn((Template::new(handle), Player { name: "ana".into() })).id();
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["File", "ana", ""]);
+        assert!(app.world().get::<PropsResource<Menu>>(root).is_some());
+        assert!(app.world().get::<PropsComponent<Player>>(root).is_some());
+
+        app.world_mut().resource_mut::<Menu>().title = "Edit".into();
+        app.world_mut().get_mut::<Player>(root).unwrap().name = "bo".into();
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["Edit", "bo", ""]);
+    }
+
+    #[test]
+    fn types_are_found_by_full_path() {
+        let mut app = declared_app();
+        let source = format!(
+            r#"<props><resource name="m" type="{}"/></props><div><p>{{{{m.title}}}}</p></div>"#,
+            Menu::type_path()
+        );
+        let handle = add(&mut app, &source);
+        let root = app.world_mut().spawn(Template::new(handle)).id();
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["File"]);
+    }
+
+    #[test]
+    fn manual_sources_are_not_overwritten() {
+        let mut app = declared_app();
+        let handle = add(&mut app, DECLARED);
+        let other = app.world_mut().spawn(Player { name: "bo".into() }).id();
+        let root = app
+            .world_mut()
+            .spawn((
+                Template::new(handle),
+                Player { name: "ana".into() },
+                PropsResource::<Menu>::at("m"),
+                PropsComponent::<Player>::at("p").from_entity(other),
+            ))
+            .id();
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["", "bo", "File"]);
+        assert_eq!(app.world().get::<PropsResource<Menu>>(root).unwrap().key, Some(path("m")));
+        assert_eq!(app.world().get::<PropsComponent<Player>>(root).unwrap().entity, Some(other));
+        assert!(app.world().get::<DeclaredProps>(root).is_none());
+    }
+
+    #[test]
+    fn unknown_types_are_skipped() {
+        let mut app = declared_app();
+        let handle = add(&mut app, r#"<props><resource type="Nope"/></props><div><p>{{nope.x}}!</p></div>"#);
+        let root = app.world_mut().spawn(Template::new(handle)).id();
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["!"]);
+    }
+
+    #[test]
+    fn rerender_replaces_declared_sources_only() {
+        let mut app = declared_app();
+        let handle = add(&mut app, DECLARED);
+        let declared = app.world_mut().spawn((Template::new(handle.clone()), Player { name: "ana".into() })).id();
+        let manual = app.world_mut().spawn((Template::new(handle.clone()), PropsResource::<Menu>::at("m"))).id();
+        app.update();
+        assert!(app.world().get::<PropsResource<Menu>>(declared).is_some());
+
+        // The reloaded template renames one declaration and drops the other.
+        let reloaded = crate::parser::parse_template(
+            r#"<props><component name="q" type="Player"/></props><div><p>{{q.name}}</p></div>"#,
+        )
+        .unwrap();
+        *app.world_mut().resource_mut::<Assets<BevueTemplate>>().get_mut(&handle).unwrap() = reloaded;
+        app.update();
+
+        assert_eq!(texts(app.world(), declared), vec!["ana"]);
+        assert!(app.world().get::<PropsResource<Menu>>(declared).is_none());
+        assert_eq!(app.world().get::<PropsComponent<Player>>(declared).unwrap().key, Some(path("q")));
+        assert_eq!(app.world().get::<PropsResource<Menu>>(manual).unwrap().key, Some(path("m")));
+    }
+}
+
 mod events_and_functions {
     use bevy::{
         ecs::{

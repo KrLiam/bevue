@@ -162,9 +162,10 @@ pub use expr::{
 };
 
 pub use crate::core::template::{
-    BevueTemplate, ConditionDirective, ConditionKind, Expression, Identifier, ListDirective, NodeId, TemplateNode,
-    TemplateRef, TemplateStyle, TemplateText, TextFragment,
+    BevueTemplate, ConditionDirective, ConditionKind, Expression, Identifier, ListDirective, NodeId, PropsDeclaration,
+    PropsSourceKind, TemplateNode, TemplateRef, TemplateStyle, TemplateText, TextFragment,
 };
+use crate::core::path::PropPath;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParseError {
@@ -195,8 +196,51 @@ impl From<ExprParseError> for ParseError {
 
 pub type Result<T> = std::result::Result<T, ParseError>;
 
+/// Parses a `<resource>` or `<component>` element of `<props>`.
+fn parse_props_declaration(tag: &HTMLTag<'_>) -> Result<PropsDeclaration> {
+    let tag_name = tag.name().as_utf8_str();
+    let source = if tag_name.eq_ignore_ascii_case("resource") {
+        PropsSourceKind::Resource
+    } else if tag_name.eq_ignore_ascii_case("component") {
+        PropsSourceKind::Component
+    } else {
+        return Err(ParseError::InvalidDirective(format!(
+            "unexpected <{tag_name}> in <props>, expected <resource> or <component>"
+        )));
+    };
+
+    let mut name = None;
+    let mut type_path = None;
+    for (attribute, value) in tag_attributes(tag) {
+        match attribute {
+            "name" => name = value,
+            "type" => type_path = value,
+            other => {
+                return Err(ParseError::InvalidDirective(format!("unknown attribute '{other}' in <{tag_name}>")));
+            }
+        }
+    }
+    let type_path = type_path
+        .map(str::trim)
+        .filter(|type_path| !type_path.is_empty())
+        .ok_or_else(|| ParseError::InvalidDirective(format!("<{tag_name}> requires a type")))?;
+    if let Some(name) = name {
+        let path = PropPath::parse(name).map_err(|e| ParseError::InvalidDirective(e.to_string()))?;
+        if path.is_empty() {
+            return Err(ParseError::InvalidDirective(format!("<{tag_name}> has an empty name")));
+        }
+    }
+
+    Ok(PropsDeclaration {
+        source,
+        name: name.map(|name| name.trim().to_string().into()),
+        type_path: type_path.to_string().into(),
+    })
+}
+
 /// Parses a template source string into a `BevueTemplate`.
-/// Supports `<template>` wrapper and `<style src="...">` tags.
+/// Supports a `<template>` wrapper, `<style src="...">` tags and a top-level `<props>` element
+/// declaring the template's props.
 pub fn parse_template(source: &str) -> Result<BevueTemplate> {
     let dom = tl::parse(source, ParserOptions::default())
         .map_err(|e| ParseError::InvalidHtml(format!("{e:?}")))?;
@@ -209,6 +253,8 @@ pub fn parse_template(source: &str) -> Result<BevueTemplate> {
     let mut current_style_inline = String::new();
     let mut parsed_style: Option<TemplateStyle> = None;
     let mut is_top_level_template = false;
+    let mut in_props = false;
+    let mut props: Vec<PropsDeclaration> = Vec::new();
 
     for node in traverse_dom(&dom) {
         match node {
@@ -227,6 +273,11 @@ pub fn parse_template(source: &str) -> Result<BevueTemplate> {
                     continue;
                 }
 
+                if in_props {
+                    props.push(parse_props_declaration(tag)?);
+                    continue;
+                }
+
                 if tag_name.eq_ignore_ascii_case("param") {
                     depth += 1;
                     continue;
@@ -239,6 +290,12 @@ pub fn parse_template(source: &str) -> Result<BevueTemplate> {
 
                 if stack.is_empty() && tag_name.eq_ignore_ascii_case("template") {
                     is_top_level_template = true;
+                    continue;
+                }
+
+                // `<props>` sits next to `<template>` and `<style>`, outside the node tree.
+                if stack.is_empty() && !is_top_level_template && tag_name.eq_ignore_ascii_case("props") {
+                    in_props = true;
                     continue;
                 }
 
@@ -330,6 +387,10 @@ pub fn parse_template(source: &str) -> Result<BevueTemplate> {
                     });
                     continue;
                 }
+                if in_props {
+                    in_props = !tag_name.eq_ignore_ascii_case("props");
+                    continue;
+                }
                 if depth > 0 {
                     depth -= 1;
                     continue;
@@ -345,7 +406,7 @@ pub fn parse_template(source: &str) -> Result<BevueTemplate> {
                     current_style_inline.push_str(&text);
                     continue;
                 }
-                if depth > 0 {
+                if depth > 0 || in_props {
                     continue;
                 }
                 if let Some(&current_idx) = stack.last() {
@@ -362,7 +423,7 @@ pub fn parse_template(source: &str) -> Result<BevueTemplate> {
         }
     }
 
-    let mut template = BevueTemplate::new(nodes);
+    let mut template = BevueTemplate::new(nodes).with_props(props);
     if let Some(style) = parsed_style
         && let Some(root_idx) = template.root_index()
         && let Some(node) = template.get_mut(root_idx)
@@ -572,6 +633,52 @@ use super::*;
         assert!(template.nodes[1].attributes.is_empty());
 
         assert!(parse_template(r#"<div><p @click.stop="a()">x</p></div>"#).is_err());
+    }
+
+    #[test]
+    fn test_parse_props() {
+        let source = r#"
+            <props>
+                <resource name="counter" type="Counter"/>
+                <resource type="path::to::Other"/>
+                <component name="stats.player" type="Player"></component>
+            </props>
+
+            <template>
+                <div><p>{{counter.seconds}}</p></div>
+            </template>
+
+            <style>.a { color: red; }</style>
+        "#;
+        let template = parse_template(source).expect("Failed to parse template");
+        assert_eq!(
+            template.props,
+            vec![
+                PropsDeclaration::resource("Counter").with_name("counter"),
+                PropsDeclaration::resource("path::to::Other"),
+                PropsDeclaration::component("Player").with_name("stats.player"),
+            ]
+        );
+        // The declarations are not part of the node tree.
+        assert_eq!(template.nodes.len(), 2);
+        assert_eq!(template.root().unwrap().element, "div".into());
+        assert!(template.root().unwrap().style.is_some());
+
+        assert!(parse_template("<div></div>").unwrap().props.is_empty());
+        // A `<props>` inside the tree is an ordinary element.
+        let nested = parse_template("<div><props><resource type='A'/></props></div>").unwrap();
+        assert!(nested.props.is_empty());
+        assert_eq!(nested.nodes.len(), 3);
+
+        let error = |source: &str| parse_template(source).unwrap_err().to_string();
+        assert_eq!(error("<props><resource name='a'/></props><div/>"), "Invalid directive: <resource> requires a type");
+        assert_eq!(
+            error("<props><asset type='A'/></props><div/>"),
+            "Invalid directive: unexpected <asset> in <props>, expected <resource> or <component>"
+        );
+        assert!(parse_template("<props><resource type='A' name='a..b'/></props><div/>").is_err());
+        assert!(parse_template("<props><resource type='A' name=''/></props><div/>").is_err());
+        assert!(parse_template("<props><resource type='A' entity='x'/></props><div/>").is_err());
     }
 
     #[test]

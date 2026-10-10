@@ -28,7 +28,7 @@ use crate::runtime::{
         assert_not_reserved, box_function, BevueCtx, BevueFunctionFactory, BoxedBevueFunction, TemplateFunctions,
     },
     instance::TemplateInstance,
-    props::BevueProps,
+    props::{mount_declared_props, BevueProps},
 };
 
 /// Renders a [`BevueTemplate`] asset under this entity.
@@ -258,6 +258,8 @@ pub fn render_template(input: In<RenderTemplate>, world: &mut World) {
     // Discard any previous render (e.g. on hot reload).
     root.remove::<TemplateInstance>();
     root.despawn_children();
+
+    mount_declared_props(world, root_entity, &template.props);
 
     let mut props = take_props(world, root_entity);
     match TemplateInstance::render(world, root_entity, template, &props) {

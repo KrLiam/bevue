@@ -19,6 +19,9 @@ use syn::{
 ///   by default. Without it, the name is the type name in snake case: `PlayerInventory` is
 ///   `player_inventory`.
 ///
+/// The derive also sets `Props::type_path` and `Props::short_type_path` for types without generic
+/// parameters, from the module the type is defined in.
+///
 /// Field and variant attributes:
 /// - `#[props(rename = "name")]` uses another key or variant string.
 /// - `#[props(skip)]` leaves a field out; it must implement `Default`.
@@ -97,6 +100,19 @@ fn expand(mut input: DeriveInput) -> syn::Result<TokenStream2> {
 
     let props_name = parse_container_attrs(&input.attrs)?
         .unwrap_or_else(|| LitStr::new(&to_snake_case(&input.ident.to_string()), input.ident.span()));
+
+    // Like `TypePath`. Generic types keep the default, which includes their parameters.
+    let type_paths = input.generics.params.is_empty().then(|| {
+        let ident = LitStr::new(&input.ident.to_string(), input.ident.span());
+        quote! {
+            fn type_path() -> &'static str {
+                ::core::concat!(::core::module_path!(), "::", #ident)
+            }
+            fn short_type_path() -> &'static str {
+                #ident
+            }
+        }
+    });
 
     let type_params: Vec<Ident> = input.generics.type_params().map(|p| p.ident.clone()).collect();
     let where_clause = input.generics.make_where_clause();
@@ -348,6 +364,7 @@ fn expand(mut input: DeriveInput) -> syn::Result<TokenStream2> {
             fn name() -> &'static str {
                 #props_name
             }
+            #type_paths
         }
     })
 }

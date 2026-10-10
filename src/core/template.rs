@@ -362,14 +362,57 @@ impl TemplateRef {
     }
 }
 
+/// Where the data of a [`PropsDeclaration`] comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PropsSourceKind {
+    /// `<resource>`: a resource.
+    Resource,
+    /// `<component>`: a component of the template entity.
+    Component,
+}
+
+/// A `<resource>` or `<component>` element of the template's `<props>`: a registered `Props` type
+/// the template mounts in its props.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropsDeclaration {
+    pub source: PropsSourceKind,
+    /// The key the type is mounted at. `None` uses the type's `Props::name`.
+    pub name: Option<Cow<'static, str>>,
+    /// The type, by its `Props::type_path` or `Props::short_type_path`.
+    pub type_path: Cow<'static, str>,
+}
+
+impl PropsDeclaration {
+    pub fn resource(type_path: impl Into<Cow<'static, str>>) -> Self {
+        Self { source: PropsSourceKind::Resource, name: None, type_path: type_path.into() }
+    }
+
+    pub fn component(type_path: impl Into<Cow<'static, str>>) -> Self {
+        Self { source: PropsSourceKind::Component, name: None, type_path: type_path.into() }
+    }
+
+    pub fn with_name(mut self, name: impl Into<Cow<'static, str>>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+}
+
 #[derive(Asset, TypePath, Debug, Clone, Default, PartialEq, Deref, DerefMut)]
 pub struct BevueTemplate {
+    #[deref]
     pub nodes: Vec<TemplateNode>,
+    /// The props declared in the template's `<props>` element.
+    pub props: Vec<PropsDeclaration>,
 }
 
 impl BevueTemplate {
     pub fn new(nodes: Vec<TemplateNode>) -> Self {
-        Self { nodes }
+        Self { nodes, props: Vec::new() }
+    }
+
+    pub fn with_props(mut self, props: impl IntoIterator<Item = PropsDeclaration>) -> Self {
+        self.props.extend(props);
+        self
     }
 
     /// Gets a reference to the node at the given index.
@@ -481,7 +524,7 @@ impl BevueTemplate {
 
 impl From<Vec<TemplateNode>> for BevueTemplate {
     fn from(nodes: Vec<TemplateNode>) -> Self {
-        Self { nodes }
+        Self::new(nodes)
     }
 }
 

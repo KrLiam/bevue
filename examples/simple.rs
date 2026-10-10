@@ -1,5 +1,5 @@
 use bevue::{
-    BevueCtx, BevueFunctionsAppExt, BevuePropsAppExt, Props, PropsResource, Template, asset::BevueAssetPlugin,
+    BevueCtx, BevueFunctionsAppExt, BevuePropsAppExt, Props, Template, asset::BevueAssetPlugin,
     runtime::BevueRuntimePlugin,
 };
 use bevy::{
@@ -16,7 +16,8 @@ use bevy::{
     time::Time,
 };
 
-/// Data rendered by `assets/simple.html` as `counter`.
+/// Data rendered by `assets/simple.html` as `counter`: the template declares it in its `<props>`,
+/// and it is mounted at the name of the type in snake case.
 #[derive(Resource, Props, Default)]
 struct Counter {
     seconds: u32,
@@ -45,11 +46,7 @@ fn main() {
 fn startup(asset_server: Res<AssetServer>, mut cmds: Commands) {
     cmds.spawn(Camera2d);
 
-    cmds.spawn((
-        Template::new(asset_server.load("simple.html")).with_function("label", label),
-        // Mounted at `counter`, the name of the type in snake case.
-        PropsResource::<Counter>::default(),
-    ));
+    cmds.spawn(Template::new(asset_server.load("simple.html")).with_function("label", label));
 }
 
 /// Called by `@click="add_item()"`: adds an item right away.

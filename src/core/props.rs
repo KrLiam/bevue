@@ -10,7 +10,8 @@
 //! `#[props(rename = "name")]` or left out with `#[props(skip)]`.
 //!
 //! A `Props` type also has a [`Props::name`], the key it is mounted at in template props by
-//! default: the type name in snake case, or `#[props(name = "name")]` on the type.
+//! default: the type name in snake case, or `#[props(name = "name")]` on the type. Its
+//! [`Props::type_path`] and [`Props::short_type_path`] are how a template names it in `<props>`.
 
 use std::{any::Any, borrow::Cow, fmt};
 
@@ -89,10 +90,28 @@ pub trait Props: Send + Sync + 'static {
     {
         static CELL: GenericTypePathCell = GenericTypePathCell::new();
         CELL.get_or_insert::<Self, _>(|| {
-            let short = short_type_name(std::any::type_name::<Self>());
+            let short = Self::short_type_path();
             let ident = short.split(|c: char| !c.is_alphanumeric() && c != '_').next().unwrap_or_default();
             to_snake_case(ident)
         })
+    }
+
+    /// The full path of this type, e.g. `my_game::ui::Counter`, like `TypePath::type_path`.
+    fn type_path() -> &'static str
+    where
+        Self: Sized,
+    {
+        std::any::type_name::<Self>()
+    }
+
+    /// The name of this type without its module path, e.g. `Counter`, like
+    /// `TypePath::short_type_path`.
+    fn short_type_path() -> &'static str
+    where
+        Self: Sized,
+    {
+        static CELL: GenericTypePathCell = GenericTypePathCell::new();
+        CELL.get_or_insert::<Self, _>(|| short_type_name(Self::type_path()))
     }
 }
 
@@ -747,6 +766,18 @@ mod tests {
         assert_eq!(Vec::<String>::name(), "vec");
         assert_eq!(short_type_name("a::B<c::d::E, [f::G; 2]>"), "B<E, [G; 2]>");
         assert_eq!(to_snake_case("HTTPServer2D"), "http_server2_d");
+    }
+
+    #[test]
+    fn type_paths() {
+        assert_eq!(Stack::type_path(), concat!(module_path!(), "::Stack"));
+        assert_eq!(Stack::short_type_path(), "Stack");
+        assert_eq!(HeadsUpDisplay::short_type_path(), "HeadsUpDisplay");
+
+        // Generic and built-in types use their Rust type name.
+        assert_eq!(Wrapper::<Stack>::type_path(), std::any::type_name::<Wrapper<Stack>>());
+        assert_eq!(Wrapper::<Stack>::short_type_path(), "Wrapper<Stack>");
+        assert_eq!(Vec::<String>::short_type_path(), "Vec<String>");
     }
 
     fn inventory() -> Inventory {

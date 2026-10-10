@@ -12,15 +12,24 @@ use bevy::{
         resource::{IsResource, Resource},
         schedule::IntoScheduleConfigs,
         system::Query,
+        world::World,
     },
-    log::{debug, trace},
-    platform::time::Instant,
+    log::{debug, trace, warn},
+    platform::{collections::HashMap, time::Instant},
     prelude::{Deref, DerefMut},
 };
 
 use crate::{
-    core::{path::PropPath, props::Props, value::Value},
-    runtime::BevueSystems,
+    core::{
+        path::PropPath,
+        props::Props,
+        template::{PropsDeclaration, PropsSourceKind},
+        value::Value,
+    },
+    runtime::{
+        render::{restore_props, take_props},
+        BevueSystems,
+    },
 };
 
 /// The props of a template, attached to the same entity as its [`Template`](crate::Template).
@@ -197,12 +206,138 @@ pub fn sync_resource_props<R: Component + Props>(
     timer.log::<R>();
 }
 
+// Props declared by templates
+
+/// How a registered [`Props`] type is mounted on a template that declares it in `<props>`.
+#[derive(Debug, Clone, Copy)]
+pub struct PropsRegistration {
+    /// The type's [`Props::type_path`].
+    pub type_path: &'static str,
+    /// The type's [`Props::name`], the key it is mounted at when the declaration has no name.
+    pub name: &'static str,
+    mount: fn(&mut World, Entity, PropsSourceKind, PropPath) -> bool,
+    unmount: fn(&mut World, Entity, PropsSourceKind),
+}
+
+/// The [`Props`] types registered with [`BevuePropsAppExt::register_props`], by the names a
+/// template can use for them in `<props>`: their [`Props::type_path`] and their
+/// [`Props::short_type_path`]. If two types share a short name, it refers to the one registered
+/// last.
+#[derive(Resource, Default, Debug)]
+pub struct PropsTypeRegistry {
+    types: HashMap<&'static str, PropsRegistration>,
+}
+
+impl PropsTypeRegistry {
+    pub fn register<T: Component + Props>(&mut self) {
+        let registration = PropsRegistration {
+            type_path: T::type_path(),
+            name: T::name(),
+            mount: mount_props::<T>,
+            unmount: unmount_props::<T>,
+        };
+        self.types.insert(T::type_path(), registration);
+        self.types.insert(T::short_type_path(), registration);
+    }
+
+    /// Gets a type by its full or short type path.
+    pub fn get(&self, type_path: &str) -> Option<&PropsRegistration> {
+        self.types.get(type_path)
+    }
+}
+
+/// The props sources a template inserted on its entity for its `<props>` declarations. They are
+/// removed when the template is rendered again, so sources inserted by hand are never touched.
+#[derive(Component, Default, Debug)]
+pub struct DeclaredProps(Vec<(PropsRegistration, PropsSourceKind)>);
+
+/// Inserts the props source of `T` on `entity` unless it already has one, and syncs it right away
+/// so the render that follows shows its data. Returns whether the source was inserted.
+fn mount_props<T: Component + Props>(world: &mut World, entity: Entity, kind: PropsSourceKind, key: PropPath) -> bool {
+    let Ok(mut target) = world.get_entity_mut(entity) else { return false };
+    let source = match kind {
+        PropsSourceKind::Resource => {
+            if target.contains::<PropsResource<T>>() {
+                return false;
+            }
+            target.insert_if_new(PropsResource::<T> { key: Some(key.clone()), _marker: PhantomData });
+            world.component_id::<T>().and_then(|id| world.resource_entities().get(id))
+        }
+        PropsSourceKind::Component => {
+            if target.contains::<PropsComponent<T>>() {
+                return false;
+            }
+            target.insert_if_new(PropsComponent::<T> { key: Some(key.clone()), entity: None, _marker: PhantomData });
+            Some(entity)
+        }
+    };
+
+    let mut value = take_props(world, entity);
+    if let Some(data) = source.and_then(|source| world.get::<T>(source)) {
+        value.update_at(key.segments(), |target| data.sync_value(target));
+    }
+    restore_props(world, entity, value);
+    true
+}
+
+fn unmount_props<T: Component + Props>(world: &mut World, entity: Entity, kind: PropsSourceKind) {
+    let Ok(mut target) = world.get_entity_mut(entity) else { return };
+    match kind {
+        PropsSourceKind::Resource => target.remove::<PropsResource<T>>(),
+        PropsSourceKind::Component => target.remove::<PropsComponent<T>>(),
+    };
+}
+
+/// Mounts the props a template declares in `<props>` on its entity, replacing the ones mounted
+/// for its previous render. A source the entity already has is left as it is.
+pub(crate) fn mount_declared_props(world: &mut World, entity: Entity, declarations: &[PropsDeclaration]) {
+    let previous = world.get_mut::<DeclaredProps>(entity).map(|mut declared| std::mem::take(&mut declared.0));
+    if previous.is_none() && declarations.is_empty() {
+        return;
+    }
+    for (registration, kind) in previous.unwrap_or_default() {
+        (registration.unmount)(world, entity, kind);
+    }
+
+    let mut mounted = Vec::new();
+    for declaration in declarations {
+        let registration = world.get_resource::<PropsTypeRegistry>().and_then(|r| r.get(&declaration.type_path));
+        let Some(registration) = registration.copied() else {
+            warn!(
+                "template on {entity} declares props of unknown type '{}'; register it with `app.register_props`",
+                declaration.type_path
+            );
+            continue;
+        };
+        let name = declaration.name.as_deref().unwrap_or(registration.name);
+        let key = match PropPath::parse(name) {
+            Ok(key) => key,
+            Err(error) => {
+                warn!("cannot mount props '{}' on {entity}: {error}", registration.type_path);
+                continue;
+            }
+        };
+        if (registration.mount)(world, entity, declaration.source, key) {
+            mounted.push((registration, declaration.source));
+        }
+    }
+
+    if let Ok(mut target) = world.get_entity_mut(entity) {
+        if mounted.is_empty() {
+            target.remove::<DeclaredProps>();
+        } else {
+            target.insert(DeclaredProps(mounted));
+        }
+    }
+}
+
 /// A [`Props`] type that can be registered as a template props source with
 /// [`BevuePropsAppExt::register_props`].
 ///
 /// It is implemented for every [`Props`] component. Resources are components too, so the same
 /// impl covers them: a registered type can be mounted with a [`PropsComponent`] and, if it is a
-/// resource, with a [`PropsResource`].
+/// resource, with a [`PropsResource`]. A registered type can also be declared in the `<props>`
+/// of a template, see [`PropsTypeRegistry`].
 pub trait RegisterableProps: Props + Sized {
     /// Adds what is needed to sync `Self` into template props.
     fn register(app: &mut App);
@@ -210,6 +345,7 @@ pub trait RegisterableProps: Props + Sized {
 
 impl<T: Component + Props> RegisterableProps for T {
     fn register(app: &mut App) {
+        app.world_mut().get_resource_or_init::<PropsTypeRegistry>().register::<T>();
         app.add_systems(
             PostUpdate,
             (sync_component_props::<T>, sync_resource_props::<T>).in_set(BevueSystems::SyncProps),
