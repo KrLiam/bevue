@@ -10,7 +10,8 @@ use syn::{
 /// Derives `bevue::core::props::Props`.
 ///
 /// - Structs with named fields become dicts keyed by field name.
-/// - Tuple structs become lists.
+/// - Tuple structs with one field are transparent: they convert like their field.
+/// - Tuple structs with more fields become lists.
 /// - Enums with only unit variants become strings holding the variant name.
 ///
 /// Type attributes:
@@ -184,59 +185,95 @@ fn expand(mut input: DeriveInput) -> syn::Result<TokenStream2> {
                     types.push(&field.ty);
                 }
                 let len = indices.len();
-                quote! {
-                    fn to_value(&self) -> #value {
-                        #value::list(::std::vec![ #( #props::Props::to_value(&self.#indices) ),* ])
-                    }
-                    fn sync_value(&self, target: &mut #value) {
-                        if target.as_list().map(|l| l.len()) != ::core::option::Option::Some(#len) {
-                            target.set(#props::Props::to_value(self));
-                            return;
+                if let [ty] = types[..] {
+                    // A single field is transparent: the struct behaves like the field itself.
+                    quote! {
+                        fn to_value(&self) -> #value {
+                            #props::Props::to_value(&self.0)
                         }
-                        #( #props::sync_element(target, #positions, &self.#indices); )*
+                        fn sync_value(&self, target: &mut #value) {
+                            #props::Props::sync_value(&self.0, target)
+                        }
+                        fn apply_value(&mut self, value: &#value) -> ::core::result::Result<(), #props::PropsError> {
+                            #props::Props::apply_value(&mut self.0, value)
+                        }
+                        fn from_value(value: &#value) -> ::core::result::Result<Self, #props::PropsError> {
+                            ::core::result::Result::Ok(Self(<#ty as #props::Props>::from_value(value)?))
+                        }
+                        fn kind(&self) -> #props::PropsKind {
+                            #props::Props::kind(&self.0)
+                        }
+                        fn field(&self, name: &str) -> ::core::option::Option<&dyn #props::Props> {
+                            #props::Props::field(&self.0, name)
+                        }
+                        fn field_mut(&mut self, name: &str) -> ::core::option::Option<&mut dyn #props::Props> {
+                            #props::Props::field_mut(&mut self.0, name)
+                        }
+                        fn element(&self, index: usize) -> ::core::option::Option<&dyn #props::Props> {
+                            #props::Props::element(&self.0, index)
+                        }
+                        fn element_mut(&mut self, index: usize) -> ::core::option::Option<&mut dyn #props::Props> {
+                            #props::Props::element_mut(&mut self.0, index)
+                        }
+                        fn element_count(&self) -> usize {
+                            #props::Props::element_count(&self.0)
+                        }
                     }
-                    fn apply_value(&mut self, value: &#value) -> ::core::result::Result<(), #props::PropsError> {
-                        let list = value.as_list().ok_or_else(|| #props::PropsError::expected("list", value))?;
-                        #(
-                            if let ::core::option::Option::Some(v) = list.get(#positions) {
-                                #props::Props::apply_value(&mut self.#indices, v)
-                                    .map_err(|e| e.in_field(::std::format!("[{}]", #positions)))?;
+                } else {
+                    quote! {
+                        fn to_value(&self) -> #value {
+                            #value::list(::std::vec![ #( #props::Props::to_value(&self.#indices) ),* ])
+                        }
+                        fn sync_value(&self, target: &mut #value) {
+                            if target.as_list().map(|l| l.len()) != ::core::option::Option::Some(#len) {
+                                target.set(#props::Props::to_value(self));
+                                return;
                             }
-                        )*
-                        ::core::result::Result::Ok(())
-                    }
-                    fn from_value(value: &#value) -> ::core::result::Result<Self, #props::PropsError> {
-                        let list = value.as_list().ok_or_else(|| #props::PropsError::expected("list", value))?;
-                        if list.len() != #len {
-                            return ::core::result::Result::Err(#props::PropsError::TypeMismatch {
-                                expected: "list of matching length",
-                                found: ::std::string::ToString::to_string(value),
-                            });
+                            #( #props::sync_element(target, #positions, &self.#indices); )*
                         }
-                        ::core::result::Result::Ok(Self(
+                        fn apply_value(&mut self, value: &#value) -> ::core::result::Result<(), #props::PropsError> {
+                            let list = value.as_list().ok_or_else(|| #props::PropsError::expected("list", value))?;
                             #(
-                                <#types as #props::Props>::from_value(&list[#positions])
-                                    .map_err(|e| e.in_field(::std::format!("[{}]", #positions)))?,
+                                if let ::core::option::Option::Some(v) = list.get(#positions) {
+                                    #props::Props::apply_value(&mut self.#indices, v)
+                                        .map_err(|e| e.in_field(::std::format!("[{}]", #positions)))?;
+                                }
                             )*
-                        ))
-                    }
-                    fn kind(&self) -> #props::PropsKind {
-                        #props::PropsKind::List
-                    }
-                    fn element(&self, index: usize) -> ::core::option::Option<&dyn #props::Props> {
-                        match index {
-                            #( #positions => ::core::option::Option::Some(&self.#indices), )*
-                            _ => ::core::option::Option::None,
+                            ::core::result::Result::Ok(())
                         }
-                    }
-                    fn element_mut(&mut self, index: usize) -> ::core::option::Option<&mut dyn #props::Props> {
-                        match index {
-                            #( #positions => ::core::option::Option::Some(&mut self.#indices), )*
-                            _ => ::core::option::Option::None,
+                        fn from_value(value: &#value) -> ::core::result::Result<Self, #props::PropsError> {
+                            let list = value.as_list().ok_or_else(|| #props::PropsError::expected("list", value))?;
+                            if list.len() != #len {
+                                return ::core::result::Result::Err(#props::PropsError::TypeMismatch {
+                                    expected: "list of matching length",
+                                    found: ::std::string::ToString::to_string(value),
+                                });
+                            }
+                            ::core::result::Result::Ok(Self(
+                                #(
+                                    <#types as #props::Props>::from_value(&list[#positions])
+                                        .map_err(|e| e.in_field(::std::format!("[{}]", #positions)))?,
+                                )*
+                            ))
                         }
-                    }
-                    fn element_count(&self) -> usize {
-                        #len
+                        fn kind(&self) -> #props::PropsKind {
+                            #props::PropsKind::List
+                        }
+                        fn element(&self, index: usize) -> ::core::option::Option<&dyn #props::Props> {
+                            match index {
+                                #( #positions => ::core::option::Option::Some(&self.#indices), )*
+                                _ => ::core::option::Option::None,
+                            }
+                        }
+                        fn element_mut(&mut self, index: usize) -> ::core::option::Option<&mut dyn #props::Props> {
+                            match index {
+                                #( #positions => ::core::option::Option::Some(&mut self.#indices), )*
+                                _ => ::core::option::Option::None,
+                            }
+                        }
+                        fn element_count(&self) -> usize {
+                            #len
+                        }
                     }
                 }
             }

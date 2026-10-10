@@ -168,7 +168,8 @@ fn parse_call_args(input: &mut &str) -> ModalResult<Vec<Expression>> {
     }
 }
 
-/// Parses expression with chained member access and indexing: `target.field1[0].field2`
+/// Parses expression with chained member access and indexing: `target.field1[0].field2`.
+/// A numeric member such as `target.0` is the same as `target[0]`.
 fn parse_expr_internal(input: &mut &str) -> ModalResult<Expression> {
     let _: &str = multispace0.parse_next(input)?;
     let mut current = parse_atom.parse_next(input)?;
@@ -188,9 +189,20 @@ fn parse_expr_internal(input: &mut &str) -> ModalResult<Expression> {
                     };
                 }
                 Err(_) => {
-                    // Not an identifier after dot; rollback
-                    *input = checkpoint;
-                    break;
+                    let digits: ModalResult<&str> = take_while(1.., '0'..='9').parse_next(input);
+                    match digits.ok().and_then(|digits| digits.parse::<i32>().ok()) {
+                        Some(index) => {
+                            current = Expression::Index {
+                                target: Box::new(current),
+                                index: Box::new(Expression::Integer(index)),
+                            };
+                        }
+                        None => {
+                            // Not a member after dot; rollback
+                            *input = checkpoint;
+                            break;
+                        }
+                    }
                 }
             }
         } else if input.starts_with('[') {
@@ -463,6 +475,13 @@ mod tests {
         );
 
         assert!(try_parse_expression("a[0").is_err());
+
+        // Numeric members are indices.
+        assert_eq!(parse_expression("a.b.0.c"), expr);
+        assert_eq!(parse_expression("rows.0.1"), parse_expression("rows[0][1]"));
+        assert_eq!(parse_expression("f(x).0"), parse_expression("f(x)[0]"));
+        assert!(try_parse_expression("a.").is_err());
+        assert!(try_parse_expression("a.0x").is_err());
     }
 
     #[test]

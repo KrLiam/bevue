@@ -384,6 +384,23 @@ fn dynamic_index() {
     assert_eq!(texts(app.world(), root), vec!["B"]);
 }
 
+#[test]
+fn numeric_member_is_an_index() {
+    let mut app = app();
+    let root = spawn(
+        &mut app,
+        r#"<div><p>{{pair.0}} {{pair[1]}}</p><span>{{rows.1.0}}</span></div>"#,
+        value!({ "pair": ["a", "b"], "rows": [["x"], ["y"]] }),
+    );
+    assert_eq!(texts(app.world(), root), vec!["a b", "y"]);
+
+    // Both spellings are bound to the same path.
+    props(&mut app, root).at_mut(&path("pair[0]")).unwrap().set("A");
+    props(&mut app, root).at_mut(&path("rows.1.0")).unwrap().set("Y");
+    app.update();
+    assert_eq!(texts(app.world(), root), vec!["A b", "Y"]);
+}
+
 mod props_sources {
     use bevy::ecs::{component::Component, resource::Resource};
 

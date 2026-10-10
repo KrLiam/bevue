@@ -52,7 +52,8 @@ impl PropPath {
         Self(segments.into_iter().collect())
     }
 
-    /// Parses a path such as `a.b[0].c` or `[2].name`.
+    /// Parses a path such as `a.b[0].c` or `[2].name`. A numeric key is an index: `a.0` is the
+    /// same as `a[0]`.
     pub fn parse(source: &str) -> Result<Self, PathParseError> {
         let err = |msg: &str| PathParseError(format!("{msg} in path '{source}'"));
         let mut segments = Vec::new();
@@ -79,7 +80,10 @@ impl PropPath {
             if key.is_empty() {
                 return Err(err("empty key"));
             }
-            segments.push(PathSegment::Key(key.to_owned().into()));
+            segments.push(match key.parse::<usize>() {
+                Ok(index) if key.bytes().all(|b| b.is_ascii_digit()) => PathSegment::Index(index),
+                _ => PathSegment::Key(key.to_owned().into()),
+            });
             rest = &rest[end..];
             expect_key = false;
         }
@@ -201,6 +205,9 @@ mod tests {
         assert_eq!(nested.to_string(), "[2][3].name");
 
         assert!(PropPath::parse("").unwrap().is_empty());
+
+        assert_eq!(PropPath::parse("a.b.0.c").unwrap(), path);
+        assert_eq!(PropPath::parse("2.3.name").unwrap(), nested);
     }
 
     #[test]

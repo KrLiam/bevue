@@ -5,7 +5,8 @@
 //! nested members by path, e.g. `inventory.slots[0].count`.
 //!
 //! Derive it with `#[derive(Props)]`, which supports structs with named fields (dicts), tuple
-//! structs (lists) and enums with only unit variants (strings). Fields can be renamed with
+//! structs (transparent with one field, lists with more) and enums with only unit variants
+//! (strings). Fields can be renamed with
 //! `#[props(rename = "name")]` or left out with `#[props(skip)]`.
 //!
 //! A `Props` type also has a [`Props::name`], the key it is mounted at in template props by
@@ -694,6 +695,40 @@ mod tests {
 
     #[derive(crate::Props)]
     struct PlayerInventory;
+
+    #[derive(crate::Props, Debug, Clone, PartialEq)]
+    struct Health(u32);
+
+    #[derive(crate::Props, Debug, Clone, PartialEq)]
+    struct Tags(Vec<String>);
+
+    #[derive(crate::Props, Debug, Clone, PartialEq)]
+    struct Player {
+        health: Health,
+        tags: Tags,
+    }
+
+    #[test]
+    fn single_field_tuple_structs_are_transparent() {
+        let mut player = Player { health: Health(3), tags: Tags(vec!["a".into(), "b".into()]) };
+        let mut value = player.to_value();
+        assert_eq!(value, value!({ "health": 3, "tags": ["a", "b"] }));
+        assert_eq!(Player::from_value(&value).unwrap(), player);
+        assert_eq!(Health::from_value(&value!(7)).unwrap(), Health(7));
+
+        // Members of the field are reached through the struct, with `.0` or `[0]`.
+        assert_eq!(player.get_path::<String>("tags[1]").unwrap(), "b");
+        assert_eq!(player.get_path::<String>("tags.1").unwrap(), "b");
+        assert_eq!(player.get_path::<Health>("health").unwrap(), &Health(3));
+        player.set_path("health", 5).unwrap();
+        player.set_path("tags.0", "c").unwrap();
+        assert_eq!(player, Player { health: Health(5), tags: Tags(vec!["c".into(), "b".into()]) });
+
+        player.sync_value(&mut value);
+        assert_eq!(value, player.to_value());
+        assert_eq!(value.get("health").unwrap().flags(), ChangeFlags::SELF);
+        assert!(!value.at(&PropPath::parse("tags[1]").unwrap()).unwrap().is_dirty());
+    }
 
     #[derive(crate::Props)]
     #[props(name = "hud")]
