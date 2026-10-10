@@ -21,12 +21,16 @@ struct Inventory {
 struct Item {
     id: String,
     count: u32,
+    color: &'static str,
 }
 
 
 fn add_item(_: In<BevueCtx>, mut inv: ResMut<Inventory>) {
-    let count = inv.items.len() + 1;
-    inv.items.push(Item { id: "apple".to_owned(), count: count as u32 });
+    let i = inv.items.len();
+    let color = ["red", "blue", "green", "yellow"][i % 4];
+
+    let count = i + 1;
+    inv.items.push(Item { id: "apple".to_owned(), count: count as u32, color });
 }
 
 fn remove_item(In(ctx): In<BevueCtx>, mut inv: ResMut<Inventory>) {
@@ -51,7 +55,7 @@ fn main() {
         .register_props::<PlayerName>()
         .insert_resource(PlayerName { value: "John".to_owned() })
         // `<ItemRow/>` in a template renders this file.
-        .register_component("Item", "item_row.html")
+        .register_component("Item", "item.html")
         .add_systems(Startup, startup)
         .add_systems(Update, inventory_changed.run_if(resource_changed::<Inventory>));
 

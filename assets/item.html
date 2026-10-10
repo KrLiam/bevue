@@ -1,6 +1,6 @@
 <template>
     <div class="item">
-        <p>{{ item.id }}</p>
+        <p :style="{ color: item.color }">{{ item.id }}</p>
         <p class="item_count">{{ item.count }}</p>
         <button class="button" @click="$emit('remove')">X</button>
     </div>
