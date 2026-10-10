@@ -63,8 +63,8 @@ fn startup(asset_server: Res<AssetServer>, mut cmds: Commands) {
         Template::new(asset_server.load("inventory.html"))
             .with_function("add_item", add_item)
             .with_function("remove_item", remove_item),
-        PropsResource::<Inventory>::at("inventory"),
-        PropsResource::<PlayerName>::at("player_name"),
+        PropsResource::<Inventory>::default(),
+        PropsResource::<PlayerName>::default(),
     ));
 }
 

@@ -7,10 +7,13 @@
 //! Derive it with `#[derive(Props)]`, which supports structs with named fields (dicts), tuple
 //! structs (lists) and enums with only unit variants (strings). Fields can be renamed with
 //! `#[props(rename = "name")]` or left out with `#[props(skip)]`.
+//!
+//! A `Props` type also has a [`Props::name`], the key it is mounted at in template props by
+//! default: the type name in snake case, or `#[props(name = "name")]` on the type.
 
 use std::{any::Any, borrow::Cow, fmt};
 
-use bevy::platform::collections::HashMap;
+use bevy::{platform::collections::HashMap, reflect::utility::GenericTypePathCell};
 
 use crate::core::{
     path::{AsPropPath, PathParseError, PathSegment, PropPath},
@@ -75,6 +78,57 @@ pub trait Props: Send + Sync + 'static {
     fn as_any(&self) -> &dyn Any;
 
     fn as_any_mut(&mut self) -> &mut dyn Any;
+
+    /// The key this type is mounted at in template props by default, e.g. `player_inventory` for
+    /// `PlayerInventory`. `#[derive(Props)]` sets it from the type name or from
+    /// `#[props(name = "...")]`.
+    fn name() -> &'static str
+    where
+        Self: Sized,
+    {
+        static CELL: GenericTypePathCell = GenericTypePathCell::new();
+        CELL.get_or_insert::<Self, _>(|| {
+            let short = short_type_name(std::any::type_name::<Self>());
+            let ident = short.split(|c: char| !c.is_alphanumeric() && c != '_').next().unwrap_or_default();
+            to_snake_case(ident)
+        })
+    }
+}
+
+/// Removes the module paths from a type name: `a::B<c::D>` becomes `B<D>`.
+pub fn short_type_name(full: &str) -> String {
+    let mut out = String::new();
+    // Where the path segment being read starts in `out`.
+    let mut segment = 0;
+    let mut chars = full.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == ':' && chars.peek() == Some(&':') {
+            chars.next();
+            out.truncate(segment);
+        } else {
+            out.push(c);
+            if !c.is_alphanumeric() && c != '_' {
+                segment = out.len();
+            }
+        }
+    }
+    out
+}
+
+/// Converts a type name to snake case: `PlayerInventory` becomes `player_inventory`.
+pub fn to_snake_case(name: &str) -> String {
+    let chars: Vec<char> = name.chars().collect();
+    let mut out = String::new();
+    for (i, &c) in chars.iter().enumerate() {
+        let previous = i.checked_sub(1).map(|p| chars[p]);
+        let next_is_lower = chars.get(i + 1).is_some_and(|n| n.is_lowercase());
+        let boundary = previous.is_some_and(|p| p.is_lowercase() || p.is_numeric() || (p.is_uppercase() && next_is_lower));
+        if c.is_uppercase() && boundary {
+            out.push('_');
+        }
+        out.extend(c.to_lowercase());
+    }
+    out
 }
 
 impl dyn Props {
@@ -636,6 +690,28 @@ mod tests {
     #[derive(crate::Props, Debug, Clone, PartialEq)]
     struct Wrapper<T> {
         inner: T,
+    }
+
+    #[derive(crate::Props)]
+    struct PlayerInventory;
+
+    #[derive(crate::Props)]
+    #[props(name = "hud")]
+    struct HeadsUpDisplay;
+
+    #[test]
+    fn names() {
+        assert_eq!(Stack::name(), "stack");
+        assert_eq!(Rarity::name(), "rarity");
+        assert_eq!(PlayerInventory::name(), "player_inventory");
+        assert_eq!(HeadsUpDisplay::name(), "hud");
+        assert_eq!(Wrapper::<u8>::name(), "wrapper");
+
+        // Types without a derive get a name from their type name.
+        assert_eq!(u32::name(), "u32");
+        assert_eq!(Vec::<String>::name(), "vec");
+        assert_eq!(short_type_name("a::B<c::d::E, [f::G; 2]>"), "B<E, [G; 2]>");
+        assert_eq!(to_snake_case("HTTPServer2D"), "http_server2_d");
     }
 
     fn inventory() -> Inventory {

@@ -47,7 +47,8 @@ fn startup(asset_server: Res<AssetServer>, mut cmds: Commands) {
 
     cmds.spawn((
         Template::new(asset_server.load("simple.html")).with_function("label", label),
-        PropsResource::<Counter>::at("counter"),
+        // Mounted at `counter`, the name of the type in snake case.
+        PropsResource::<Counter>::default(),
     ));
 }
 

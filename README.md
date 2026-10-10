@@ -47,6 +47,10 @@ app.register_props::<Menu>();
 commands.spawn((Template::new(asset_server.load("menu.html")), PropsResource::<Menu>::at("menu")));
 ```
 
+`PropsResource::<Menu>::default()` mounts the resource at its default name: the type name in snake
+case (`menu`, or `player_inventory` for `PlayerInventory`), or the one set with
+`#[props(name = "...")]` on the type.
+
 Changed Rust data is diffed into the props, so editing `menu.actions[1].label` only updates the
 text bound to that label.
 

@@ -428,7 +428,8 @@ mod props_sources {
 
         let template = crate::parser::parse_template(MENU).unwrap();
         let handle = app.world_mut().resource_mut::<Assets<BevueTemplate>>().add(template);
-        let root = app.world_mut().spawn((Template::new(handle), PropsResource::<Menu>::at("menu"))).id();
+        // Mounted at `Menu::name()`, which is "menu".
+        let root = app.world_mut().spawn((Template::new(handle), PropsResource::<Menu>::default())).id();
         app.update();
         assert_eq!(texts(app.world(), root), vec!["File", "Open", "Save"]);
 

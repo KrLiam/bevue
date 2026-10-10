@@ -13,6 +13,11 @@ use syn::{
 /// - Tuple structs become lists.
 /// - Enums with only unit variants become strings holding the variant name.
 ///
+/// Type attributes:
+/// - `#[props(name = "name")]` sets `Props::name`, the key the type is mounted at in template props
+///   by default. Without it, the name is the type name in snake case: `PlayerInventory` is
+///   `player_inventory`.
+///
 /// Field and variant attributes:
 /// - `#[props(rename = "name")]` uses another key or variant string.
 /// - `#[props(skip)]` leaves a field out; it must implement `Default`.
@@ -49,9 +54,48 @@ fn parse_attrs(attrs: &[syn::Attribute]) -> syn::Result<Attrs> {
     Ok(out)
 }
 
+/// Parses the attributes of the type itself, returning its `name` if set.
+fn parse_container_attrs(attrs: &[syn::Attribute]) -> syn::Result<Option<LitStr>> {
+    let mut name = None;
+    for attr in attrs.iter().filter(|a| a.path().is_ident("props")) {
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("name") {
+                let value = meta.value()?.parse::<LitStr>()?;
+                if value.value().trim().is_empty() {
+                    return Err(syn::Error::new(value.span(), "`name` cannot be empty"));
+                }
+                name = Some(value);
+                Ok(())
+            } else {
+                Err(meta.error("expected `name = \"...\"`"))
+            }
+        })?;
+    }
+    Ok(name)
+}
+
+/// Converts a type name to snake case: `PlayerInventory` becomes `player_inventory`.
+fn to_snake_case(name: &str) -> String {
+    let chars: Vec<char> = name.chars().collect();
+    let mut out = String::new();
+    for (i, &c) in chars.iter().enumerate() {
+        let previous = i.checked_sub(1).map(|p| chars[p]);
+        let next_is_lower = chars.get(i + 1).is_some_and(|n| n.is_lowercase());
+        let boundary = previous.is_some_and(|p| p.is_lowercase() || p.is_numeric() || (p.is_uppercase() && next_is_lower));
+        if c.is_uppercase() && boundary {
+            out.push('_');
+        }
+        out.extend(c.to_lowercase());
+    }
+    out
+}
+
 fn expand(mut input: DeriveInput) -> syn::Result<TokenStream2> {
     let props = quote!(::bevue::core::props);
     let value = quote!(::bevue::core::value::Value);
+
+    let props_name = parse_container_attrs(&input.attrs)?
+        .unwrap_or_else(|| LitStr::new(&to_snake_case(&input.ident.to_string()), input.ident.span()));
 
     let type_params: Vec<Ident> = input.generics.type_params().map(|p| p.ident.clone()).collect();
     let where_clause = input.generics.make_where_clause();
@@ -263,6 +307,9 @@ fn expand(mut input: DeriveInput) -> syn::Result<TokenStream2> {
             }
             fn as_any_mut(&mut self) -> &mut dyn ::core::any::Any {
                 self
+            }
+            fn name() -> &'static str {
+                #props_name
             }
         }
     })

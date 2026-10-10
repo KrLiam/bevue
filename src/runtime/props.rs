@@ -57,7 +57,7 @@ impl From<Value> for BevueProps {
 ///
 /// `T` is read from this entity, or from [`PropsComponent::from_entity`]. With a key, it is mounted
 /// at that path of the props (`{{inventory.slots}}`); without one it becomes the props root
-/// (`{{slots}}`). Register `T` with [`BevuePropsAppExt::register_props`].
+/// (`{{slots}}`). The default mounts it at its [`Props::name`]. Register `T` with [`BevuePropsAppExt::register_props`].
 #[derive(Component)]
 #[require(BevueProps)]
 pub struct PropsComponent<T: Send + Sync + 'static> {
@@ -85,7 +85,15 @@ impl<T: Send + Sync + 'static> PropsComponent<T> {
     }
 }
 
+impl<T: Props> Default for PropsComponent<T> {
+    /// Mounts `T` at its [`Props::name`].
+    fn default() -> Self {
+        Self::at(T::name())
+    }
+}
+
 /// Renders resource `R` into the [`BevueProps`] of this template, at `key` or as the props root.
+/// The default mounts it at its [`Props::name`].
 /// Register `R` with [`BevuePropsAppExt::register_props`].
 #[derive(Component)]
 #[require(BevueProps)]
@@ -104,6 +112,13 @@ impl<R: Resource> PropsResource<R> {
     pub fn at(key: &str) -> Self {
         let key = PropPath::parse(key).unwrap_or_else(|e| panic!("invalid props key: {e}"));
         Self { key: Some(key), _marker: PhantomData }
+    }
+}
+
+impl<R: Resource + Props> Default for PropsResource<R> {
+    /// Mounts `R` at its [`Props::name`].
+    fn default() -> Self {
+        Self::at(R::name())
     }
 }
 
