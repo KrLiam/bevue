@@ -30,8 +30,8 @@ fn add_item(_: In<BevueCtx>, mut inv: ResMut<Inventory>) {
 }
 
 fn remove_item(In(ctx): In<BevueCtx>, mut inv: ResMut<Inventory>) {
-    let index = ctx.args.get(0).and_then(|v| v.as_number()).unwrap();
-    inv.items.remove(index as usize);
+    let index: usize = ctx.get_args().unwrap();
+    inv.items.remove(index);
 }
 
 // a normal bevy system. this will be called whenever inventory changes.

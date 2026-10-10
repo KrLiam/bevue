@@ -26,7 +26,13 @@ use bevy::{
     platform::collections::HashMap,
 };
 
-use crate::{core::value::Value, runtime::events::BevueEvent};
+use crate::{
+    core::{
+        props::{Props, PropsError},
+        value::Value,
+    },
+    runtime::events::BevueEvent,
+};
 
 /// The input of a Bevue function.
 #[derive(Debug, Clone)]
@@ -37,6 +43,58 @@ pub struct BevueCtx {
     pub root: Entity,
     /// The evaluated call arguments.
     pub args: Vec<Value>,
+}
+
+impl BevueCtx {
+    /// Converts the call arguments to `T`.
+    ///
+    /// A single type reads the first argument: `ctx.get_args::<f32>()`. A tuple reads one argument
+    /// per element: `ctx.get_args::<(String, u32)>()`. A missing argument is read as `null`, so
+    /// optional arguments can be an `Option`.
+    pub fn get_args<T: FromArgs>(&self) -> Result<T, PropsError> {
+        T::from_args(&self.args)
+    }
+}
+
+/// A type that can be created from the arguments of a function call, for [`BevueCtx::get_args`].
+///
+/// It is implemented for every [`Props`] type, which reads the first argument, and for tuples of
+/// up to 8 of them.
+pub trait FromArgs: Sized {
+    fn from_args(args: &[Value]) -> Result<Self, PropsError>;
+}
+
+/// Converts the argument at `index`, reading a missing one as `null`.
+fn arg<T: Props>(args: &[Value], index: usize) -> Result<T, PropsError> {
+    T::from_value(args.get(index).unwrap_or(&Value::NULL)).map_err(|e| e.in_field(format!("argument {index}")))
+}
+
+impl<T: Props> FromArgs for T {
+    fn from_args(args: &[Value]) -> Result<Self, PropsError> {
+        arg(args, 0)
+    }
+}
+
+macro_rules! impl_from_args {
+    ($(($($ty:ident $index:tt),+))*) => {
+        $(
+            impl<$($ty: Props),+> FromArgs for ($($ty,)+) {
+                fn from_args(args: &[Value]) -> Result<Self, PropsError> {
+                    Ok(($(arg::<$ty>(args, $index)?,)+))
+                }
+            }
+        )*
+    };
+}
+impl_from_args! {
+    (A 0)
+    (A 0, B 1)
+    (A 0, B 1, C 2)
+    (A 0, B 1, C 2, D 3)
+    (A 0, B 1, C 2, D 3, E 4)
+    (A 0, B 1, C 2, D 3, E 4, F 5)
+    (A 0, B 1, C 2, D 3, E 4, F 5, G 6)
+    (A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7)
 }
 
 pub type BevueFunctionId = SystemId<In<BevueCtx>, Value>;
@@ -147,4 +205,33 @@ pub fn emit(In(ctx): In<BevueCtx>, mut commands: Commands) {
         return;
     };
     commands.trigger(BevueEvent { entity: ctx.root, name: Cow::Owned(name), args: args.collect() });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::value;
+
+    fn ctx(args: Vec<Value>) -> BevueCtx {
+        BevueCtx { entity: Entity::PLACEHOLDER, root: Entity::PLACEHOLDER, args }
+    }
+
+    #[test]
+    fn get_args() {
+        let call = ctx(vec![value!(2.5), value!("x"), value!([1, 2])]);
+        assert_eq!(call.get_args::<f32>(), Ok(2.5));
+        assert_eq!(call.get_args::<usize>(), Ok(2));
+        assert_eq!(call.get_args::<(f64,)>(), Ok((2.5,)));
+        assert_eq!(call.get_args::<(f32, String, Vec<u8>)>(), Ok((2.5, "x".to_owned(), vec![1, 2])));
+        assert_eq!(call.get_args::<Value>(), Ok(value!(2.5)));
+
+        // Missing arguments are null.
+        assert_eq!(call.get_args::<(f32, String, Value, Option<u32>)>().unwrap().3, None);
+        assert_eq!(ctx(vec![]).get_args::<Option<bool>>(), Ok(None));
+
+        let error = call.get_args::<(f32, u32)>().unwrap_err();
+        assert_eq!(error.to_string(), "argument 1: expected number, found \"x\"");
+        let error = call.get_args::<(f32, String, Vec<u8>, bool)>().unwrap_err();
+        assert_eq!(error.to_string(), "argument 3: expected bool, found null");
+    }
 }

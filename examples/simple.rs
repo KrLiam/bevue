@@ -60,7 +60,8 @@ fn add_item(In(_ctx): In<BevueCtx>, mut counter: ResMut<Counter>) {
 
 /// Called by `{{ label(item) }}`, only available to this template.
 fn label(In(ctx): In<BevueCtx>) -> String {
-    format!("Item #{}", ctx.args[0].to_text())
+    let item: u32 = ctx.get_args().unwrap();
+    format!("Item #{item}")
 }
 
 /// Updates the counter once per second. Only the template nodes bound to the fields that changed

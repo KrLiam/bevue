@@ -68,6 +68,16 @@ app.register_bevue_function("add_user", add_user); // global
 Template::new(handle).with_function("add_user", add_user); // only for this template
 ```
 
+`ctx.args` holds the call arguments as `Value`s. `ctx.get_args()` converts them to Rust types: a
+single type reads the first argument and a tuple reads one argument per element.
+
+```rust
+fn rename_user(In(ctx): In<BevueCtx>, mut props: Query<&mut BevueProps>) {
+    let Ok((index, name)) = ctx.get_args::<(usize, String)>() else { return };
+    // ...
+}
+```
+
 ```html
 <button @click="add_user()">Add</button>
 <li v-for="user in users" @click="$emit('select', user.id)">{{ user.name }}</li>

@@ -14,7 +14,7 @@ pub mod render;
 
 pub use crate::core::template::TemplateRef;
 pub use events::{BevueEvent, LastInteraction};
-pub use functions::{BevueCtx, BevueFunctions, BevueFunctionsAppExt, TemplateFunctions};
+pub use functions::{BevueCtx, BevueFunctions, BevueFunctionsAppExt, FromArgs, TemplateFunctions};
 pub use instance::{TemplateInstance, UpdateStats};
 pub use props::{BevueProps, BevuePropsAppExt, PropsComponent, PropsResource, RegisterableProps};
 pub use render::{
