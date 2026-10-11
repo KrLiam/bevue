@@ -1,0 +1,79 @@
+name: Publish
+
+# Publishes to crates.io when a version tag is pushed. To release, set `version` in Cargo.toml,
+# commit, then tag that commit `v<version>` (e.g. `v0.2.0`) and push the tag.
+#
+# The tag must match the version of `bevue`. Each crate is published only if its version is not on
+# crates.io yet, so `bevue_macros` is released along with `bevue` whenever its version changed.
+
+on:
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Find unpublished versions
+        id: versions
+        run: |
+          # In dependency order: bevue needs bevue_macros to be on crates.io first.
+          unpublished=""
+          for crate in bevue_macros bevue; do
+            version=$(cargo metadata --no-deps --format-version 1 \
+              | jq -r --arg name "$crate" '.packages[] | select(.name == $name) | .version')
+            if [ -z "$version" ]; then
+              echo "::error::crate $crate not found in the workspace"
+              exit 1
+            fi
+            if [ "$crate" = bevue ] && [ "v$version" != "$GITHUB_REF_NAME" ]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match bevue $version in Cargo.toml"
+              exit 1
+            fi
+            status=$(curl -s -o /dev/null -w '%{http_code}' \
+              -H "User-Agent: bevue-publish-workflow (${{ github.repository }})" \
+              "https://crates.io/api/v1/crates/$crate/$version")
+            case "$status" in
+              200) echo "$crate $version is already published" ;;
+              404) echo "$crate $version is not published yet"; unpublished="$unpublished $crate" ;;
+              *) echo "::error::crates.io answered $status for $crate $version"; exit 1 ;;
+            esac
+          done
+          echo "crates=${unpublished# }" >> "$GITHUB_OUTPUT"
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.versions.outputs.crates != ''
+
+      - name: Install Bevy dependencies
+        if: steps.versions.outputs.crates != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
+
+      - name: Test
+        if: steps.versions.outputs.crates != ''
+        run: cargo test --workspace
+
+      - name: Publish
+        if: steps.versions.outputs.crates != ''
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          for crate in ${{ steps.versions.outputs.crates }}; do
+            cargo publish -p "$crate"
+          done

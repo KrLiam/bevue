@@ -5,7 +5,9 @@ edition = "2024"
 description = "Vue-like templating for Bevy UI"
 repository="https://github.com/krliam/bevue"
 license = "MIT"
+readme = "README.md"
 keywords=["bevy", "ui", "vue", "reactivity"]
+exclude = ["/plans", "/docs", "/todo.md", "/.github"]
 
 [workspace]
 members = ["crates/bevue_macros"]
