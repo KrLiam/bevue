@@ -1,7 +1,7 @@
 use std::{borrow::Cow, collections::HashSet, path::Path, sync::Arc};
 
 use bevy::{
-    asset::{AssetEvent, AssetId, AssetServer, Assets, Handle},
+    asset::{AssetEvent, AssetId, AssetLoadFailedEvent, AssetServer, Assets, Handle},
     ecs::{
         change_detection::{DetectChanges, DetectChangesMut, Ref},
         component::Component,
@@ -166,6 +166,7 @@ pub fn watch_template_components(
     mut commands: Commands,
     assets: Res<Assets<BevueTemplate>>,
     mut asset_events: MessageReader<AssetEvent<BevueTemplate>>,
+    mut failed_events: MessageReader<AssetLoadFailedEvent<BevueTemplate>>,
     changed_templates: Query<(Entity, &Template), Changed<Template>>,
     waiting_templates: Query<(Entity, &Template), With<WaitingForTemplate>>,
     all_templates: Query<(Entity, &Template, Option<&ComponentDependencies>)>,
@@ -187,6 +188,9 @@ pub fn watch_template_components(
             _ => {}
         }
     }
+    // A component that failed to load is no longer waited for.
+    let failed: Vec<_> = failed_events.read().map(|event| event.id).collect();
+    added_asset_ids.extend(&failed);
 
     if !modified_asset_ids.is_empty() || !added_asset_ids.is_empty() {
         for (entity, template, dependencies) in &all_templates {
@@ -249,7 +253,7 @@ pub fn watch_template_components(
 pub fn render_template(input: In<RenderTemplate>, world: &mut World) {
     let start = Instant::now();
     load_components(world);
-    let (template, compiled, dependencies) = {
+    let (template, compiled, dependencies, loading) = {
         let Some(templates) = world.get_resource::<Assets<BevueTemplate>>() else {
             error!("Assets<BevueTemplate> resource not found");
             return;
@@ -260,7 +264,8 @@ pub fn render_template(input: In<RenderTemplate>, world: &mut World) {
         };
         let components = WorldComponents::new(world, templates);
         let compiled = CompiledTemplate::compile_with(template, &components);
-        (Arc::new(template.clone()), compiled, components.into_dependencies())
+        let loading = components.is_loading();
+        (Arc::new(template.clone()), compiled, components.into_dependencies(), loading)
     };
 
     let root_entity = match input.ui_root {
@@ -271,6 +276,12 @@ pub fn render_template(input: In<RenderTemplate>, world: &mut World) {
     let mut root = world.entity_mut(root_entity);
     if !root.contains::<Template>() {
         root.insert(Template::new(input.template.clone()));
+    }
+    // Wait for the components that are still loading instead of rendering without them. The
+    // template is rendered when they arrive or fail to load.
+    if loading {
+        root.insert(dependencies);
+        return;
     }
     // Discard any previous render (e.g. on hot reload).
     root.remove::<TemplateInstance>();

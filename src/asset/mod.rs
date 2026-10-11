@@ -5,7 +5,7 @@ use bevy::{
             memory::{Dir, MemoryAssetReader},
             AssetSourceBuilder, Reader,
         },
-        AssetApp, AssetLoader, AssetServer, Assets, LoadContext,
+        AssetApp, AssetLoader, AssetPath, AssetServer, Assets, LoadContext,
     },
     ecs::resource::Resource,
     prelude::{Deref, DerefMut},
@@ -21,6 +21,7 @@ pub enum BevueTemplateLoaderError {
     Utf8(std::str::Utf8Error),
     Parse(crate::parser::ParseError),
     Compile(crate::core::compile::CompileError),
+    Import(String),
 }
 
 impl std::fmt::Display for BevueTemplateLoaderError {
@@ -30,6 +31,7 @@ impl std::fmt::Display for BevueTemplateLoaderError {
             BevueTemplateLoaderError::Utf8(e) => write!(f, "Template source is not valid UTF-8: {e}"),
             BevueTemplateLoaderError::Parse(e) => write!(f, "Could not parse template: {e}"),
             BevueTemplateLoaderError::Compile(e) => write!(f, "Invalid template: {e}"),
+            BevueTemplateLoaderError::Import(e) => write!(f, "Invalid template: {e}"),
         }
     }
 }
@@ -67,12 +69,22 @@ impl AssetLoader for BevueTemplateLoader {
         &self,
         reader: &mut dyn Reader,
         _settings: &Self::Settings,
-        _load_context: &mut LoadContext<'_>,
+        load_context: &mut LoadContext<'_>,
     ) -> Result<Self::Asset, Self::Error> {
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).await?;
         let source = std::str::from_utf8(&bytes)?;
-        let template = parse_template(source)?;
+        let mut template = parse_template(source)?;
+        // `./` and `../` are relative to this file; other paths start at the asset root.
+        for import in &mut template.imports {
+            let path = if import.src.starts_with("./") || import.src.starts_with("../") {
+                load_context.path().resolve_embed_str(&import.src)
+            } else {
+                AssetPath::try_parse(&import.src).map(AssetPath::into_owned)
+            }
+            .map_err(|e| BevueTemplateLoaderError::Import(format!("invalid path in <import src=\"{}\">: {e}", import.src)))?;
+            import.handle = Some(load_context.load(path));
+        }
         // Report directive and scoping errors at load time rather than at render time.
         crate::core::compile::CompiledTemplate::compile(&template).map_err(BevueTemplateLoaderError::Compile)?;
         Ok(template)

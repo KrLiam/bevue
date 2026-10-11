@@ -26,6 +26,7 @@ Bevue is only inspired by Vue, it won't:
 - [X] Function calls in expressions, backed by Bevy systems, e.g. `{{ format(price) }}`;
 - [X] Event handling with `@click`, `@mouseover`, `@mouseleave`, custom events and `$emit`;
 - [X] Component elements such as `<ItemRow :item="item" @remove="remove_item(i)"/>`, at the cost of inlined markup;
+- [X] Components imported by the templates using them, e.g. `<import src="item_row.html"/>`;
 
 # Reactivity
 
@@ -141,15 +142,17 @@ an event on the template root.
 
 # Components
 
-Register a template file under a capitalised name and use it as an element in any template:
-
-```rust
-app.register_component("ItemRow", "item_row.html");
-```
+Import a template file and use it as an element:
 
 ```html
 <!-- inventory.html -->
-<ItemRow v-for="(item, i) in inventory.items" :item="item" @remove="remove_item(i)"/>
+<import src="item_row.html"/>
+
+<template>
+    <ul>
+        <ItemRow v-for="(item, i) in inventory.items" :item="item" @remove="remove_item(i)"/>
+    </ul>
+</template>
 
 <!-- item_row.html -->
 <li class="item">
@@ -157,6 +160,23 @@ app.register_component("ItemRow", "item_row.html");
     <button @click="$emit('remove')">X</button>
 </li>
 ```
+
+`<import>` sits at the top level of the file, next to `<props>`, `<template>` and `<style>`.
+
+- The component is named after its file in PascalCase: `item_row.html` and `ui/item-row.html` are
+  both `ItemRow`. Give it another name with `<import src="item_row.html" as="Row"/>`.
+- A `src` starting with `./` or `../` is relative to the importing file. Any other path starts at
+  the asset root, like the paths given to the asset server.
+- An import is only visible in the file that declares it: a component uses its own imports, not
+  those of the template it is used in.
+- `app.register_component("ItemRow", "item_row.html")` makes a component available to every
+  template without an import. An import of the same name comes first.
+- A template is rendered once the components it uses are loaded. A component that fails to load
+  leaves an empty node.
+- For a template parsed in code, call `template.load_imports(&asset_server)` to load its
+  `<import>`s, or add one with `template.with_import("ItemRow", handle)`.
+
+Using a component:
 
 - Attributes are the component's props: `:item="expr"` is evaluated in the template using the
   component, `title="text"` is a string and a bare `open` is `true`. A `-` in a name becomes `_`

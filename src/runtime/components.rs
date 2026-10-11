@@ -107,6 +107,7 @@ pub struct ComponentDependencies {
 /// Resolves components from the registry and the loaded template assets, recording the ones
 /// asked for.
 pub(crate) struct WorldComponents<'w> {
+    asset_server: Option<&'w AssetServer>,
     components: Option<&'w BevueComponents>,
     templates: &'w Assets<BevueTemplate>,
     used: RefCell<ComponentDependencies>,
@@ -114,7 +115,19 @@ pub(crate) struct WorldComponents<'w> {
 
 impl<'w> WorldComponents<'w> {
     pub(crate) fn new(world: &'w World, templates: &'w Assets<BevueTemplate>) -> Self {
-        Self { components: world.get_resource::<BevueComponents>(), templates, used: RefCell::default() }
+        Self {
+            asset_server: world.get_resource::<AssetServer>(),
+            components: world.get_resource::<BevueComponents>(),
+            templates,
+            used: RefCell::default(),
+        }
+    }
+
+    /// Returns true if a component that was asked for is missing because it is still being
+    /// loaded. One that failed to load, or that the asset server does not know, is not.
+    pub(crate) fn is_loading(&self) -> bool {
+        let Some(asset_server) = self.asset_server else { return false };
+        self.used.borrow().pending.iter().any(|id| asset_server.load_state(*id).is_loading())
     }
 
     pub(crate) fn into_dependencies(self) -> ComponentDependencies {
@@ -128,6 +141,10 @@ impl ComponentResolver for WorldComponents<'_> {
             return ResolvedComponent::Unknown;
         };
         let Some(handle) = &component.handle else { return ResolvedComponent::Pending };
+        self.resolve_asset(handle)
+    }
+
+    fn resolve_asset(&self, handle: &Handle<BevueTemplate>) -> ResolvedComponent<'_> {
         let mut used = self.used.borrow_mut();
         if !used.assets.contains(&handle.id()) {
             used.assets.push(handle.id());

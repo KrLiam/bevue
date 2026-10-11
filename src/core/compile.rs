@@ -11,6 +11,8 @@
 
 use std::{borrow::Cow, fmt};
 
+use bevy::asset::Handle;
+
 use crate::core::{
     path::PathSegment,
     template::{
@@ -227,7 +229,12 @@ pub enum ResolvedComponent<'a> {
 
 /// Finds the templates of the components a template uses.
 pub trait ComponentResolver {
+    /// The component registered as `name`, for names the template does not import.
     fn resolve(&self, name: &str) -> ResolvedComponent<'_>;
+
+    /// The template an `<import>` refers to: [`ResolvedComponent::Ready`] or
+    /// [`ResolvedComponent::Pending`].
+    fn resolve_asset(&self, handle: &Handle<BevueTemplate>) -> ResolvedComponent<'_>;
 }
 
 /// A [`ComponentResolver`] for which every component is [`ResolvedComponent::Pending`].
@@ -235,6 +242,10 @@ pub struct NoComponents;
 
 impl ComponentResolver for NoComponents {
     fn resolve(&self, _name: &str) -> ResolvedComponent<'_> {
+        ResolvedComponent::Pending
+    }
+
+    fn resolve_asset(&self, _handle: &Handle<BevueTemplate>) -> ResolvedComponent<'_> {
         ResolvedComponent::Pending
     }
 }
@@ -313,7 +324,8 @@ struct ScopeFrame {
 
 /// The component whose template is being expanded.
 struct ComponentEnv<'a> {
-    name: &'a str,
+    /// The template the component element was written in.
+    outer: &'a BevueTemplate,
     /// The attributes of the component element, compiled in the scope of the element.
     props: Vec<(String, CompiledExpr)>,
     /// The first `v-for` frame the component can see: those of its own template.
@@ -369,16 +381,32 @@ impl<'a> Compiler<'a> {
         if !node.children.is_empty() || node.text.is_some() {
             return Err(CompileError::unplaced(format!("component elements cannot have children: <{name}>")));
         }
-        let component = match self.components.resolve(name) {
+        // The imports of the template the element is written in come before registered components.
+        let resolved = match self.template.imports.iter().find(|import| import.name == name) {
+            Some(import) => match &import.handle {
+                Some(handle) => self.components.resolve_asset(handle),
+                None => {
+                    return Err(CompileError::unplaced(format!(
+                        "<import src=\"{}\"> is not loaded; a template parsed in code needs \
+                         `BevueTemplate::load_imports` or `BevueTemplate::with_import`",
+                        import.src
+                    )));
+                }
+            },
+            None => self.components.resolve(name),
+        };
+        let component = match resolved {
             ResolvedComponent::Ready(component) => component,
             ResolvedComponent::Pending => return Ok(self.out_id(id)),
             ResolvedComponent::Unknown => {
                 return Err(CompileError::unplaced(format!(
-                    "unknown component <{name}>; register it with `app.register_component`"
+                    "unknown component <{name}>; import it with `<import src=\"...\"/>` or register it with \
+                     `app.register_component`"
                 )));
             }
         };
-        if self.envs.iter().any(|env| env.name == name) {
+        // Names are local to a file, so templates are compared rather than names.
+        if std::ptr::eq(self.template, component) || self.envs.iter().any(|env| std::ptr::eq(env.outer, component)) {
             return Err(CompileError::unplaced(format!("component <{name}> contains itself")));
         }
         let Some(root) = component.root_index() else { return Ok(self.out_id(id)) };
@@ -410,7 +438,7 @@ impl<'a> Compiler<'a> {
         out.nodes.resize(offset + component.nodes.len(), CompiledNode::default());
         let target = NodeId(offset + *root);
 
-        self.envs.push(ComponentEnv { name, props, visible_from: self.scopes.len(), root: target });
+        self.envs.push(ComponentEnv { outer: self.template, props, visible_from: self.scopes.len(), root: target });
         let template = std::mem::replace(&mut self.template, component);
         let host_offset = std::mem::replace(&mut self.offset, offset);
         let visited = std::mem::replace(&mut self.visited, vec![false; component.nodes.len()]);
@@ -872,11 +900,25 @@ mod tests {
         }
     }
 
+    impl Components {
+        /// The handle standing for the component at `index` in imports.
+        fn handle(index: usize) -> Handle<BevueTemplate> {
+            Handle::Uuid(bevy::asset::uuid::Uuid::from_u128(index as u128 + 1), Default::default())
+        }
+    }
+
     impl ComponentResolver for Components {
         fn resolve(&self, name: &str) -> ResolvedComponent<'_> {
             match self.0.iter().find(|(n, _)| *n == name) {
                 Some((_, template)) => ResolvedComponent::Ready(template),
                 None => ResolvedComponent::Unknown,
+            }
+        }
+
+        fn resolve_asset(&self, handle: &Handle<BevueTemplate>) -> ResolvedComponent<'_> {
+            match (0..self.0.len()).find(|i| Self::handle(*i) == *handle) {
+                Some(index) => ResolvedComponent::Ready(&self.0[index].1),
+                None => ResolvedComponent::Pending,
             }
         }
     }
@@ -1064,6 +1106,96 @@ mod tests {
             compiled.props,
             vec![PropsDeclaration::resource("Host"), PropsDeclaration::resource("Menu"), PropsDeclaration::resource("User")]
         );
+    }
+
+    /// The texts of the static children of the root.
+    fn child_texts(compiled: &CompiledTemplate) -> Vec<String> {
+        let texts = |id: NodeId| match &compiled.get(id).text {
+            Some(text) => text.0.iter().map(|f| format!("{f:?}")).collect::<String>(),
+            None => String::new(),
+        };
+        compiled
+            .get(compiled.root.unwrap())
+            .slots
+            .iter()
+            .map(|slot| match slot {
+                Slot::Static(child) => texts(*child),
+                other => panic!("unexpected slot {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn imports() {
+        // Index 0 is registered as `Row`; index 1 is only reachable through an import.
+        let mut components = Components::new(&[
+            ("Row", r#"<p>registered</p>"#),
+            ("-", r#"<p>imported</p>"#),
+            ("Outer", r#"<div><Row/><Inner/></div>"#),
+            ("-", r#"<b>inner</b>"#),
+        ]);
+        // `Outer` imports its own `Row` and `Inner`.
+        let outer = std::mem::take(&mut components.0[2].1);
+        components.0[2].1 = outer.with_import("Row", Components::handle(3)).with_import("Inner", Components::handle(3));
+
+        let host = |source: &str| parse_template(source).unwrap();
+        let compile = |template: &BevueTemplate| CompiledTemplate::compile_with(template, &components);
+
+        // An import wins over a registered component, and other names still find registered ones.
+        let template = host(r#"<div><Row/><Other/><Outer/></div>"#)
+            .with_import("Row", Components::handle(1))
+            .with_import("Other", Components::handle(0));
+        let compiled = compile(&template).unwrap();
+        let texts = child_texts(&compiled);
+        assert!(texts[0].contains("imported") && texts[1].contains("registered"), "{texts:?}");
+        // Inside `Outer`, its own imports are used, not the host's `Row`.
+        let Slot::Static(outer) = compiled.get(NodeId(0)).slots[2] else { panic!("expected an element") };
+        let inner: Vec<_> = compiled
+            .get(outer)
+            .slots
+            .iter()
+            .map(|slot| match slot {
+                Slot::Static(child) => format!("{:?}", compiled.get(*child).text),
+                other => panic!("unexpected slot {other:?}"),
+            })
+            .collect();
+        assert!(inner.iter().all(|text| text.contains("inner")), "{inner:?}");
+
+        // The host's imports are not visible inside a component.
+        let template = host(r#"<div><Outer/></div>"#).with_import("Inner", Components::handle(0));
+        assert!(compile(&template).is_ok());
+        let leaky = Components::new(&[("Uses", r#"<div><Private/></div>"#), ("-", r#"<p>x</p>"#)]);
+        let template = host(r#"<div><Private/><Uses/></div>"#).with_import("Private", Components::handle(1));
+        let error = CompiledTemplate::compile_with(&template, &leaky).unwrap_err();
+        assert!(error.message.contains("in <Uses>: unknown component <Private>"), "{error}");
+        assert!(error.message.contains("<import src") && error.message.contains("register_component"), "{error}");
+
+        // An import that is not loaded yet leaves an empty node.
+        let template = host(r#"<div><Late/><p>x</p></div>"#).with_import("Late", Components::handle(99));
+        let compiled = compile(&template).unwrap();
+        assert_eq!(*compiled.get(NodeId(1)), CompiledNode::default());
+
+        // A parsed `<import>` has no handle until the loader or `load_imports` sets it.
+        let template = host(r#"<import src="ui/row.html"/><div><Row/></div>"#);
+        let error = compile(&template).unwrap_err();
+        assert!(error.message.contains(r#"<import src="ui/row.html"> is not loaded"#), "{error}");
+        // Unused, it is not an error.
+        assert!(compile(&host(r#"<import src="ui/row.html"/><div></div>"#)).is_ok());
+    }
+
+    #[test]
+    fn import_cycles() {
+        // Two names for one template: `A` contains `B`, which is `A` again under another name.
+        let mut components = Components::new(&[("A", r#"<div><B/></div>"#), ("Leaf", r#"<p>x</p>"#)]);
+        let a = std::mem::take(&mut components.0[0].1);
+        components.0[0].1 = a.with_import("B", Components::handle(0));
+        let template = parse_template(r#"<div><A/></div>"#).unwrap();
+        let error = CompiledTemplate::compile_with(&template, &components).unwrap_err();
+        assert!(error.message.contains("in <A>: component <B> contains itself"), "{error}");
+
+        // The same component used twice side by side is fine.
+        let template = parse_template(r#"<div><Leaf/><Other/></div>"#).unwrap().with_import("Other", Components::handle(1));
+        assert!(CompiledTemplate::compile_with(&template, &components).is_ok());
     }
 
     #[test]

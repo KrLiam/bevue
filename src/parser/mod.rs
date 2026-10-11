@@ -163,7 +163,7 @@ pub use expr::{
 
 pub use crate::core::template::{
     BevueTemplate, ConditionDirective, ConditionKind, Expression, Identifier, ListDirective, NodeId, PropsDeclaration,
-    PropsSourceKind, TemplateNode, TemplateRef, TemplateStyle, TemplateText, TextFragment,
+    PropsSourceKind, TemplateImport, TemplateNode, TemplateRef, TemplateStyle, TemplateText, TextFragment,
 };
 use crate::core::path::PropPath;
 
@@ -238,6 +238,47 @@ fn parse_props_declaration(tag: &HTMLTag<'_>) -> Result<PropsDeclaration> {
     })
 }
 
+/// Parses a top-level `<import src="..." as="...">` element.
+fn parse_import(tag: &HTMLTag<'_>, imports: &[TemplateImport]) -> Result<TemplateImport> {
+    let mut src = None;
+    let mut name = None;
+    for (attribute, value) in tag_attributes(tag) {
+        match attribute {
+            "src" => src = value.map(str::trim),
+            "as" => name = value.map(str::trim),
+            other => {
+                return Err(ParseError::InvalidDirective(format!("unexpected attribute `{other}` in <import>")));
+            }
+        }
+    }
+    let src = src
+        .filter(|src| !src.is_empty())
+        .ok_or_else(|| ParseError::InvalidDirective("<import> requires a src".to_owned()))?;
+    let name = match name {
+        Some(name) => {
+            let valid = name.starts_with(|c: char| c.is_ascii_uppercase())
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if !valid {
+                return Err(ParseError::InvalidDirective(format!(
+                    "invalid component name `{name}` in <import src=\"{src}\">: it must start with an uppercase letter"
+                )));
+            }
+            name.to_owned()
+        }
+        None => TemplateImport::component_name(src).ok_or_else(|| {
+            ParseError::InvalidDirective(format!(
+                "cannot name the component of <import src=\"{src}\"> after its file, give it a name with `as`"
+            ))
+        })?,
+    };
+    if imports.iter().any(|import| import.name == name) {
+        return Err(ParseError::InvalidDirective(format!(
+            "<import src=\"{src}\"> imports a second component named `{name}`, rename one with `as`"
+        )));
+    }
+    Ok(TemplateImport { name: name.into(), src: src.to_owned().into(), handle: None })
+}
+
 /// Puts a space before every `/>` that directly follows a tag name, as in `<Foo/>`.
 ///
 /// `tl` reads the name of such a tag as `Foo/` and does not close it, so the elements after it
@@ -262,8 +303,9 @@ fn separate_self_closing(source: &str) -> Cow<'_, str> {
 }
 
 /// Parses a template source string into a `BevueTemplate`.
-/// Supports a `<template>` wrapper, `<style src="...">` tags and a top-level `<props>` element
-/// declaring the template's props.
+/// Supports a `<template>` wrapper, `<style src="...">` tags, a top-level `<props>` element
+/// declaring the template's props and top-level `<import>` elements naming the component files
+/// the template uses.
 pub fn parse_template(source: &str) -> Result<BevueTemplate> {
     let source = separate_self_closing(source);
     let dom = tl::parse(&source, ParserOptions::default())
@@ -279,6 +321,9 @@ pub fn parse_template(source: &str) -> Result<BevueTemplate> {
     let mut is_top_level_template = false;
     let mut in_props = false;
     let mut props: Vec<PropsDeclaration> = Vec::new();
+    let mut imports: Vec<TemplateImport> = Vec::new();
+    // `<import>` elements that were opened. One written without `/>` contains what follows it.
+    let mut open_imports: usize = 0;
 
     for node in traverse_dom(&dom) {
         match node {
@@ -320,6 +365,12 @@ pub fn parse_template(source: &str) -> Result<BevueTemplate> {
                 // `<props>` sits next to `<template>` and `<style>`, outside the node tree.
                 if stack.is_empty() && !is_top_level_template && tag_name.eq_ignore_ascii_case("props") {
                     in_props = true;
+                    continue;
+                }
+
+                if stack.is_empty() && !is_top_level_template && tag_name.eq_ignore_ascii_case("import") {
+                    imports.push(parse_import(tag, &imports)?);
+                    open_imports += 1;
                     continue;
                 }
 
@@ -423,6 +474,10 @@ pub fn parse_template(source: &str) -> Result<BevueTemplate> {
                     is_top_level_template = false;
                     continue;
                 }
+                if stack.is_empty() && !is_top_level_template && open_imports > 0 && tag_name.eq_ignore_ascii_case("import") {
+                    open_imports -= 1;
+                    continue;
+                }
                 stack.pop();
             }
             HtmlNode::Text(text) => {
@@ -448,6 +503,7 @@ pub fn parse_template(source: &str) -> Result<BevueTemplate> {
     }
 
     let mut template = BevueTemplate::new(nodes).with_props(props);
+    template.imports = imports;
     if let Some(style) = parsed_style
         && let Some(root_idx) = template.root_index()
         && let Some(node) = template.get_mut(root_idx)
@@ -515,6 +571,57 @@ use super::*;
         assert_eq!(foo.events.len(), 1);
         assert_eq!(foo.events[0].0, "close");
         assert_eq!(result.nodes[2].element, "p".into());
+    }
+
+    #[test]
+    fn imports() {
+        let names = |template: &BevueTemplate| -> Vec<(String, String)> {
+            template.imports.iter().map(|i| (i.name.to_string(), i.src.to_string())).collect()
+        };
+        let template = parse_template(
+            r#"
+            <import src="button.html"/>
+            <import src="ui/item_row.html" />
+            <props><resource type="Menu"/></props>
+            <template><div><Button/><import>x</import></div></template>
+            <import src="./container.html" as="Panel"/>
+            <style>.a {}</style>
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            names(&template),
+            vec![
+                ("Button".into(), "button.html".into()),
+                ("ItemRow".into(), "ui/item_row.html".into()),
+                ("Panel".into(), "./container.html".into()),
+            ]
+        );
+        assert!(template.imports.iter().all(|import| import.handle.is_none()));
+        // The rest of the file is read as before; an `<import>` inside the template is an element.
+        assert_eq!(template.props.len(), 1);
+        assert_eq!(template.nodes.len(), 3);
+        assert_eq!(template.nodes[0].children, vec![NodeId(1), NodeId(2)]);
+        assert_eq!(template.nodes[2].element, "import".into());
+        assert!(template.nodes[0].style.is_some());
+
+        // Written without `/>`, an import contains the elements after it.
+        let unclosed = parse_template(r#"<import src="a.html"><import src="b.html"><div><A/><p>x</p></div>"#).unwrap();
+        assert_eq!(names(&unclosed), vec![("A".into(), "a.html".into()), ("B".into(), "b.html".into())]);
+        assert_eq!(unclosed.nodes.len(), 3);
+        assert_eq!(unclosed.nodes[0].children, vec![NodeId(1), NodeId(2)]);
+
+        for (source, expected) in [
+            (r#"<import/><div></div>"#, "requires a src"),
+            (r#"<import src=""/><div></div>"#, "requires a src"),
+            (r#"<import src="3d.html"/><div></div>"#, "give it a name with `as`"),
+            (r#"<import src="a.html" as="panel"/><div></div>"#, "must start with an uppercase letter"),
+            (r#"<import src="a.html"/><import src="ui/a.html"/><div></div>"#, "a second component named `A`"),
+            (r#"<import src="a.html" name="B"/><div></div>"#, "unexpected attribute `name`"),
+        ] {
+            let error = parse_template(source).unwrap_err().to_string();
+            assert!(error.contains(expected), "{source}: {error}");
+        }
     }
 
     #[test]

@@ -1486,3 +1486,225 @@ mod components {
         BevueComponents::default().register("row", "row.html");
     }
 }
+
+/// Templates loaded from files through the asset loader, here the in-memory `bevue://` source.
+mod imports {
+    use std::path::Path;
+
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use bevy::{
+        asset::{
+            AssetApp, AssetServer, Handle,
+            io::{
+                AssetReader, AssetReaderError, AssetSourceBuilder, PathStream, Reader,
+                memory::{Dir, MemoryAssetReader},
+            },
+        },
+        ecs::{lifecycle::Insert, observer::On, resource::Resource, system::ResMut},
+    };
+
+    use super::*;
+    use crate::asset::{BevueAssetPlugin, BevueAssetRegistry};
+
+    /// The `slow://` asset source: files in memory that cannot be read until `open` is set.
+    #[derive(Resource, Clone, Default)]
+    struct Slow {
+        dir: Dir,
+        open: Arc<AtomicBool>,
+    }
+
+    struct SlowReader {
+        reader: MemoryAssetReader,
+        open: Arc<AtomicBool>,
+    }
+
+    impl AssetReader for SlowReader {
+        async fn read<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
+            while !self.open.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            self.reader.read(path).await
+        }
+
+        async fn read_meta<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
+            self.reader.read_meta(path).await
+        }
+
+        async fn read_directory<'a>(&'a self, path: &'a Path) -> Result<Box<PathStream>, AssetReaderError> {
+            self.reader.read_directory(path).await
+        }
+
+        async fn is_directory<'a>(&'a self, path: &'a Path) -> Result<bool, AssetReaderError> {
+            self.reader.is_directory(path).await
+        }
+    }
+
+    /// How many times each template entity was rendered.
+    #[derive(Resource, Default)]
+    struct Renders(Vec<Entity>);
+
+    fn file_app(files: &[(&str, &str)]) -> App {
+        let mut app = App::new();
+        let slow = Slow::default();
+        let (dir, open) = (slow.dir.clone(), slow.open.clone());
+        app.register_asset_source(
+            "slow",
+            AssetSourceBuilder::new(move || {
+                Box::new(SlowReader { reader: MemoryAssetReader { root: dir.clone() }, open: open.clone() })
+            }),
+        );
+        app.insert_resource(slow);
+        // Asset sources have to be registered before `AssetPlugin` is added.
+        app.add_plugins((BevueAssetPlugin, MinimalPlugins, AssetPlugin::default(), BevueRuntimePlugin));
+        app.init_resource::<Renders>();
+        app.add_observer(|event: On<Insert, TemplateInstance>, mut renders: ResMut<Renders>| {
+            renders.0.push(event.entity);
+        });
+        app.finish();
+        for (path, source) in files {
+            write(&mut app, path, source);
+        }
+        app
+    }
+
+    fn write(app: &mut App, path: &str, source: &str) {
+        app.world().resource::<BevueAssetRegistry>().dir.insert_asset_text(Path::new(path), source);
+    }
+
+    fn load(app: &mut App, path: &str, props: Value) -> Entity {
+        let handle: Handle<BevueTemplate> = app.world().resource::<AssetServer>().load(format!("bevue://{path}"));
+        app.world_mut().spawn((Template::new(handle), BevueProps::new(props))).id()
+    }
+
+    /// Updates until `done`, giving the asset tasks time to run.
+    fn wait(app: &mut App, what: &str, mut done: impl FnMut(&mut App) -> bool) {
+        for _ in 0..500 {
+            if done(app) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            app.update();
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    fn wait_for_texts(app: &mut App, root: Entity, expected: &[&str]) {
+        wait(app, &format!("{expected:?}"), |app| texts(app.world(), root) == expected);
+    }
+
+    fn renders(app: &App, root: Entity) -> usize {
+        app.world().resource::<Renders>().0.iter().filter(|e| **e == root).count()
+    }
+
+    #[test]
+    fn imports_render_once_they_are_loaded() {
+        let mut app = file_app(&[
+            (
+                "screens/menu.html",
+                r#"
+                <import src="./row.html"/>
+                <import src="../shared/title_bar.html"/>
+                <import src="bevue://shared/title_bar.html" as="Footer"/>
+                <template>
+                    <div><TitleBar :text="title"/><Row v-for="item in items" :item="item"/><Footer text="end"/></div>
+                </template>
+                "#,
+            ),
+            // A component with an import of its own, relative to its own folder.
+            ("screens/row.html", r#"<import src="./parts/tag.html"/><li><Tag :label="item"/></li>"#),
+            ("screens/parts/tag.html", r#"<b>{{ label }}</b>"#),
+            ("shared/title_bar.html", r#"<h1>{{ text }}</h1>"#),
+        ]);
+        let root = load(&mut app, "screens/menu.html", value!({ "title": "Menu", "items": ["a", "b"] }));
+        wait_for_texts(&mut app, root, &["Menu", "a", "b", "end"]);
+        // Nothing was rendered with a component missing.
+        assert_eq!(renders(&app, root), 1);
+        for _ in 0..5 {
+            app.update();
+        }
+        assert_eq!(renders(&app, root), 1);
+
+        // A changed import renders the host again, with its props kept.
+        props(&mut app, root).get_mut("title").unwrap().set("Edit");
+        write(&mut app, "screens/parts/tag.html", r#"<i>{{ label }}!</i>"#);
+        app.world().resource::<AssetServer>().reload("bevue://screens/parts/tag.html");
+        wait_for_texts(&mut app, root, &["Edit", "a!", "b!", "end"]);
+    }
+
+    #[test]
+    fn rendering_waits_for_loading_components() {
+        let mut app = file_app(&[("host.html", r#"<import src="slow://row.html"/><div><Row label="x"/><p>after</p></div>"#)]);
+        app.world().resource::<Slow>().dir.insert_asset_text(Path::new("row.html"), r#"<b>{{ label }}</b>"#);
+        let root = load(&mut app, "host.html", Value::empty_dict());
+        // The host is loaded but its component is not: nothing is rendered in the meantime.
+        wait(&mut app, "the host to load", |app| {
+            let handle = app.world().get::<Template>(root).unwrap().handle.clone();
+            app.world().resource::<Assets<BevueTemplate>>().contains(&handle)
+        });
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            app.update();
+        }
+        assert_eq!(renders(&app, root), 0);
+        assert!(children(app.world(), root).is_empty());
+
+        app.world().resource::<Slow>().open.store(true, Ordering::Relaxed);
+        wait_for_texts(&mut app, root, &["x", "after"]);
+        assert_eq!(renders(&app, root), 1);
+    }
+
+    #[test]
+    fn a_missing_import_does_not_block() {
+        let mut app = file_app(&[(
+            "host.html",
+            r#"<import src="bevue://nope.html"/><div><Nope/><p>after</p></div>"#,
+        )]);
+        let root = load(&mut app, "host.html", Value::empty_dict());
+        wait_for_texts(&mut app, root, &["after"]);
+        assert_eq!(children(app.world(), root).len(), 2, "an empty node takes the component's place");
+    }
+
+    #[test]
+    fn files_importing_each_other() {
+        let mut app = file_app(&[
+            ("a.html", r#"<import src="./b.html"/><div><p>a</p><B v-if="deep"/></div>"#),
+            ("b.html", r#"<import src="./a.html"/><div><p>b</p></div>"#),
+            ("selfish.html", r#"<import src="./selfish.html" as="Me"/><div><Me/></div>"#),
+        ]);
+        let a = load(&mut app, "a.html", value!({ "deep": true }));
+        let b = load(&mut app, "b.html", Value::empty_dict());
+        wait_for_texts(&mut app, a, &["a", "b"]);
+        wait_for_texts(&mut app, b, &["b"]);
+
+        // A file that contains itself does not render, and does not hang or overflow either.
+        let selfish = load(&mut app, "selfish.html", Value::empty_dict());
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            app.update();
+        }
+        assert!(children(app.world(), selfish).is_empty());
+        assert!(app.world().get::<TemplateInstance>(selfish).is_none());
+    }
+
+    #[test]
+    fn imports_of_templates_built_in_code() {
+        let mut app = file_app(&[("row.html", r#"<b>{{ label }}</b>"#)]);
+        let row: Handle<BevueTemplate> = app.world().resource::<AssetServer>().load("bevue://row.html");
+        let code = crate::parser::parse_template(r#"<div><Line label="x"/></div>"#).unwrap().with_import("Line", row);
+        let mut parsed = crate::parser::parse_template(r#"<import src="bevue://row.html"/><div><Row label="y"/></div>"#).unwrap();
+        parsed.load_imports(app.world().resource::<AssetServer>());
+
+        let mut spawn = |template: BevueTemplate| {
+            let handle = app.world_mut().resource_mut::<Assets<BevueTemplate>>().add(template);
+            app.world_mut().spawn((Template::new(handle), BevueProps::new(Value::empty_dict()))).id()
+        };
+        let (code, parsed) = (spawn(code), spawn(parsed));
+        wait_for_texts(&mut app, code, &["x"]);
+        wait_for_texts(&mut app, parsed, &["y"]);
+        assert_eq!(renders(&app, code), 1);
+    }
+}

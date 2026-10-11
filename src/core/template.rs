@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use bevy::{
-    asset::Asset,
+    asset::{Asset, AssetServer, Handle},
     ecs::{component::Component, entity::Entity, hierarchy::ChildOf, system::Commands},
     prelude::{Deref, DerefMut},
     reflect::TypePath,
@@ -399,17 +399,69 @@ impl PropsDeclaration {
     }
 }
 
+/// A component imported by a template with `<import src="item_row.html"/>`, usable in that
+/// template as `<ItemRow/>`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TemplateImport {
+    /// The element name of the component.
+    pub name: Cow<'static, str>,
+    /// The path of the component's file, as written.
+    pub src: Cow<'static, str>,
+    /// The component's template. The asset loader sets it; a template parsed in code has `None`
+    /// until [`BevueTemplate::load_imports`] is called.
+    pub handle: Option<Handle<BevueTemplate>>,
+}
+
+impl TemplateImport {
+    /// The component name of a file: its stem in PascalCase, so `ui/item_row.html` and
+    /// `item-row.html` are both `ItemRow`. Returns `None` if that does not start with a letter.
+    pub fn component_name(src: &str) -> Option<String> {
+        let file = src.rsplit(['/', '\\']).next().unwrap_or(src);
+        let stem = file.rsplit_once('.').map_or(file, |(stem, _)| stem);
+        let mut name = String::with_capacity(stem.len());
+        for part in stem.split(|c: char| !c.is_alphanumeric()) {
+            let mut chars = part.chars();
+            if let Some(first) = chars.next() {
+                name.extend(first.to_uppercase());
+                name.push_str(chars.as_str());
+            }
+        }
+        name.starts_with(|c: char| c.is_ascii_uppercase()).then_some(name)
+    }
+}
+
 #[derive(Asset, TypePath, Debug, Clone, Default, PartialEq, Deref, DerefMut)]
 pub struct BevueTemplate {
     #[deref]
     pub nodes: Vec<TemplateNode>,
     /// The props declared in the template's `<props>` element.
     pub props: Vec<PropsDeclaration>,
+    /// The components imported with `<import>` elements, which only this template can use.
+    pub imports: Vec<TemplateImport>,
 }
 
 impl BevueTemplate {
     pub fn new(nodes: Vec<TemplateNode>) -> Self {
-        Self { nodes, props: Vec::new() }
+        Self { nodes, props: Vec::new(), imports: Vec::new() }
+    }
+
+    /// Makes the template `handle` usable in this template as the component `<name/>`, replacing
+    /// an import of the same name.
+    pub fn with_import(mut self, name: impl Into<Cow<'static, str>>, handle: Handle<BevueTemplate>) -> Self {
+        let name = name.into();
+        self.imports.retain(|import| import.name != name);
+        self.imports.push(TemplateImport { name, src: Cow::Borrowed(""), handle: Some(handle) });
+        self
+    }
+
+    /// Loads the `<import>`s that have no handle yet, with their paths taken from the asset root.
+    /// The asset loader does this for template files; call it for templates parsed in code.
+    pub fn load_imports(&mut self, asset_server: &AssetServer) {
+        for import in &mut self.imports {
+            if import.handle.is_none() {
+                import.handle = Some(asset_server.load(import.src.to_string()));
+            }
+        }
     }
 
     pub fn with_props(mut self, props: impl IntoIterator<Item = PropsDeclaration>) -> Self {
@@ -532,6 +584,22 @@ mod test {
     use crate::core::template::{
         BevueTemplate, ConditionDirective, Expression, Identifier, ListDirective, TemplateNode, NodeId, TemplateText,
     };
+
+    #[test]
+    fn component_names() {
+        use crate::core::template::TemplateImport;
+        for (src, expected) in [
+            ("button.html", Some("Button")),
+            ("ui/item_row.html", Some("ItemRow")),
+            ("./item-row.html", Some("ItemRow")),
+            ("bevue://a/b/contextMenu.v2.bevue", Some("ContextMenuV2")),
+            ("Panel", Some("Panel")),
+            ("3d.html", None),
+            ("ui/", None),
+        ] {
+            assert_eq!(TemplateImport::component_name(src).as_deref(), expected, "{src}");
+        }
+    }
 
     #[test]
     fn build() {
