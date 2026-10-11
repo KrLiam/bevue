@@ -102,6 +102,11 @@ mod tests {
             (Or, value!("a"), value!("x"), value!("a")),
             (And, value!(""), value!("x"), value!("")),
             (And, value!(1), value!("x"), value!("x")),
+            // Empty lists and dicts are falsy.
+            (Or, value!([]), value!("x"), value!("x")),
+            (Or, value!([0]), value!("x"), value!([0])),
+            (Or, value!({}), value!("x"), value!("x")),
+            (And, value!([]), value!("x"), value!([])),
         ] {
             assert_eq!(binary(op, &left, &right), expected, "{left} {op:?} {right}");
         }
@@ -112,6 +117,9 @@ mod tests {
         assert_eq!(unary(UnaryOp::Not, &value!(0)), value!(true));
         assert_eq!(unary(UnaryOp::Not, &value!("a")), value!(false));
         assert_eq!(unary(UnaryOp::Not, &Value::null()), value!(true));
+        assert_eq!(unary(UnaryOp::Not, &value!([])), value!(true));
+        assert_eq!(unary(UnaryOp::Not, &value!({})), value!(true));
+        assert_eq!(unary(UnaryOp::Not, &value!([0])), value!(false));
         assert_eq!(unary(UnaryOp::Neg, &value!(2)), value!(-2));
         assert_eq!(unary(UnaryOp::Neg, &value!("2")), Value::null());
         assert_eq!(unary(UnaryOp::Pos, &value!(2)), value!(2));

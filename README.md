@@ -123,7 +123,7 @@ changed, so editing `inventory.items[1].count` touches a single text.
 <p>{{ inventory.items[0].count }} of {{ format_name(inventory.items[0].id) }}</p>
 ```
 
-An expression is a path into the props (`a.b[0].c`, `rows[i].name`), a string, number or boolean,
+An expression is a path into the props (`a.b[0].c`, `rows[i].name`), a string, boolean, number,
 a function call, or an object `{ key: value }`, combined with operators:
 
 ```html
@@ -135,15 +135,16 @@ a function call, or an object `{ key: value }`, combined with operators:
 
 | Operators, loosest first | |
 |---|---|
-| `a ? b : c` | evaluates only the branch it picks |
-| `\|\|` `&&` | return one of their operands, so `name \|\| 'unnamed'` is a default |
-| `==` `!=` | deep comparison, without type conversion (`1 == '1'` is false) |
-| `<` `<=` `>` `>=` | two numbers, or two strings alphabetically |
-| `+` `-` `*` `/` `%` | numbers; `+` joins as text when either side is a string |
-| `!` `-` `+` | prefix |
+| `a ? b : c` | Ternary, only evaluates the branch it picks |
+| `\|\|` `&&` | Logical operators with short circuiting |
+| `==` `!=` | Deep comparison without type conversion (`1 == '1'` is false) |
+| `<` `<=` `>` `>=` | Numeric comparison; string lexicographical comparison |
+| `+` `-` `*` `/` `%` | Basic arithmetic; `+` concatenates when one of the operands is a string |
+| `!` `-` `+` | |
 
-Arithmetic that makes no sense for its operands (`'a' * 2`, or a prop that is not there yet) gives
-`null`, which renders as empty text, and such a comparison is false. Neither is an error.
+Arithmetic with invalid operands (e.g `'a' * 2` or undefined props) produce `null` instead of an error, which renders as empty text.
+`false`, `0`, `''`, `null`, `[]` and `{}` are false; everything else counts as true. So `v-if="inventory.items"` renders
+only when there are items.
 
 A template string builds text from expressions:
 
@@ -191,7 +192,7 @@ Template::new(handle).with_function("remove_item", remove_item);          // thi
 
 ```html
 <p>{{ format_name(item.id) }}</p>
-<p v-if="is_empty(inventory.items)">Nothing here.</p>
+<p v-if="can_afford(item.price)">Buy</p>
 <li v-for="item in sorted(inventory.items)">{{ item.id }}</li>
 ```
 

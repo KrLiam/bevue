@@ -475,6 +475,42 @@ mod operators {
         props(&mut app, root).get_mut("mine").unwrap().push("d");
         app.update();
         assert_eq!(texts(app.world(), root), vec!["1. c", "2. d"]);
+
+        // An empty list is falsy, so the default is used again.
+        props(&mut app, root).get_mut("mine").unwrap().clear();
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["1. a", "2. b"]);
+    }
+
+    #[test]
+    fn empty_lists_and_dicts_are_falsy() {
+        let mut app = app();
+        let root = spawn(
+            &mut app,
+            r#"
+            <div>
+                <p v-if="items" :class="{ filled: items, bare: !items }">items</p>
+                <p v-else>no items</p>
+                <p v-if="user">user</p>
+                <p v-else>no user</p>
+                <p>{{ items ? 'some' : 'none' }}</p>
+            </div>"#,
+            value!({ "items": [], "user": {} }),
+        );
+        assert_eq!(texts(app.world(), root), vec!["no items", "no user", "none"]);
+
+        props(&mut app, root).get_mut("items").unwrap().push(0);
+        props(&mut app, root).get_mut("user").unwrap().insert("name", "ana");
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["items", "user", "some"]);
+        let p = children(app.world(), root)[0];
+        let classes = app.world().get::<ClassList>(p).unwrap();
+        assert!(classes.contains("filled") && !classes.contains("bare"));
+
+        props(&mut app, root).get_mut("items").unwrap().remove_at(0);
+        props(&mut app, root).get_mut("user").unwrap().remove("name");
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["no items", "no user", "none"]);
     }
 }
 

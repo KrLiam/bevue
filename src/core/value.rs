@@ -195,15 +195,16 @@ impl Value {
         match &self.t { ValueType::Dict(v) => Some(v), _ => None }
     }
 
-    /// Truthiness used by `v-if`: `false`, `0`, `NaN`, `""` and `null` are falsy, everything else
-    /// (including empty lists and dicts) is truthy.
+    /// Truthiness used by `v-if`: `false`, `0`, `NaN`, `""`, `null` and empty lists and dicts are
+    /// falsy, everything else is truthy.
     pub fn is_truthy(&self) -> bool {
         match &self.t {
             ValueType::Null => false,
             ValueType::Boolean(b) => *b,
             ValueType::Number(n) => *n != 0.0 && !n.is_nan(),
             ValueType::String(s) => !s.is_empty(),
-            ValueType::List(_) | ValueType::Dict(_) => true,
+            ValueType::List(list) => !list.is_empty(),
+            ValueType::Dict(map) => !map.is_empty(),
         }
     }
 
@@ -953,7 +954,10 @@ mod tests {
         assert!(!Value::from(0).is_truthy());
         assert!(!Value::from("").is_truthy());
         assert!(!Value::null().is_truthy());
-        assert!(Value::list(vec![]).is_truthy());
+        assert!(!Value::list(vec![]).is_truthy());
+        assert!(Value::list(vec![Value::from(0)]).is_truthy());
+        assert!(!Value::dict(HashMap::new()).is_truthy());
+        assert!(Value::dict(HashMap::from([("a".to_owned(), Value::null())])).is_truthy());
         assert!(Value::from(Some(1)).is_truthy());
         assert!(!Value::from(None::<i32>).is_truthy());
     }
