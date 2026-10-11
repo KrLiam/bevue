@@ -322,6 +322,162 @@ mod styles {
     }
 }
 
+mod operators {
+    use bevy::ecs::{
+        resource::Resource,
+        system::{In, ResMut},
+    };
+
+    use super::*;
+    use crate::runtime::{BevueCtx, BevueFunctionsAppExt};
+
+    #[derive(Resource, Default)]
+    struct Calls(Vec<String>);
+
+    /// Returns its first argument and records its second, the name of the call.
+    fn probe(In(ctx): In<BevueCtx>, mut calls: ResMut<Calls>) -> Value {
+        calls.0.push(ctx.args.get(1).map(Value::to_text).unwrap_or_default());
+        ctx.args.first().cloned().unwrap_or_default()
+    }
+
+    fn operator_app() -> App {
+        let mut app = app();
+        app.init_resource::<Calls>().register_bevue_function("probe", probe);
+        app
+    }
+
+    fn calls(app: &mut App) -> Vec<String> {
+        std::mem::take(&mut app.world_mut().resource_mut::<Calls>().0)
+    }
+
+    #[test]
+    fn operators_render_and_update() {
+        let mut app = app();
+        let root = spawn(
+            &mut app,
+            r#"
+            <div>
+                <p>{{ a + b * 2 }} {{ a < b }} {{ name || 'unnamed' }} {{ 'Item #' + a }}</p>
+                <p v-if="!done && a >= 1">open</p>
+                <p v-else>closed</p>
+                <p :class="a > b ? 'hi' : 'lo'" :style="{ width: a * 10 + 'px' }">{{ a % 2 == 0 ? 'even' : 'odd' }}</p>
+                <span>{{ other }}</span>
+            </div>
+            "#,
+            value!({ "a": 1, "b": 3, "done": false, "other": "x" }),
+        );
+        assert_eq!(texts(app.world(), root), vec!["7 true unnamed Item #1", "open", "odd", "x"]);
+        let [first, _, third, _] = children(app.world(), root)[..] else { panic!("expected four children") };
+        assert!(app.world().get::<ClassList>(third).unwrap().contains("lo"));
+        assert_eq!(
+            app.world().get::<bevy_flair::prelude::InlineStyle>(third),
+            Some(&bevy_flair::prelude::InlineStyle::new("width: 10px"))
+        );
+
+        // An unrelated prop leaves the operator bindings alone.
+        let tick = text_changed_tick(app.world(), first);
+        props(&mut app, root).get_mut("other").unwrap().set("y");
+        app.update();
+        assert_eq!(text_changed_tick(app.world(), first), tick);
+
+        // Either operand updates the binding.
+        props(&mut app, root).get_mut("a").unwrap().set(4);
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["10 false unnamed Item #4", "open", "even", "y"]);
+        let third = children(app.world(), root)[2];
+        assert!(app.world().get::<ClassList>(third).unwrap().contains("hi"));
+        assert_eq!(
+            app.world().get::<bevy_flair::prelude::InlineStyle>(third),
+            Some(&bevy_flair::prelude::InlineStyle::new("width: 40px"))
+        );
+
+        props(&mut app, root).get_mut("b").unwrap().set(10);
+        props(&mut app, root).insert("name", "sword");
+        props(&mut app, root).get_mut("done").unwrap().set(true);
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["24 true sword Item #4", "closed", "even", "y"]);
+    }
+
+    #[test]
+    fn only_the_needed_operands_are_evaluated() {
+        let mut app = operator_app();
+        let root = spawn(
+            &mut app,
+            r#"
+            <div>
+                <p>{{ on && probe('and', 'and') }}</p>
+                <p>{{ on || probe('or', 'or') }}</p>
+                <p>{{ on ? probe('then', 'then') : probe('else', 'else') }}</p>
+            </div>
+            "#,
+            value!({ "on": false }),
+        );
+        assert_eq!(texts(app.world(), root), vec!["false", "or", "else"]);
+        assert_eq!(calls(&mut app), vec!["or", "else"]);
+
+        props(&mut app, root).get_mut("on").unwrap().set(true);
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["and", "true", "then"]);
+        assert_eq!(calls(&mut app), vec!["and", "then"]);
+    }
+
+    #[test]
+    fn template_strings() {
+        let mut app = app();
+        let root = spawn(
+            &mut app,
+            r#"
+            <div>
+                <p :style="{ width: `${progress * 100}%`, color: `#${color}` }" :class="`bar bar-${kind}`">
+                    {{ `Hello, ${user.name || 'stranger'}!` }} {{ `${count} ${count == 1 ? 'item' : 'items'}` }}
+                </p>
+                <span>{{ `static ${1 + 1}` }} {{ other }}</span>
+            </div>
+            "#,
+            value!({ "progress": 0.5, "color": "f00", "kind": "ok", "count": 1, "other": "x" }),
+        );
+        assert_eq!(texts(app.world(), root), vec!["Hello, stranger! 1 item", "static 2 x"]);
+        let p = children(app.world(), root)[0];
+        let style = |app: &App| app.world().get::<bevy_flair::prelude::InlineStyle>(p).cloned().unwrap();
+        assert_eq!(style(&app), bevy_flair::prelude::InlineStyle::new("width: 50%; color: #f00"));
+        let classes = app.world().get::<ClassList>(p).unwrap();
+        assert!(classes.contains("bar") && classes.contains("bar-ok"));
+
+        let tick = text_changed_tick(app.world(), p);
+        props(&mut app, root).get_mut("other").unwrap().set("y");
+        app.update();
+        assert_eq!(text_changed_tick(app.world(), p), tick);
+
+        props(&mut app, root).insert("user", value!({ "name": "Ana" }));
+        props(&mut app, root).get_mut("count").unwrap().set(3);
+        props(&mut app, root).get_mut("progress").unwrap().set(0.75);
+        props(&mut app, root).get_mut("kind").unwrap().set("warn");
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["Hello, Ana! 3 items", "static 2 y"]);
+        assert_eq!(style(&app), bevy_flair::prelude::InlineStyle::new("width: 75%; color: #f00"));
+        assert!(app.world().get::<ClassList>(p).unwrap().contains("bar-warn"));
+    }
+
+    #[test]
+    fn lists_over_operator_expressions() {
+        let mut app = app();
+        let root = spawn(
+            &mut app,
+            r#"<ul><li v-for="(x, i) in mine || defaults" :key="x">{{ i + 1 }}. {{ x }}</li></ul>"#,
+            value!({ "defaults": ["a", "b"] }),
+        );
+        assert_eq!(texts(app.world(), root), vec!["1. a", "2. b"]);
+
+        props(&mut app, root).insert("mine", value!(["c"]));
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["1. c"]);
+
+        props(&mut app, root).get_mut("mine").unwrap().push("d");
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["1. c", "2. d"]);
+    }
+}
+
 #[test]
 fn if_chain_swaps_branches_in_place() {
     let mut app = app();

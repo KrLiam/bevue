@@ -5,14 +5,14 @@
 <template>
     <div class="window">
         <div class="root">
-            <p>Hello! {{ counter.seconds }}s</p>
+            <p>Hello! {{ counter.seconds }}s ({{ counter.seconds * 1000 }} ms)</p>
             <p v-if="counter.even">Even second</p>
             <p v-else>Odd second</p>
             <div class="button" @click="add_item()">
                 <span>Add item</span>
             </div>
             <div class="item" v-for="item in counter.items" :key="item">
-                <span>{{ label(item) }}</span>
+                <span>{{ `${label(item)}!` }}</span>
             </div>
         </div>
     </div>

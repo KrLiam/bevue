@@ -13,6 +13,8 @@ Bevue brings [Vue](https://vuejs.org/guide/introduction.html)-like templating to
 - [X] Conditional rendering using the `v-if`, `v-else-if` and `v-else` directives;
 - [X] List rendering using the `v-for` directive, e.g. `v-for="(item, i) in items" :key="item.id"`;
 - [X] Dynamic styles with `:style`, e.g. `:style="{ 'background-color': theme.color }"`;
+- [X] Operators in expressions, e.g. `{{ item.count * item.price }}`, `v-if="!done && count > 0"`;
+- [X] Template strings, e.g. `` :style="{ width: `${progress * 100}%` }" ``;
 - [X] Function calls in expressions, backed by Bevy one-shot systems, e.g. `{{ pressed_button(button.id) }}`;
 - [X] Event handling with `@click`, `@mouseover`, `@mouseleave`, custom events and `$emit`;
 - [X] Importing components from within HTML, e.g. `<import src="ui/item.html"/>`;
@@ -122,7 +124,33 @@ changed, so editing `inventory.items[1].count` touches a single text.
 ```
 
 An expression is a path into the props (`a.b[0].c`, `rows[i].name`), a string, number or boolean,
-a function call, or an object `{ key: value }`. There are no operators such as `!`, `==` or `+`, yet.
+a function call, or an object `{ key: value }`, combined with operators:
+
+```html
+<p v-if="!menu.answered && inventory.items[0].count > 0">...</p>
+<p>{{ item.count * item.price }} gold, {{ item.name || 'unnamed' }}</p>
+<li v-for="(item, i) in items" :class="{ last: i == total - 1 }">{{ i + 1 }}</li>
+<p :class="item.count > 0 ? 'in-stock' : 'sold-out'">{{ 'Item #' + item.id }}</p>
+```
+
+| Operators, loosest first | |
+|---|---|
+| `a ? b : c` | evaluates only the branch it picks |
+| `\|\|` `&&` | return one of their operands, so `name \|\| 'unnamed'` is a default |
+| `==` `!=` | deep comparison, without type conversion (`1 == '1'` is false) |
+| `<` `<=` `>` `>=` | two numbers, or two strings alphabetically |
+| `+` `-` `*` `/` `%` | numbers; `+` joins as text when either side is a string |
+| `!` `-` `+` | prefix |
+
+Arithmetic that makes no sense for its operands (`'a' * 2`, or a prop that is not there yet) gives
+`null`, which renders as empty text, and such a comparison is false. Neither is an error.
+
+A template string builds text from expressions:
+
+```html
+<p>{{ `Hello, ${user.name || 'stranger'}!` }}</p>
+<div :class="`slot slot-${item.rarity}`" :style="{ width: `${progress * 100}%` }"></div>
+```
 
 ## Conditions and lists
 

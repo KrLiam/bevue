@@ -302,12 +302,41 @@ fn separate_self_closing(source: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
+/// Stands for a `<` inside `{{ }}` while the HTML is parsed.
+const MASKED_LT: char = '\u{E000}';
+
+/// Hides every `<` inside `{{ }}` from the HTML parser, which would read `{{ a < b }}` as the start
+/// of a tag. [`unmask`] restores them.
+fn mask_interpolations(source: &str) -> Cow<'_, str> {
+    if !source.contains("{{") {
+        return Cow::Borrowed(source);
+    }
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(start) = rest.find("{{") {
+        let Some(len) = rest[start..].find("}}") else { break };
+        let (before, interpolation) = (&rest[..start], &rest[start..start + len]);
+        out.push_str(before);
+        for c in interpolation.chars() {
+            out.push(if c == '<' { MASKED_LT } else { c });
+        }
+        rest = &rest[start + len..];
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
+}
+
+fn unmask(text: &str) -> Cow<'_, str> {
+    if text.contains(MASKED_LT) { Cow::Owned(text.replace(MASKED_LT, "<")) } else { Cow::Borrowed(text) }
+}
+
 /// Parses a template source string into a `BevueTemplate`.
 /// Supports a `<template>` wrapper, `<style src="...">` tags, a top-level `<props>` element
 /// declaring the template's props and top-level `<import>` elements naming the component files
 /// the template uses.
 pub fn parse_template(source: &str) -> Result<BevueTemplate> {
-    let source = separate_self_closing(source);
+    let source = mask_interpolations(source);
+    let source = separate_self_closing(&source);
     let dom = tl::parse(&source, ParserOptions::default())
         .map_err(|e| ParseError::InvalidHtml(format!("{e:?}")))?;
 
@@ -379,7 +408,8 @@ pub fn parse_template(source: &str) -> Result<BevueTemplate> {
                 let mut condition_directive: Option<ConditionDirective> = None;
 
                 for (name, value) in tag_attributes(tag) {
-                    let val_str = value;
+                    let value = value.map(unmask);
+                    let val_str = value.as_deref();
                     if name == "v-for" {
                         let val = val_str.ok_or_else(|| {
                             ParseError::InvalidDirective("v-for requires a value".to_owned())
@@ -481,6 +511,7 @@ pub fn parse_template(source: &str) -> Result<BevueTemplate> {
                 stack.pop();
             }
             HtmlNode::Text(text) => {
+                let text = unmask(&text);
                 if in_style {
                     current_style_inline.push_str(&text);
                     continue;
@@ -621,6 +652,21 @@ use super::*;
         ] {
             let error = parse_template(source).unwrap_err().to_string();
             assert!(error.contains(expected), "{source}: {error}");
+        }
+    }
+
+    #[test]
+    fn operators_in_text_and_attributes() {
+        for source in [
+            r#"<div><p>{{ a < b }}</p><span>x</span></div>"#,
+            r#"<div><p>{{ a<b }}</p><span>x</span></div>"#,
+            r#"<div><p>{{ a <= b && c > d }} and {{ a>b }}</p><span>x</span></div>"#,
+            r#"<div><p v-if="a < b && c > d" :class="a<b ? 'x' : 'y'">t</p><span>x</span></div>"#,
+        ] {
+            let result = parse_template(source).unwrap_or_else(|e| panic!("{source}: {e}"));
+            assert_eq!(result.nodes.len(), 3, "{source}: {:?}", result.nodes);
+            assert_eq!(result.nodes[0].children, vec![NodeId(1), NodeId(2)], "{source}");
+            assert!(result.nodes[1].text.is_some(), "{source}");
         }
     }
 

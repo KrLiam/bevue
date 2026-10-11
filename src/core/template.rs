@@ -177,6 +177,49 @@ impl std::fmt::Display for Identifier {
     }
 }
 
+/// A prefix operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOp {
+    /// `!a`
+    Not,
+    /// `-a`
+    Neg,
+    /// `+a`
+    Pos,
+}
+
+/// An infix operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryOp {
+    Or,
+    And,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+}
+
+impl BinaryOp {
+    /// How tightly the operator binds; a higher value binds tighter.
+    pub fn precedence(self) -> u8 {
+        match self {
+            BinaryOp::Or => 1,
+            BinaryOp::And => 2,
+            BinaryOp::Eq | BinaryOp::Ne => 3,
+            BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => 4,
+            BinaryOp::Add | BinaryOp::Sub => 5,
+            BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => 6,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expression {
     Identifier(Identifier),
@@ -186,6 +229,12 @@ pub enum Expression {
     Call { function: Identifier, args: Vec<Expression> },
     /// An object literal: `{ key: expr, 'quoted-key': expr }`, in source order.
     Object(Vec<(Cow<'static, str>, Expression)>),
+    Unary { op: UnaryOp, operand: Box<Expression> },
+    Binary { op: BinaryOp, left: Box<Expression>, right: Box<Expression> },
+    /// `condition ? then : otherwise`
+    Conditional { condition: Box<Expression>, then: Box<Expression>, otherwise: Box<Expression> },
+    /// A template string: `` `Hello, ${user.name}!` ``.
+    TemplateString(TemplateText),
     Float(f32),
     Integer(i32),
     String(Cow<'static, str>),

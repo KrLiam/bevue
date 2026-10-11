@@ -14,9 +14,10 @@ use std::{borrow::Cow, fmt};
 use bevy::asset::Handle;
 
 use crate::core::{
+    ops,
     path::PathSegment,
     template::{
-        BevueTemplate, ConditionKind, ElementType, Expression, Identifier, NodeId, PropsDeclaration, TemplateNode,
+        BevueTemplate, BinaryOp, UnaryOp, ConditionKind, ElementType, Expression, Identifier, NodeId, PropsDeclaration, TemplateNode, TemplateText,
         TemplateStyle, TextFragment,
     },
     value::Value,
@@ -53,6 +54,16 @@ pub enum CompiledExpr {
     Call { function: Cow<'static, str>, args: Vec<CompiledExpr>, segments: Vec<CompiledSegment> },
     /// An object literal, which evaluates to a dict. Entries are in source order.
     Object(Vec<(Cow<'static, str>, CompiledExpr)>),
+    Unary { op: UnaryOp, operand: Box<CompiledExpr> },
+    /// An infix operator. `&&` and `||` only evaluate `right` when `left` does not decide.
+    Binary { op: BinaryOp, left: Box<CompiledExpr>, right: Box<CompiledExpr> },
+    /// `condition ? then : otherwise`, which evaluates only the branch it picks.
+    Conditional { condition: Box<CompiledExpr>, then: Box<CompiledExpr>, otherwise: Box<CompiledExpr> },
+    /// A template string with at least one part to evaluate. It evaluates to a string.
+    Text(CompiledText),
+    /// Fields or indices of the result of an expression that is not a path or a call, as in
+    /// `(a || b).name`.
+    Access { target: Box<CompiledExpr>, segments: Vec<CompiledSegment> },
 }
 
 impl CompiledExpr {
@@ -65,7 +76,7 @@ impl CompiledExpr {
         match self {
             CompiledExpr::Literal(_) => true,
             CompiledExpr::Object(entries) => entries.iter().all(|(_, value)| value.is_static()),
-            CompiledExpr::Path { .. } | CompiledExpr::Call { .. } => false,
+            _ => false,
         }
     }
 
@@ -105,6 +116,32 @@ impl CompiledExpr {
             CompiledExpr::Object(entries) => {
                 for (_, value) in entries {
                     value.dependencies(out);
+                }
+            }
+            CompiledExpr::Text(text) => {
+                for fragment in &text.0 {
+                    if let CompiledFragment::Expr(expr) = fragment {
+                        expr.dependencies(out);
+                    }
+                }
+            }
+            CompiledExpr::Unary { operand, .. } => operand.dependencies(out),
+            // Every operand counts, including the ones skipped by the last evaluation.
+            CompiledExpr::Binary { left, right, .. } => {
+                left.dependencies(out);
+                right.dependencies(out);
+            }
+            CompiledExpr::Conditional { condition, then, otherwise } => {
+                condition.dependencies(out);
+                then.dependencies(out);
+                otherwise.dependencies(out);
+            }
+            CompiledExpr::Access { target, segments } => {
+                target.dependencies(out);
+                for segment in segments {
+                    if let CompiledSegment::Dynamic(index) = segment {
+                        index.dependencies(out);
+                    }
                 }
             }
         }
@@ -484,19 +521,7 @@ impl<'a> Compiler<'a> {
         self.visit(id)?;
         let node = &self.template.nodes[*id];
 
-        let text = match &node.text {
-            Some(text) => Some(CompiledText(
-                text.0
-                    .iter()
-                    .map(|fragment| match fragment {
-                        TextFragment::Literal(s) => Ok(CompiledFragment::Literal(s.clone())),
-                        TextFragment::Interpolated(expr) => self.expr(expr).map(CompiledFragment::Expr),
-                    })
-                    .collect::<Result<_, _>>()
-                    .map_err(|e| e.at(id))?,
-            )),
-            None => None,
-        };
+        let text = node.text.as_ref().map(|text| self.text(text)).transpose().map_err(|e| e.at(id))?;
         let attributes = |name: &str| {
             node.attributes
                 .iter()
@@ -577,6 +602,17 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
+    fn text(&self, text: &TemplateText) -> Result<CompiledText, CompileError> {
+        text.0
+            .iter()
+            .map(|fragment| match fragment {
+                TextFragment::Literal(s) => Ok(CompiledFragment::Literal(s.clone())),
+                TextFragment::Interpolated(expr) => self.expr(expr).map(CompiledFragment::Expr),
+            })
+            .collect::<Result<_, _>>()
+            .map(CompiledText)
+    }
+
     fn handler(&self, expr: &Expression) -> Result<CompiledHandler, CompileError> {
         match expr {
             Expression::Call { function, args } => Ok(CompiledHandler::Call {
@@ -597,6 +633,46 @@ impl<'a> Compiler<'a> {
             Expression::String(s) => CompiledExpr::Literal(Value::from(s.as_ref())),
             Expression::Bool(b) => CompiledExpr::Literal(Value::from(*b)),
             Expression::Identifier(ident) => self.resolve(ident)?,
+            // Operators on literals are computed here, once.
+            Expression::Unary { op, operand } => match self.expr(operand)? {
+                CompiledExpr::Literal(value) => CompiledExpr::Literal(ops::unary(*op, &value)),
+                operand => CompiledExpr::Unary { op: *op, operand: Box::new(operand) },
+            },
+            Expression::Binary { op, left, right } => match (self.expr(left)?, self.expr(right)?) {
+                (CompiledExpr::Literal(left), CompiledExpr::Literal(right)) => {
+                    CompiledExpr::Literal(ops::binary(*op, &left, &right))
+                }
+                (left, right) => CompiledExpr::Binary { op: *op, left: Box::new(left), right: Box::new(right) },
+            },
+            Expression::Conditional { condition, then, otherwise } => {
+                let (then, otherwise) = (self.expr(then)?, self.expr(otherwise)?);
+                match self.expr(condition)? {
+                    CompiledExpr::Literal(value) if value.is_truthy() => then,
+                    CompiledExpr::Literal(_) => otherwise,
+                    condition => CompiledExpr::Conditional {
+                        condition: Box::new(condition),
+                        then: Box::new(then),
+                        otherwise: Box::new(otherwise),
+                    },
+                }
+            }
+            Expression::TemplateString(text) => {
+                let text = self.text(text)?;
+                // Without anything to evaluate, the string is known now.
+                let mut literal = String::new();
+                let is_literal = text.0.iter().all(|fragment| match fragment {
+                    CompiledFragment::Literal(s) => {
+                        literal.push_str(s);
+                        true
+                    }
+                    CompiledFragment::Expr(CompiledExpr::Literal(value)) => {
+                        literal.push_str(&value.to_text());
+                        true
+                    }
+                    CompiledFragment::Expr(_) => false,
+                });
+                if is_literal { CompiledExpr::Literal(Value::from(literal)) } else { CompiledExpr::Text(text) }
+            }
             Expression::Object(entries) => CompiledExpr::Object(
                 entries
                     .iter()
@@ -672,7 +748,14 @@ impl<'a> Compiler<'a> {
                 segments.push(segment);
                 Ok(CompiledExpr::Call { function, args, segments })
             }
-            CompiledExpr::Literal(_) | CompiledExpr::Object(_) => {
+            CompiledExpr::Access { target, mut segments } => {
+                segments.push(segment);
+                Ok(CompiledExpr::Access { target, segments })
+            }
+            target @ (CompiledExpr::Unary { .. } | CompiledExpr::Binary { .. } | CompiledExpr::Conditional { .. }) => {
+                Ok(CompiledExpr::Access { target: Box::new(target), segments: vec![segment] })
+            }
+            CompiledExpr::Literal(_) | CompiledExpr::Object(_) | CompiledExpr::Text(_) => {
                 Err(CompileError::unplaced("cannot access a field of a literal"))
             }
         }
@@ -1028,6 +1111,147 @@ mod tests {
             compiled.get(row).text.as_ref().unwrap().0,
             vec![CompiledFragment::Expr(CompiledExpr::Literal(Value::from("x")))]
         );
+    }
+
+    #[test]
+    fn operators() {
+        let template = parse_template(
+            r#"
+            <ul>
+                <li v-for="(it, i) in items" :class="it.n > limit && !it.off ? 'hi' : 'lo'">
+                    {{ i + 1 }} {{ (it.alt || fallback).name }} {{ -2 * (3 + 1) }} {{ 1 < 2 ? it.a : it.b }}
+                </li>
+            </ul>
+            "#,
+        )
+        .unwrap();
+        let compiled = CompiledTemplate::compile(&template).unwrap();
+        let node = compiled.get(NodeId(1));
+        let item = |field| CompiledExpr::Path { root: ScopeRef::Item(0), segments: vec![key(field)] };
+        let prop = |name| CompiledExpr::Path { root: ScopeRef::Props, segments: vec![key(name)] };
+        let boxed = Box::new;
+
+        assert_eq!(
+            node.classes,
+            vec![CompiledExpr::Conditional {
+                condition: boxed(CompiledExpr::Binary {
+                    op: BinaryOp::And,
+                    left: boxed(CompiledExpr::Binary { op: BinaryOp::Gt, left: boxed(item("n")), right: boxed(prop("limit")) }),
+                    right: boxed(CompiledExpr::Unary { op: UnaryOp::Not, operand: boxed(item("off")) }),
+                }),
+                then: boxed(CompiledExpr::Literal(Value::from("hi"))),
+                otherwise: boxed(CompiledExpr::Literal(Value::from("lo"))),
+            }]
+        );
+        // Every operand is a dependency, whichever ones the last evaluation used.
+        let mut dependencies = Vec::new();
+        node.classes[0].dependencies(&mut dependencies);
+        assert_eq!(
+            dependencies,
+            vec![
+                (ScopeRef::Item(0), vec![PathSegment::Key("n".into())]),
+                (ScopeRef::Props, vec![PathSegment::Key("limit".into())]),
+                (ScopeRef::Item(0), vec![PathSegment::Key("off".into())]),
+            ]
+        );
+
+        let exprs: Vec<_> = node
+            .text
+            .as_ref()
+            .unwrap()
+            .0
+            .iter()
+            .filter_map(|f| match f {
+                CompiledFragment::Expr(e) => Some(e.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            exprs,
+            vec![
+                CompiledExpr::Binary {
+                    op: BinaryOp::Add,
+                    left: boxed(CompiledExpr::Path { root: ScopeRef::Index(0), segments: vec![] }),
+                    right: boxed(CompiledExpr::Literal(Value::from(1))),
+                },
+                CompiledExpr::Access {
+                    target: boxed(CompiledExpr::Binary {
+                        op: BinaryOp::Or,
+                        left: boxed(item("alt")),
+                        right: boxed(prop("fallback")),
+                    }),
+                    segments: vec![key("name")],
+                },
+                // Operators on literals are computed at compile time,
+                CompiledExpr::Literal(Value::from(-8)),
+                // and a ternary with a literal condition is its branch.
+                item("a"),
+            ]
+        );
+
+        // A component attribute given an operator expression can still be accessed.
+        let components = Components::new(&[("Row", r#"<p>{{ item.name }}</p>"#)]);
+        let compiled = compile_with(r#"<div><Row :item="a || b"/></div>"#, &components).unwrap();
+        let Slot::Static(row) = compiled.get(NodeId(0)).slots[0] else { panic!("expected an element") };
+        assert_eq!(
+            compiled.get(row).text.as_ref().unwrap().0,
+            vec![CompiledFragment::Expr(CompiledExpr::Access {
+                target: boxed(CompiledExpr::Binary { op: BinaryOp::Or, left: boxed(prop("a")), right: boxed(prop("b")) }),
+                segments: vec![key("name")],
+            })]
+        );
+
+        let template = parse_template(r#"<p>{{ 'abc'.length }}</p>"#).unwrap();
+        assert!(CompiledTemplate::compile(&template).is_err());
+    }
+
+    #[test]
+    fn template_strings() {
+        let template = parse_template(
+            r#"<ul><li v-for="(it, i) in items" :style="{ width: `${it.w * 10}px` }">{{ `#${i}: ${it.name || title}` }} {{ `a${1 + 1}b` }}</li></ul>"#,
+        )
+        .unwrap();
+        let compiled = CompiledTemplate::compile(&template).unwrap();
+        let node = compiled.get(NodeId(1));
+        let item = |field| CompiledExpr::Path { root: ScopeRef::Item(0), segments: vec![key(field)] };
+        let literal = |s: &'static str| CompiledFragment::Literal(s.into());
+
+        let fragments = &node.text.as_ref().unwrap().0;
+        let CompiledFragment::Expr(first) = &fragments[0] else { panic!("expected an expression") };
+        assert_eq!(
+            *first,
+            CompiledExpr::Text(CompiledText(vec![
+                literal("#"),
+                CompiledFragment::Expr(CompiledExpr::Path { root: ScopeRef::Index(0), segments: vec![] }),
+                literal(": "),
+                CompiledFragment::Expr(CompiledExpr::Binary {
+                    op: BinaryOp::Or,
+                    left: Box::new(item("name")),
+                    right: Box::new(CompiledExpr::Path { root: ScopeRef::Props, segments: vec![key("title")] }),
+                }),
+            ]))
+        );
+        let mut dependencies = Vec::new();
+        first.dependencies(&mut dependencies);
+        assert_eq!(
+            dependencies,
+            vec![
+                (ScopeRef::Index(0), vec![]),
+                (ScopeRef::Item(0), vec![PathSegment::Key("name".into())]),
+                (ScopeRef::Props, vec![PathSegment::Key("title".into())]),
+            ]
+        );
+        // Nothing to evaluate: the string is a literal.
+        assert_eq!(fragments[2], CompiledFragment::Expr(CompiledExpr::Literal(Value::from("a2b"))));
+        assert!(node.has_dynamic_styles());
+
+        let template = parse_template(r#"<p :style="{ width: `${4 * 5}px` }" :class="`a b`">x</p>"#).unwrap();
+        let node = CompiledTemplate::compile(&template).unwrap();
+        let node = node.get(NodeId(0));
+        assert!(!node.has_dynamic_styles() && !node.has_dynamic_classes());
+
+        let template = parse_template(r#"<p>{{ `a${b}`.length }}</p>"#).unwrap();
+        assert!(CompiledTemplate::compile(&template).is_err());
     }
 
     #[test]

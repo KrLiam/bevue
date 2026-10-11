@@ -6,6 +6,8 @@ use bevy::log::warn;
 use bevy_flair::prelude::InlineStyle;
 
 use crate::core::{
+    ops,
+    template::BinaryOp,
     compile::{CompiledExpr, CompiledFragment, CompiledSegment, CompiledText, ScopeRef},
     path::{PathSegment, PropPath},
     value::{Value, ValueType},
@@ -103,6 +105,28 @@ pub fn eval<'r, 'p: 'r>(expr: &'r CompiledExpr, ctx: &mut EvalCtx<'p, '_, '_>) -
                 return Cow::Owned(result);
             }
             Cow::Owned(navigate(&result, segments, ctx).cloned().unwrap_or_default())
+        }
+        CompiledExpr::Text(text) => Cow::Owned(Value::from(render_text(text, ctx))),
+        CompiledExpr::Unary { op, operand } => Cow::Owned(ops::unary(*op, &eval(operand, ctx))),
+        CompiledExpr::Binary { op: BinaryOp::And, left, right } => {
+            let left = eval(left, ctx);
+            if left.is_truthy() { eval(right, ctx) } else { left }
+        }
+        CompiledExpr::Binary { op: BinaryOp::Or, left, right } => {
+            let left = eval(left, ctx);
+            if left.is_truthy() { left } else { eval(right, ctx) }
+        }
+        CompiledExpr::Binary { op, left, right } => {
+            let left = eval(left, ctx);
+            let right = eval(right, ctx);
+            Cow::Owned(ops::binary(*op, &left, &right))
+        }
+        CompiledExpr::Conditional { condition, then, otherwise } => {
+            if eval(condition, ctx).is_truthy() { eval(then, ctx) } else { eval(otherwise, ctx) }
+        }
+        CompiledExpr::Access { target, segments } => {
+            let target = eval(target, ctx);
+            Cow::Owned(navigate(&target, segments, ctx).cloned().unwrap_or_default())
         }
         CompiledExpr::Object(entries) => {
             let mut dict = Value::empty_dict();
