@@ -1,6 +1,6 @@
 [package]
 name = "bevue"
-version = "0.1.0"
+version = "0.2.0-dev"
 edition = "2024"
 description = "Vue-like templating for Bevy UI"
 repository="https://github.com/krliam/bevue"
@@ -13,7 +13,7 @@ exclude = ["/plans", "/docs", "/todo.md", "/.github"]
 members = ["crates/bevue_macros"]
 
 [dependencies]
-bevue_macros = { path = "crates/bevue_macros", version = "0.1.0" }
+bevue_macros = { path = "crates/bevue_macros", version = "0.2.0-dev" }
 bevy = { version = "0.19", default-features = false, features = [
     "ui",
     "file_watcher",
