@@ -20,7 +20,7 @@ bevy = { version = "0.19", default-features = false, features = [
 ]}
 bevy_flair = { version = "0.8.1" }
 tl = "^0.7.8"
-winnow = "^1.0.4"
+winnow = "^1.0.3"
 
 [dev-dependencies]
 criterion = "0.8"
