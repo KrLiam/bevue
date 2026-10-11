@@ -267,15 +267,6 @@ mod styles {
         assert!(!classes.contains("active") && classes.contains("is-big"));
     }
 
-    /// An app whose generated stylesheets can be loaded: the `bevue://` asset source has to be
-    /// registered before `AssetPlugin` is added.
-    fn styled_app() -> App {
-        let mut app = App::new();
-        app.add_plugins((crate::asset::BevueAssetPlugin, MinimalPlugins, AssetPlugin::default(), BevueRuntimePlugin));
-        app.finish();
-        app
-    }
-
     /// Updates until `bevy_flair` has loaded the template's stylesheet and styled `entity`.
     fn wait_for_background(app: &mut App, entity: Entity, expected: Color) {
         for _ in 0..500 {
@@ -292,7 +283,7 @@ mod styles {
     /// frame it was set.
     #[test]
     fn applied_by_flair_in_the_same_frame() {
-        let mut app = styled_app();
+        let mut app = app();
         let root = spawn(
             &mut app,
             r#"
@@ -319,7 +310,7 @@ mod styles {
     /// has none gets an empty one.
     #[test]
     fn applied_without_a_style_block() {
-        let mut app = styled_app();
+        let mut app = app();
         let root = spawn(&mut app, r#"<div><p :style="{ backgroundColor: color }">x</p></div>"#, value!({ "color": "#ff0000" }));
         let p = children(app.world(), root)[0];
         assert!(matches!(app.world().get::<Styled>(root), Some(Styled::StyleSheet(_))));
@@ -1149,7 +1140,7 @@ mod components {
 
     use super::*;
     use crate::{
-        asset::BevueAssetRegistry,
+        asset::BevueStylesheets,
         core::template::TemplateRef,
         runtime::{
             BevueComponents, BevueCtx, BevueEvent, BevueFunctionsAppExt, BevuePropsAppExt, ComponentDependencies,
@@ -1430,9 +1421,7 @@ mod components {
         assert_eq!(texts(app.world(), root), vec!["Edit", "Edit", "Edit"]);
 
         let Some(Styled::StyleSheet(sheet)) = app.world().get::<Styled>(root) else { panic!("expected a stylesheet") };
-        let registry = app.world().resource::<BevueAssetRegistry>();
-        let css = registry.get_asset(sheet.path().unwrap().path()).unwrap();
-        let css = std::str::from_utf8(css.value()).unwrap();
+        let css = app.world().resource::<BevueStylesheets>().get(sheet.path().unwrap().path()).unwrap();
         let (title, host) = (css.find(".title").unwrap(), css.find(".host").unwrap());
         assert!(title < host, "the host's rules come last: {css}");
         assert_eq!(css.matches(".title").count(), 1);
@@ -1487,7 +1476,7 @@ mod components {
     }
 }
 
-/// Templates loaded from files through the asset loader, here the in-memory `bevue://` source.
+/// Templates loaded from files through the asset loader, here from the in-memory `mem://` source.
 mod imports {
     use std::path::Path;
 
@@ -1508,7 +1497,9 @@ mod imports {
     };
 
     use super::*;
-    use crate::asset::{BevueAssetPlugin, BevueAssetRegistry};
+    /// The files of the `mem://` asset source.
+    #[derive(Resource, Clone, Default)]
+    struct Files(Dir);
 
     /// The `slow://` asset source: files in memory that cannot be read until `open` is set.
     #[derive(Resource, Clone, Default)]
@@ -1558,8 +1549,15 @@ mod imports {
             }),
         );
         app.insert_resource(slow);
+        let memory = Files::default();
+        let dir = memory.0.clone();
+        app.register_asset_source(
+            "mem",
+            AssetSourceBuilder::new(move || Box::new(MemoryAssetReader { root: dir.clone() })),
+        );
+        app.insert_resource(memory);
         // Asset sources have to be registered before `AssetPlugin` is added.
-        app.add_plugins((BevueAssetPlugin, MinimalPlugins, AssetPlugin::default(), BevueRuntimePlugin));
+        app.add_plugins((MinimalPlugins, AssetPlugin::default(), BevueRuntimePlugin));
         app.init_resource::<Renders>();
         app.add_observer(|event: On<Insert, TemplateInstance>, mut renders: ResMut<Renders>| {
             renders.0.push(event.entity);
@@ -1572,11 +1570,11 @@ mod imports {
     }
 
     fn write(app: &mut App, path: &str, source: &str) {
-        app.world().resource::<BevueAssetRegistry>().dir.insert_asset_text(Path::new(path), source);
+        app.world().resource::<Files>().0.insert_asset_text(Path::new(path), source);
     }
 
     fn load(app: &mut App, path: &str, props: Value) -> Entity {
-        let handle: Handle<BevueTemplate> = app.world().resource::<AssetServer>().load(format!("bevue://{path}"));
+        let handle: Handle<BevueTemplate> = app.world().resource::<AssetServer>().load(format!("mem://{path}"));
         app.world_mut().spawn((Template::new(handle), BevueProps::new(props))).id()
     }
 
@@ -1608,7 +1606,7 @@ mod imports {
                 r#"
                 <import src="./row.html"/>
                 <import src="../shared/title_bar.html"/>
-                <import src="bevue://shared/title_bar.html" as="Footer"/>
+                <import src="mem://shared/title_bar.html" as="Footer"/>
                 <template>
                     <div><TitleBar :text="title"/><Row v-for="item in items" :item="item"/><Footer text="end"/></div>
                 </template>
@@ -1631,7 +1629,7 @@ mod imports {
         // A changed import renders the host again, with its props kept.
         props(&mut app, root).get_mut("title").unwrap().set("Edit");
         write(&mut app, "screens/parts/tag.html", r#"<i>{{ label }}!</i>"#);
-        app.world().resource::<AssetServer>().reload("bevue://screens/parts/tag.html");
+        app.world().resource::<AssetServer>().reload("mem://screens/parts/tag.html");
         wait_for_texts(&mut app, root, &["Edit", "a!", "b!", "end"]);
     }
 
@@ -1661,7 +1659,7 @@ mod imports {
     fn a_missing_import_does_not_block() {
         let mut app = file_app(&[(
             "host.html",
-            r#"<import src="bevue://nope.html"/><div><Nope/><p>after</p></div>"#,
+            r#"<import src="mem://nope.html"/><div><Nope/><p>after</p></div>"#,
         )]);
         let root = load(&mut app, "host.html", Value::empty_dict());
         wait_for_texts(&mut app, root, &["after"]);
@@ -1693,9 +1691,9 @@ mod imports {
     #[test]
     fn imports_of_templates_built_in_code() {
         let mut app = file_app(&[("row.html", r#"<b>{{ label }}</b>"#)]);
-        let row: Handle<BevueTemplate> = app.world().resource::<AssetServer>().load("bevue://row.html");
+        let row: Handle<BevueTemplate> = app.world().resource::<AssetServer>().load("mem://row.html");
         let code = crate::parser::parse_template(r#"<div><Line label="x"/></div>"#).unwrap().with_import("Line", row);
-        let mut parsed = crate::parser::parse_template(r#"<import src="bevue://row.html"/><div><Row label="y"/></div>"#).unwrap();
+        let mut parsed = crate::parser::parse_template(r#"<import src="mem://row.html"/><div><Row label="y"/></div>"#).unwrap();
         parsed.load_imports(app.world().resource::<AssetServer>());
 
         let mut spawn = |template: BevueTemplate| {

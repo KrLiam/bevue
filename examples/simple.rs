@@ -1,6 +1,5 @@
 use bevue::{
-    BevueCtx, BevueFunctionsAppExt, BevuePropsAppExt, Props, Template, asset::BevueAssetPlugin,
-    runtime::BevueRuntimePlugin,
+    BevueCtx, BevueFunctionsAppExt, BevuePlugin, BevuePropsAppExt, Props, Template,
 };
 use bevy::{
     DefaultPlugins,
@@ -33,7 +32,7 @@ fn main() {
     // `bevue=debug` logs how long each props sync, render and update took.
     let log = LogPlugin { filter: "wgpu=error,naga=warn,bevue=debug".into(), ..Default::default() };
 
-    app.add_plugins((BevueAssetPlugin, DefaultPlugins.set(log), BevueRuntimePlugin))
+    app.add_plugins((DefaultPlugins.set(log), BevuePlugin))
         .register_props::<Counter>()
         .init_resource::<Counter>()
         .register_bevue_function("add_item", add_item)

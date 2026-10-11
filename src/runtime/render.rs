@@ -1,7 +1,7 @@
 use std::{borrow::Cow, collections::HashSet, path::Path, sync::Arc};
 
 use bevy::{
-    asset::{AssetEvent, AssetId, AssetLoadFailedEvent, AssetServer, Assets, Handle},
+    asset::{io::embedded::EmbeddedAssetRegistry, AssetEvent, AssetId, AssetLoadFailedEvent, AssetServer, Assets, Handle},
     ecs::{
         change_detection::{DetectChanges, DetectChangesMut, Ref},
         component::Component,
@@ -13,7 +13,7 @@ use bevy::{
         observer::On,
         lifecycle::HookContext,
         query::{Changed, QueryState, With},
-        system::{Command, Commands, In, IntoSystem, Query, Res, command::run_system_cached_with},
+        system::{Command, Commands, In, IntoSystem, Query, Res, ResMut, command::run_system_cached_with},
         world::{DeferredWorld, World},
     },
     log::{debug, error, warn},
@@ -21,7 +21,7 @@ use bevy::{
 };
 use bevy_flair::prelude::{Styled, StyleSheet};
 
-use crate::asset::BevueAssetRegistry;
+use crate::asset::BevueStylesheets;
 use crate::core::compile::CompiledTemplate;
 use crate::core::template::{BevueTemplate, TemplateRef};
 use crate::core::value::Value;
@@ -383,7 +383,8 @@ pub(crate) fn restore_props(world: &mut World, entity: Entity, value: Value) {
 pub fn apply_template_classes_and_styles(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
-    bevue_assets: Res<BevueAssetRegistry>,
+    embedded: Res<EmbeddedAssetRegistry>,
+    mut stylesheets: ResMut<BevueStylesheets>,
     template_nodes: Query<(Entity, &TemplateRef), Changed<TemplateRef>>,
     root_templates: Query<(&Template, &TemplateInstance)>,
     parents: Query<&ChildOf>,
@@ -416,8 +417,10 @@ pub fn apply_template_classes_and_styles(
                     format!("inline_{entity}")
                 };
 
-                let css_file_name = format!("{html_path_str}.css");
-                let css_asset_path = format!("bevue://{css_file_name}");
+                // Generated stylesheets live in Bevy's `embedded://` source, which can be written
+                // to at any time.
+                let css_file_name = format!("{}/{html_path_str}.css", BevueStylesheets::ROOT);
+                let css_asset_path = format!("embedded://{css_file_name}");
 
                 // `@import` rules must come before any other rule.
                 let mut full_css = String::new();
@@ -431,10 +434,8 @@ pub fn apply_template_classes_and_styles(
 
                 // Only reload the stylesheet if this render changed it.
                 let path = Path::new(&css_file_name);
-                let unchanged =
-                    bevue_assets.dir.get_asset(path).is_some_and(|asset| asset.value() == full_css.as_bytes());
-                if !unchanged {
-                    bevue_assets.dir.insert_asset_text(path, &full_css);
+                if stylesheets.bypass_change_detection().set(path, &full_css) {
+                    embedded.insert_asset(path.to_owned(), path, full_css.into_bytes());
                     asset_server.reload(&css_asset_path);
                 }
 
@@ -775,10 +776,10 @@ mod test {
     fn test_template_ref_inline_style() {
         use bevy_flair::prelude::{ClassList, Styled};
         use crate::core::template::{NodeId, TemplateRef};
-        use crate::asset::{BevueAssetPlugin, BevueAssetRegistry};
+        use crate::asset::BevueStylesheets;
 
         let mut app = App::new();
-        app.add_plugins((BevueAssetPlugin, MinimalPlugins, AssetPlugin::default(), BevueRuntimePlugin));
+        app.add_plugins((MinimalPlugins, AssetPlugin::default(), BevueRuntimePlugin));
         app.finish();
 
         let source = r#"
@@ -811,18 +812,17 @@ mod test {
         let root_classes = app.world().get::<ClassList>(entity).expect("Root must have ClassList");
         assert!(root_classes.contains("root"));
 
-        // 2. Verify root entity has Styled pointing to fabricated asset in bevue://
+        // 2. Verify root entity has Styled pointing to fabricated asset in embedded://
         let root_styled = app.world().get::<Styled>(entity).expect("Root must have Styled component");
         match root_styled {
             Styled::StyleSheet(handle) => {
                 let path = handle.path().expect("Fabricated stylesheet must have an AssetPath");
-                assert_eq!(path.source().as_str(), Some("bevue"));
+                assert_eq!(path.source().as_str(), Some("embedded"));
                 assert!(path.path().to_string_lossy().ends_with(".css"));
 
-                // Verify file content in BevueAssetRegistry
-                let registry = app.world().resource::<BevueAssetRegistry>();
-                let asset_data = registry.get_asset(path.path()).expect("Asset must exist in BevueAssetRegistry");
-                let css_text = std::str::from_utf8(asset_data.value()).unwrap();
+                // Verify file content in BevueStylesheets
+                let stylesheets = app.world().resource::<BevueStylesheets>();
+                let css_text = stylesheets.get(path.path()).expect("Stylesheet must exist in BevueStylesheets");
                 assert!(css_text.contains(".root"));
                 assert!(css_text.contains("background-color: red;"));
             }
@@ -833,10 +833,10 @@ mod test {
     #[test]
     fn test_template_ref_inline_and_src_style() {
         use bevy_flair::prelude::Styled;
-        use crate::asset::{BevueAssetPlugin, BevueAssetRegistry};
+        use crate::asset::BevueStylesheets;
 
         let mut app = App::new();
-        app.add_plugins((BevueAssetPlugin, MinimalPlugins, AssetPlugin::default(), BevueRuntimePlugin));
+        app.add_plugins((MinimalPlugins, AssetPlugin::default(), BevueRuntimePlugin));
         app.finish();
 
         let source = r#"
@@ -865,11 +865,10 @@ mod test {
         match root_styled {
             Styled::StyleSheet(handle) => {
                 let path = handle.path().expect("Fabricated stylesheet must have an AssetPath");
-                assert_eq!(path.source().as_str(), Some("bevue"));
+                assert_eq!(path.source().as_str(), Some("embedded"));
 
-                let registry = app.world().resource::<BevueAssetRegistry>();
-                let asset_data = registry.get_asset(path.path()).expect("Asset must exist in BevueAssetRegistry");
-                let css_text = std::str::from_utf8(asset_data.value()).unwrap();
+                let stylesheets = app.world().resource::<BevueStylesheets>();
+                let css_text = stylesheets.get(path.path()).expect("Stylesheet must exist in BevueStylesheets");
                 assert!(css_text.contains("@import \"shared.css\";"));
                 assert!(css_text.contains("color: blue;"));
             }

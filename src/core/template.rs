@@ -592,7 +592,7 @@ mod test {
             ("button.html", Some("Button")),
             ("ui/item_row.html", Some("ItemRow")),
             ("./item-row.html", Some("ItemRow")),
-            ("bevue://a/b/contextMenu.v2.bevue", Some("ContextMenuV2")),
+            ("mem://a/b/contextMenu.v2.bevue", Some("ContextMenuV2")),
             ("Panel", Some("Panel")),
             ("3d.html", None),
             ("ui/", None),

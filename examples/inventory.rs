@@ -1,5 +1,5 @@
 use bevue::{
-    BevueCtx, BevuePropsAppExt, Props, Template, asset::BevueAssetPlugin, runtime::BevueRuntimePlugin,
+    BevueCtx, BevuePlugin, BevuePropsAppExt, Props, Template,
 };
 use bevy::{
     DefaultPlugins, app::{App, Startup, Update}, asset::AssetServer, camera::Camera2d, ecs::{
@@ -49,7 +49,7 @@ fn inventory_changed(inv: Res<Inventory>) {
 fn main() {
     let mut app = App::new();
 
-    app.add_plugins((BevueAssetPlugin, DefaultPlugins, BevueRuntimePlugin))
+    app.add_plugins((DefaultPlugins, BevuePlugin))
         .register_props::<Inventory>()
         .init_resource::<Inventory>()
         .register_props::<PlayerName>()

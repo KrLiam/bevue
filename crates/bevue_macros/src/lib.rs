@@ -142,9 +142,9 @@ fn expand(mut input: DeriveInput) -> syn::Result<TokenStream2> {
                 }
                 quote! {
                     fn to_value(&self) -> #value {
-                        let mut map = ::bevue::__private::HashMap::<::std::string::String, #value>::new();
+                        let mut map = ::std::collections::HashMap::<::std::string::String, #value>::new();
                         #( map.insert(::std::string::String::from(#keys), #props::Props::to_value(&self.#idents)); )*
-                        #value::dict(map)
+                        <#value as ::std::convert::From<_>>::from(map)
                     }
                     fn sync_value(&self, target: &mut #value) {
                         if target.as_dict().is_none() {
