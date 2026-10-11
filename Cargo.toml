@@ -19,8 +19,8 @@ bevy = { version = "0.19", default-features = false, features = [
     "file_watcher",
 ]}
 bevy_flair = { version = "0.8.1" }
-tl = "0.7.8"
-winnow = "1.0.4"
+tl = "^0.7.8"
+winnow = "^1.0.4"
 
 [dev-dependencies]
 criterion = "0.8"
