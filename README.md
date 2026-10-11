@@ -1,223 +1,298 @@
 # About
 
-Bevue brings [Vue](https://vuejs.org/guide/introduction.html)-like templating to Bevy UI, enabling fast prototyping of user interfaces while leveraging the power of Bevy's ECS. For that, it provides:
-- An abstract UI node hierarchy to represent concepts such as interpolation, condition rendering and list rendering.
-- A parser and asset loader to let Bevue templates be specified with Bevy assets.
-- Lightweight (and very limited) scripting in template expressions, including the use of Rust functions in templates.
-- A runtime engine that turn templates into concrete UI nodes with change-detection, immediate mode by default.
+Bevue brings [Vue](https://vuejs.org/guide/introduction.html)-like templating to Bevy UI, enabling fast prototyping of user interfaces while leveraging the power of Bevy's ECS.
+
+## Features
+
+- [X] Declare Bevy UI with Vue-like HTML templates;
+- [X] Loading templates from assets with hot reloading;
+- [X] Easy styling with CSS through [bevy-flair](https://github.com/eckz/bevy_flair) crate;
+- [X] Using Bevy components/resources (`Props`) as template inputs;
+- [X] Fine-grained reactivity: only UI nodes bound to the props that changed are updated;
+- [X] Text interpolation e.g `Hello {{ user.name }}!`;
+- [X] Conditional rendering using the `v-if`, `v-else-if` and `v-else` directives;
+- [X] List rendering using the `v-for` directive, e.g. `v-for="(item, i) in items" :key="item.id"`;
+- [X] Dynamic styles with `:style`, e.g. `:style="{ 'background-color': theme.color }"`;
+- [X] Function calls in expressions, backed by Bevy one-shot systems, e.g. `{{ pressed_button(button.id) }}`;
+- [X] Event handling with `@click`, `@mouseover`, `@mouseleave`, custom events and `$emit`;
+- [X] Importing components from within HTML, e.g. `<import src="ui/item.html"/>`;
+- [X] Component elements such as `<ItemSlot :item="item" @pickup="pickup_item(i)"/>`;
 
 Bevue is only inspired by Vue, it won't:
-- Support *all* syntax of Vue;
+- Support *all* of Vue's features;
 - Embed the Vue framework or a JavaScript engine. Everything still happens in Rust.
 
-# Features
+## Getting started
 
-- [X] Vue-like components in HTML files;
-- [X] Loading components from assets with hot reloading;
-- [X] Easy styling with CSS through `bevy-flair` crate;
-- [X] Rendering static components to Bevy UI;
-- [X] Text and class interpolation e.g `Hello {{ user.name }}!`, `:class="state"`;
-- [X] Dynamic styles with `:style`, e.g. `:style="{ 'background-color': theme.color }"`;
-- [X] Conditional rendering using the `v-if`, `v-else-if` and `v-else` directives;
-- [X] Keyed list rendering using the `v-for` directive, e.g. `v-for="(item, i) in items" :key="item.id"`;
-- [X] Fine-grained reactivity: only UI nodes bound to the props that changed are updated;
-- [X] `#[derive(Props)]` to render Bevy components and resources, with path access like `a.b[0].c`;
-- [X] Props declared in the component file with `<props>`;
-- [X] Function calls in expressions, backed by Bevy systems, e.g. `{{ format(price) }}`;
-- [X] Event handling with `@click`, `@mouseover`, `@mouseleave`, custom events and `$emit`;
-- [X] Component elements such as `<ItemRow :item="item" @remove="remove_item(i)"/>`, at the cost of inlined markup;
-- [X] Components imported by the templates using them, e.g. `<import src="item_row.html"/>`;
+```sh
+cargo add bevue
+```
 
-# Reactivity
-
-A template renders the `BevueProps` component on its entity. Mutate it through the `Value`
-mutators (`get_mut`, `at_mut`, `set`, `push`, `insert`, ...), which record exactly what changed:
+Add `BevuePlugin` after `DefaultPlugins`, then spawn a `Template` with the data it renders:
 
 ```rust
-fn rename(mut props: Query<&mut BevueProps>) {
-    for mut props in &mut props {
-        props.at_mut(&"user.name".parse().unwrap()).unwrap().set("Ana");
-    }
+use bevue::{BevuePlugin, BevuePropsAppExt, Props, Template};
+use bevy::prelude::*;
+
+#[derive(Component, Props)]
+struct Menu {
+    user_name: String,
+}
+
+fn main() {
+    App::new()
+        .add_plugins((DefaultPlugins, BevuePlugin))
+        .register_props::<Menu>()
+        .add_systems(Startup, setup)
+        .run();
+}
+
+fn setup(mut commands: Commands, assets: Res<AssetServer>) {
+    commands.spawn(Camera2d);
+    commands.spawn((
+        Template::new(assets.load("menu.html")),
+        Menu { user_name: "John".into() },
+    ));
 }
 ```
 
-Or derive `Props` on a component or resource and let Bevy change detection sync it:
+```html
+<!-- assets/menu.html -->
+<props>
+    <component type="Menu"/>
+</props>
 
-```rust
-#[derive(Resource, Props)]
-struct Menu { title: String, actions: Vec<Action> }
+<template>
+    <div class="menu">
+        <p>Hello, {{ menu.user_name }}! How are you?</p>
+    </div>
+</template>
 
-app.register_props::<Menu>();
-commands.spawn((Template::new(asset_server.load("menu.html")), PropsResource::<Menu>::at("menu")));
+<style>
+.menu { flex-direction: column; row-gap: 20px; }
+</style>
 ```
 
-`PropsResource::<Menu>::default()` mounts the resource at its default name: the type name in snake
-case (`menu`, or `player_inventory` for `PlayerInventory`), or the one set with
-`#[props(name = "...")]` on the type.
+A template file has a `<template>` with one root element, and optionally `<props>`, `<style>` and
+`<import>` next to it. Every element becomes a Bevy UI `Node` on its own entity and its text a
+`Text`; tag names are only labels, so style elements by class. Saving the file updates the running
+app.
 
-Changed Rust data is diffed into the props, so editing `menu.actions[1].label` only updates the
-text bound to that label.
+Check out [`examples/`](examples) for more complete showcases.
 
-A template can also declare the registered types it renders, in a `<props>` element next to
-`<template>` and `<style>`. Then spawning `Template` alone is enough:
+## Props
+
+Props are the data a template reads. Derive `Props` on a component or a resource, register the
+type, and name it in the template's `<props>`:
+
+```rust
+#[derive(Resource, Props, Default)]
+struct Inventory {
+    items: Vec<Item>,
+    #[props(skip)]          // not visible to templates
+    last_saved: f32,
+}
+
+#[derive(Props, Clone)]
+struct Item { id: u32, count: u32 }
+
+app.register_props::<Inventory>().init_resource::<Inventory>();
+```
 
 ```html
 <props>
-    <resource name="menu" type="Menu"/>
-    <resource type="my_game::ui::Settings"/>
-    <component type="Player"/>
+    <resource type="Inventory"/>                 <!-- read as `inventory` -->
+    <resource name="settings" type="my_game::ui::Settings"/>
+    <component type="Menu"/>                     <!-- a component of the template entity -->
 </props>
 ```
 
-- `<resource>` mounts a resource, like `PropsResource`. `<component>` mounts a component of the
-  template entity, like `PropsComponent`.
-- `type` is the full path of the type or just its name. If two registered types share a name, the
-  name refers to the one registered last.
-- `name` is the key in the props. Without it, the default name of the type is used.
-- A `PropsResource` or `PropsComponent` you inserted yourself for the same type is kept as it is.
+A type is read under its name in snake case (`PlayerInventory` is `player_inventory`) unless
+`name` says otherwise.
 
-# Dynamic styles
+There is nothing else to wire up: change the component or resource as usual and the UI follows.
+Bevue compares the new data with what it rendered and updates only the nodes bound to what
+changed, so editing `inventory.items[1].count` touches a single text.
 
-`:style` sets CSS properties of a node from props. They are written to the node's `InlineStyle`
-component, which `bevy-flair` applies over the rules of the stylesheet.
+## Text and expressions
 
 ```html
-<div :style="{ backgroundColor: theme.color, 'border-radius': '4px', '--gap': theme.gap }"></div>
-<div style="width: 200px" :style="theme.panel"></div>
+<p>Hello, {{ menu.user_name }}!</p>
+<p>{{ inventory.items[0].count }} of {{ format_name(inventory.items[0].id) }}</p>
 ```
 
-`{ key: value, 'quoted-key': value }` is an object literal. It can be used in any expression, for
-example `:class="{ active: item.selected }"`.
+An expression is a path into the props (`a.b[0].c`, `rows[i].name`), a string, number or boolean,
+a function call, or an object `{ key: value }`. There are no operators such as `!`, `==` or `+`, yet.
 
-- The value of `:style` is an object literal, a dict from props, a string of CSS declarations
-  (which is what a plain `style` attribute is) or a list of these. Several `style` and `:style`
-  attributes are merged, and the last declaration of a property wins.
-- `backgroundColor` and `background_color` are read as `background-color`, so a `#[derive(Props)]`
-  struct can be used as a style. Custom properties (`--gap`) are passed unchanged.
-- Values are written as they are: numbers get no unit, so use `'10px'` or a function that formats
-  the number. A `null` or `false` value leaves the property out.
-- A style is re-evaluated only when a prop it reads changes, and is applied in the same frame:
-  `BevueSystems` run before `bevy-flair`'s `StyleSystems`.
-- `bevy-flair` only applies inline styles to nodes that have a stylesheet. A template that uses
-  `style` attributes and has neither a `<style>` block nor an ancestor with a stylesheet gets an
-  empty one.
-- If a style is not valid CSS, `bevy-flair` logs the error and, in that frame, stops reading the
-  other styles that changed. Those are applied the next time they change.
-
-# Functions and events
-
-Functions are Bevy systems taking `In<BevueCtx>`. They can be called anywhere in a template; calls
-in bindings re-run only when the props their arguments read change.
-
-```rust
-fn add_user(In(ctx): In<BevueCtx>, mut props: Query<&mut BevueProps>) {
-    props.get_mut(ctx.root).unwrap().get_mut("users").unwrap().push("new");
-}
-
-app.register_bevue_function("add_user", add_user); // global
-Template::new(handle).with_function("add_user", add_user); // only for this template
-```
-
-`ctx.args` holds the call arguments as `Value`s. `ctx.get_args()` converts them to Rust types: a
-single type reads the first argument and a tuple reads one argument per element.
-
-```rust
-fn rename_user(In(ctx): In<BevueCtx>, mut props: Query<&mut BevueProps>) {
-    let Ok((index, name)) = ctx.get_args::<(usize, String)>() else { return };
-    // ...
-}
-```
+## Conditions and lists
 
 ```html
-<button @click="add_user()">Add</button>
-<li v-for="user in users" @click="$emit('select', user.id)">{{ user.name }}</li>
-<p @click>Observed from Bevy</p>
-```
+<p v-if="menu.answered">Thank you for your answer!</p>
+<p v-else-if="menu.skipped">Maybe later.</p>
+<div v-else>
+    <button v-for="option in menu.options">{{ option }}</button>
+</div>
 
-Bevue adds `Interaction` to nodes that listen to `click`, `mouseover` or `mouseleave`, and triggers
-a `BevueEvent { entity, name, args }` for them. Trigger your own with
-`commands.trigger(BevueEvent { .. })`, and observe any of them with `On<BevueEvent>`. Handlers can
-read `$event` (the first event argument) and `$args` (all of them). `$emit(name, ...args)` triggers
-an event on the template root.
-
-# Components
-
-Import a template file and use it as an element:
-
-```html
-<!-- inventory.html -->
-<import src="item_row.html"/>
-
-<template>
-    <ul>
-        <ItemRow v-for="(item, i) in inventory.items" :item="item" @remove="remove_item(i)"/>
-    </ul>
-</template>
-
-<!-- item_row.html -->
-<li class="item">
-    <p>{{ item.id }}</p>
-    <button @click="$emit('remove')">X</button>
+<li v-for="(item, i) in inventory.items" :key="item.id">
+    {{ i }}: {{ item.count }}
 </li>
 ```
 
-`<import>` sits at the top level of the file, next to `<props>`, `<template>` and `<style>`.
+With `:key`, the entities of a list follow their items when the list is reordered, instead of
+being rewritten in place. `v-if` and `v-for` cannot be on the same element; wrap one in the other.
 
-- The component is named after its file in PascalCase: `item_row.html` and `ui/item-row.html` are
-  both `ItemRow`. Give it another name with `<import src="item_row.html" as="Row"/>`.
-- A `src` starting with `./` or `../` is relative to the importing file. Any other path starts at
-  the asset root, like the paths given to the asset server.
-- An import is only visible in the file that declares it: a component uses its own imports, not
-  those of the template it is used in.
-- `app.register_component("ItemRow", "item_row.html")` makes a component available to every
-  template without an import. An import of the same name comes first.
-- A template is rendered once the components it uses are loaded. A component that fails to load
-  leaves an empty node.
-- For a template parsed in code, call `template.load_imports(&asset_server)` to load its
-  `<import>`s, or add one with `template.with_import("ItemRow", handle)`.
+## Functions
 
-Using a component:
-
-- Attributes are the component's props: `:item="expr"` is evaluated in the template using the
-  component, `title="text"` is a string and a bare `open` is `true`. A `-` in a name becomes `_`
-  (`:item-count` is read as `item_count`).
-- `class`, `:class`, `style`, `:style`, `v-if`, `v-else-if`, `v-else`, `v-for` and `:key` apply to the root element of
-  the component, which takes the place of the component element.
-- `$emit(name, ...args)` inside a component triggers the event on the component's root element,
-  where the `@name` listener of the component element handles it.
-
-Components are expanded when the template using them is compiled: `{{ item.id }}` above becomes the
-same binding as if the `<li>` was written inside `inventory.html`. A component has no entity,
-component or props of its own, so splitting a template into components costs nothing at runtime.
-This also means that:
-
-- An identifier that is not an attribute reads the props of the template the component is used in
-  (but not its `v-for` aliases). The `<props>` declared by a component file are mounted on that
-  template's entity.
-- The `<style>` of a component is added to the stylesheet of the template, it is not scoped.
-- An attribute expression is evaluated wherever the component uses it.
-- A component cannot contain itself, and cannot have children (there are no slots yet).
-- A template or component cannot have a component as its root element.
-
-A template is rendered again when the file of a component it uses is loaded or changed.
-
-# Debugging performance
-
-Bevue logs how long its work took at the `debug` level. Enable it with Bevy's log filter:
+A function is a Bevy system that takes `In<BevueCtx>`. It can have any other system parameter and
+can return a value:
 
 ```rust
-DefaultPlugins.set(LogPlugin { filter: "wgpu=error,naga=warn,bevue=debug".into(), ..Default::default() })
+fn format_name(In(ctx): In<BevueCtx>, names: Res<ItemNames>) -> String {
+    let id: u32 = ctx.get_args().unwrap();
+    names.get(id).to_owned()
+}
+
+fn remove_item(In(ctx): In<BevueCtx>, mut inventory: ResMut<Inventory>) {
+    let Ok((index, _reason)) = ctx.get_args::<(usize, Option<String>)>() else { return };
+    inventory.items.remove(index);
+}
+
+app.register_bevue_function("format_name", format_name);                  // every template
+Template::new(handle).with_function("remove_item", remove_item);          // this template only
 ```
 
-```text
-DEBUG bevue::runtime::props: synced simple::Counter into 1 template(s), 1 changed, in 4.1µs
-DEBUG bevue::runtime::render: rendered simple.html on 12v0: 4 bindings, 2 blocks, 0 list items, in 310µs
-DEBUG bevue::runtime::render: updated template on 12v0: 2 bindings, 1 lists in 95µs
+```html
+<p>{{ format_name(item.id) }}</p>
+<p v-if="is_empty(inventory.items)">Nothing here.</p>
+<li v-for="item in sorted(inventory.items)">{{ item.id }}</li>
 ```
 
-- `synced` is the cost of diffing a `Props` component or resource into `BevueProps`. It is logged
-  when the diff found a change; syncs that found nothing are logged at the `trace` level.
-- `rendered` is a full render: the first one, or a re-render after the template asset changed.
-- `updated` is an incremental update: the bindings re-evaluated and the lists reconciled.
+`ctx.get_args()` converts the arguments to Rust types: one type reads the first argument and a
+tuple reads one per element. `ctx.root` is the template entity and `ctx.entity` the node that made
+the call. A call in text, a condition or a list runs again only when the props passed to it
+change.
 
-`cargo bench --bench reactivity` measures the same phases for lists of 100 to 10 000 items.
+## Events
+
+```html
+<button @click="remove_item(i, 'clicked')">Remove</button>
+<div @mouseover="highlight(item.id)" @mouseleave="highlight()">...</div>
+```
+
+```rust
+fn answer(In(ctx): In<BevueCtx>, mut menus: Query<&mut Menu>) {
+    let option: String = ctx.get_args().unwrap();
+    info!("answered {option}");
+    menus.get_mut(ctx.root).unwrap().answered = true;
+}
+```
+
+`click`, `mouseover` and `mouseleave` are triggered by Bevue for the nodes that listen to them. A
+handler is a function call, and its changes to the props are on screen in the same frame.
+
+Every event is also a Bevy `BevueEvent`, so it can be observed from Rust. `$emit` triggers one of
+your own:
+
+```html
+<button @click="$emit('close', menu.user_name)">Close</button>
+```
+
+```rust
+app.add_observer(|event: On<BevueEvent>| {
+    if event.name == "close" {
+        info!("closed by {:?}", event.args);
+    }
+});
+```
+
+## Styles
+
+Styling is CSS, applied by [bevy-flair](https://github.com/eckz/bevy_flair). Write it in the
+template, load it from a file in the assets folder, or both:
+
+```html
+<style>
+.menu { flex-direction: column; row-gap: 20px; }
+.option:hover { background-color: #444; }
+</style>
+```
+
+```html
+<style src="ui/menu.css"></style>
+```
+
+```html
+<style src="ui/menu.css">
+.option:hover { background-color: #444; }
+</style>
+```
+
+A template has a single `<style>` element.
+
+Classes can come from props. A string is a list of class names and an object turns each class on
+or off:
+
+```html
+<div class="option" :class="item.rarity"></div>
+<div class="option" :class="{ selected: item.selected, 'is-empty': item.empty }"></div>
+```
+
+`:style` sets individual properties from props, over whatever the stylesheet says:
+
+```html
+<p :style="{ color: item.color, 'font-size': '18px' }">{{ item.id }}</p>
+<div style="width: 200px" :style="theme.panel"></div>
+```
+
+A key can be written `backgroundColor`, `background_color` or `'background-color'`. Values are
+used as they are, so a length needs its unit (`'10px'`), and a `null` or `false` value leaves the
+property out.
+
+## Components
+
+A template file can be used as an element of another one. Import it, and pass it data through
+attributes:
+
+```html
+<!-- assets/inventory.html -->
+<import src="ui/item_slot.html"/>
+
+<template>
+    <div class="inventory">
+        <ItemSlot v-for="(item, i) in inventory.items" :item="item" @pickup="pickup_item(i)"/>
+    </div>
+</template>
+```
+
+```html
+<!-- assets/ui/item_slot.html -->
+<template>
+    <div class="slot">
+        <p>{{ item.count }}</p>
+        <button @click="$emit('pickup')">Take</button>
+    </div>
+</template>
+
+<style>
+.slot { padding: 5px; background-color: #333; }
+</style>
+```
+
+- The element is named after the file in PascalCase (`item_slot.html` is `ItemSlot`), or by
+  `<import src="..." as="Slot"/>`. A `src` starting with `./` or `../` is relative to the importing
+  file.
+- `:item="expr"` passes a value, `title="text"` a string. Inside the component they are read by
+  name, with `-` as `_`.
+- `$emit('pickup')` in the component reaches `@pickup` on its element.
+- `class`, `style`, `v-if`, `v-for` and `:key` on the element apply to the component's root.
+
+Components are inlined into the template that uses them, so splitting a template into components
+costs nothing at runtime. In exchange, a component cannot contain itself or have children (there
+are no slots yet), its `<style>` is not scoped to it, and it can read the props of the template it
+is used in.
+
+## Bevy compatibility
+
+| bevy | bevue         |
+|------|---------------|
+| 0.19 | 0.1           |

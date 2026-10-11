@@ -1,0 +1,27 @@
+<props>
+  <component name="menu" type="Menu"/>
+</props>
+<template>
+  <div class="column">
+    <p>Hello, {{ menu.user_name }}! How are you?</p>
+
+    <div v-if="menu.answered">
+      <p>Thank you for your answer!</p>
+    </div>
+    <div v-else class="column">
+      <button class="button" v-for="msg in menu.options" @click="answer(msg)">{{ msg }}</button>
+    </div>
+  </div>
+</template>
+<style>
+* {
+    color: white;
+}
+.column {
+    flex-direction: column;
+    row-gap: 20px;
+}
+.button:hover {
+    color: gray;
+}
+</style>
