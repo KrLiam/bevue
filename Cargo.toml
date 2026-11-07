@@ -15,14 +15,18 @@ members = ["crates/bevue_macros"]
 [dependencies]
 bevue_macros = { path = "crates/bevue_macros", version = "0.2.0-dev" }
 bevy = { version = "0.19", default-features = false, features = [
-    "ui",
-    "file_watcher",
+    "ui_api",
+    "bevy_ui_render",
 ]}
 bevy_flair = { version = "0.8.1" }
 tl = "^0.7.8"
 winnow = "^1.0.3"
 
 [dev-dependencies]
+bevy = { version = "0.19", default-features = false, features = [
+    "ui",
+    "file_watcher",
+]}
 criterion = "0.8"
 
 [[bench]]
