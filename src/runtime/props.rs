@@ -8,7 +8,7 @@ use bevy::{
         change_detection::{DetectChanges, DetectChangesMut, Mut, Ref},
         component::{Component, ComponentId},
         entity::Entity,
-        query::With,
+        query::{Changed, QueryState, With},
         resource::{IsResource, Resource},
         schedule::IntoScheduleConfigs,
         system::Query,
@@ -256,6 +256,8 @@ pub struct PropsRegistration {
     pub read: for<'w> fn(EntityRef<'w>) -> Option<&'w dyn Props>,
     /// Reads the component of an entity of a query.
     pub read_filtered: for<'w, 's> fn(&FilteredEntityRef<'w, 's>) -> Option<&'w dyn Props>,
+    /// Creates a query finding the entities whose component changed.
+    pub changed_query: fn(&mut World) -> Box<dyn ChangedEntities>,
     mount: fn(&mut World, Entity, PropsSourceKind, PropPath) -> bool,
     unmount: fn(&mut World, Entity, PropsSourceKind),
     resync: fn(&mut World, Entity),
@@ -277,6 +279,24 @@ fn read_component<T: Component + Props>(entity: EntityRef<'_>) -> Option<&dyn Pr
     entity.get::<T>().map(|data| data as &dyn Props)
 }
 
+/// Finds the entities whose component changed since the running system last ran, by scanning
+/// change ticks the way Bevy's `Changed` filter does: a dense pass over each table's tick column.
+pub trait ChangedEntities: Send + Sync {
+    /// Appends the entities whose component changed (or was added) to `out`. Inside an exclusive
+    /// system, "since" is that system's previous run.
+    fn changed(&mut self, world: &World, out: &mut Vec<Entity>);
+}
+
+impl<T: Component> ChangedEntities for QueryState<Entity, Changed<T>> {
+    fn changed(&mut self, world: &World, out: &mut Vec<Entity>) {
+        out.extend(self.iter(world));
+    }
+}
+
+fn changed_query<T: Component>(world: &mut World) -> Box<dyn ChangedEntities> {
+    Box::new(QueryState::<Entity, Changed<T>>::new(world))
+}
+
 fn read_filtered_component<'w, T: Component + Props>(entity: &FilteredEntityRef<'w, '_>) -> Option<&'w dyn Props> {
     entity.get::<T>().map(|data| data as &dyn Props)
 }
@@ -290,6 +310,7 @@ impl PropsTypeRegistry {
             component_id,
             read: read_component::<T>,
             read_filtered: read_filtered_component::<T>,
+            changed_query: changed_query::<T>,
             mount: mount_props::<T>,
             unmount: unmount_props::<T>,
             resync: resync_props::<T>,

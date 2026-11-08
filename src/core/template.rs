@@ -510,8 +510,9 @@ pub struct QueryDeclaration {
     pub with: Vec<Cow<'static, str>>,
     /// Components the entities must not have, by type path.
     pub without: Vec<Cow<'static, str>>,
-    /// How the rows are sorted. Rows with equal keys, and all rows without keys, keep the order
-    /// in which their entities started matching.
+    /// How the rows are sorted. Without keys, rows keep the order in which their entities started
+    /// matching. Rows with equal keys keep their relative order, and a row whose keys change moves
+    /// after the rows equal to it.
     pub order_by: Vec<SortKey>,
 }
 

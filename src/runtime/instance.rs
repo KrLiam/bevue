@@ -357,6 +357,8 @@ struct Item {
     block: BlockId,
     index: usize,
     key: ItemKey,
+    /// The [element id](Value::element_id) of the element the item last rendered.
+    elem_id: u32,
     entity: Entity,
     trie: DepTrie,
     index_bindings: Vec<BindingId>,
@@ -900,25 +902,63 @@ impl TemplateInstance {
             None => Frame::new(&elements[index], index),
         };
 
-        let keys: Vec<ItemKey> = match &list.key {
+        // Unchanged elements can be matched to their items by element id when their key depends on
+        // them alone: the key cannot have changed. Keys read through entities can, so those lists
+        // always evaluate every key.
+        let binding_reads_entities =
+            binding.and_then(|b| self.bindings.get(b)).is_some_and(|b| !b.entity_reads.is_empty());
+        let by_element = list.key.is_some() && !force && list.element_key && base.is_some() && !binding_reads_entities;
+        let Some(Block::For(block)) = self.blocks.get(block_id) else { return };
+        let mut reused: Vec<Option<ItemId>> = vec![None; elements.len()];
+        let mut used = vec![false; block.items.len()];
+        if by_element {
+            match_by_element_id(elements, &block.items, &self.items, &mut reused, &mut used);
+        }
+
+        // Evaluate the keys of the elements not matched yet.
+        let keys: Vec<Option<ItemKey>> = match &list.key {
             Some(key) => (0..elements.len())
                 .map(|index| {
+                    if reused[index].is_some() {
+                        return None;
+                    }
                     item_frames.push(element_frame(index));
                     let key = ItemKey::of(&eval(key, &mut EvalCtx::new(&item_frames, props, &mut call)));
                     item_frames.pop();
-                    key
+                    Some(key)
                 })
                 .collect(),
             None => Vec::new(),
         };
-        let reads = call.into_reads();
+        let mut reads = call.into_reads();
         if let Some(binding) = binding {
+            // Not every key was evaluated, so the reads add to the previous ones.
+            if by_element && let Some(previous) = self.bindings.get(binding) {
+                reads.extend_from_slice(&previous.entity_reads);
+            }
             self.set_entity_reads(world, binding, reads);
         }
         let keyed = list.key.is_some();
 
         let Some(Block::For(block)) = self.blocks.get(block_id) else { return };
-        let (reused, removed): (Vec<Option<ItemId>>, Vec<ItemId>) = if keyed {
+        let (reused, removed): (Vec<Option<ItemId>>, Vec<ItemId>) = if by_element {
+            // The remaining elements are matched by key against the remaining items.
+            let mut by_key: HashMap<&ItemKey, Vec<usize>> = HashMap::default();
+            for (position, item_id) in block.items.iter().enumerate().rev() {
+                if !used[position] {
+                    by_key.entry(&self.items.get(*item_id).unwrap().key).or_default().push(position);
+                }
+            }
+            for (index, key) in keys.iter().enumerate() {
+                let Some(key) = key else { continue };
+                if let Some(position) = by_key.get_mut(key).and_then(Vec::pop) {
+                    used[position] = true;
+                    reused[index] = Some(block.items[position]);
+                }
+            }
+            let removed = block.items.iter().zip(&used).filter(|(_, used)| !**used).map(|(id, _)| *id).collect();
+            (reused, removed)
+        } else if keyed {
             // Items are matched by key, in order among items with the same key.
             let mut by_key: HashMap<&ItemKey, ItemId> = HashMap::with_capacity(block.items.len());
             let mut duplicates: Vec<(&ItemKey, ItemId)> = Vec::new();
@@ -933,6 +973,7 @@ impl TemplateInstance {
             let reused = keys
                 .iter()
                 .map(|key| {
+                    let key = key.as_ref().unwrap();
                     by_key.remove(key).or_else(|| {
                         let index = duplicates.iter().position(|(k, _)| *k == key)?;
                         Some(duplicates.remove(index).1)
@@ -958,10 +999,19 @@ impl TemplateInstance {
         let mut keys = keys.into_iter();
         let mut new_items = Vec::with_capacity(reused.len());
         for (index, reused) in reused.into_iter().enumerate() {
-            let key = if keyed { keys.next().unwrap() } else { ItemKey::Position(index) };
+            let key = if keyed { keys.next().unwrap() } else { Some(ItemKey::Position(index)) };
+            let elem_id = elements[index].element_id();
             match reused {
                 Some(item_id) => {
                     let item = self.items.get_mut(item_id).unwrap();
+                    // A key that does not depend on the element alone (`:key="i"`), or a duplicate
+                    // key, can match the item to another element than the one it rendered.
+                    let other_element = item.elem_id != elem_id || (elem_id == 0 && !list.element_key);
+                    item.elem_id = elem_id;
+                    if other_element && keyed && !force {
+                        fire_all(&item.trie, pending);
+                        pending.fired.extend(item.index_bindings.iter().copied());
+                    }
                     if item.index != index {
                         item.index = index;
                         pending.fired.extend(item.index_bindings.iter().copied());
@@ -978,7 +1028,8 @@ impl TemplateInstance {
                     let item_id = self.items.insert(Item {
                         block: block_id,
                         index,
-                        key,
+                        key: key.expect("unmatched elements have their key evaluated"),
+                        elem_id,
                         entity: Entity::PLACEHOLDER,
                         trie: DepTrie::default(),
                         index_bindings: Vec::new(),
@@ -1363,10 +1414,22 @@ impl TemplateInstance {
         }
         if current.len() == children.len() {
             // The same children in another order: every rendered child is already a child of
-            // `parent`, as spawned items and branches are, so sorting is enough.
-            let positions: EntityHashMap<usize> = children.iter().enumerate().map(|(i, e)| (*e, i)).collect();
+            // `parent`, as spawned items and branches are, so reordering is enough. Only the window
+            // between the first and last difference moves, e.g. the range a list item moved across.
+            let start = current.iter().zip(&children).position(|(a, b)| a != b).unwrap_or(0);
+            let end = current.len() - current.iter().rev().zip(children.iter().rev()).position(|(a, b)| a != b).unwrap_or(0);
+            let mut positions: EntityHashMap<usize> = current[start..end].iter().enumerate().map(|(i, e)| (*e, start + i)).collect();
             if let Some(mut current) = parent.get_mut::<Children>() {
-                current.sort_by_key(|e| positions.get(e).copied().unwrap_or(usize::MAX));
+                for (target, entity) in children.iter().enumerate().take(end).skip(start) {
+                    let Some(&position) = positions.get(entity) else { continue };
+                    if position != target {
+                        // The child at `target` goes where `entity` was.
+                        let displaced = current[target];
+                        current.swap(target, position);
+                        positions.insert(displaced, position);
+                        positions.insert(*entity, target);
+                    }
+                }
             }
         } else {
             parent.replace_children(&children);
@@ -1433,6 +1496,41 @@ fn walk(trie: &DepTrie, value: &Value, need_real: bool, pending: &mut Pending) -
             .extend(trie.bindings.iter().filter(|(_, mode)| *mode == DepMode::Deep).map(|(id, _)| *id));
     }
     real
+}
+
+/// Matches the unchanged elements of a list to the items that rendered them by element id, marking
+/// `reused[index]` and `used[item position]`. Elements usually keep their order, so the item after
+/// the last match (or a few further, past removed or moved items) is tried first; the id map is
+/// only built if that fails.
+fn match_by_element_id(
+    elements: &[Value],
+    old: &[ItemId],
+    items: &Arena<Item>,
+    reused: &mut [Option<ItemId>],
+    used: &mut [bool],
+) {
+    const LOOK_AHEAD: usize = 16;
+    let elem_id = |position: usize| items.get(old[position]).map_or(0, |item| item.elem_id);
+    let mut cursor = 0;
+    let mut by_id: Option<HashMap<u32, usize>> = None;
+    for (index, element) in elements.iter().enumerate() {
+        let id = element.element_id();
+        if id == 0 || element.is_dirty() {
+            continue;
+        }
+        while cursor < old.len() && used[cursor] {
+            cursor += 1;
+        }
+        let near = (cursor..(cursor + LOOK_AHEAD).min(old.len())).find(|&p| !used[p] && elem_id(p) == id);
+        let position = near.or_else(|| {
+            let by_id = by_id.get_or_insert_with(|| (0..old.len()).map(|p| (elem_id(p), p)).collect());
+            by_id.get(&id).copied().filter(|p| !used[*p])
+        });
+        if let Some(position) = position {
+            used[position] = true;
+            reused[index] = Some(old[position]);
+        }
+    }
 }
 
 /// Returns true if a value was replaced or a shape changed at or below `value`.

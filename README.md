@@ -164,8 +164,9 @@ components in `data`:
   it match too, with `null` in its place.
 - `with` / `without`: components the entities must have or not have. A marker is registered like
   any other type: `#[derive(Component, Props)] struct Enemy;`.
-- `order-by`: paths into the rows, each `asc` (the default) or `desc`. Without it, and between
-  equal keys, rows keep the order in which their entities started matching.
+- `order-by`: paths into the rows, each `asc` (the default) or `desc`. Without it, rows keep the
+  order in which their entities started matching. Rows with equal keys keep their relative order,
+  and a row whose keys change moves after the rows equal to it.
 
 All types must be registered with `register_props`. Each frame, only the components of matching
 entities whose change tick moved are compared into their row, and entities that start or stop

@@ -249,6 +249,9 @@ pub struct CompiledList {
     /// The path of an iterable that is a prop path without dynamic indices, from which changes of
     /// single elements are routed to the items rendering them.
     pub route: Option<Dep>,
+    /// Whether the key reads only the element, without calls: then an element that did not change
+    /// still has the key it had, and lists can match it to its item without evaluating it.
+    pub element_key: bool,
 }
 
 /// What an event listener does.
@@ -373,6 +376,10 @@ impl CompiledNode {
             let is_static_path = matches!(&list.iterable, CompiledExpr::Path { root, segments }
                 if !matches!(root, ScopeRef::Index(_)) && segments.iter().all(|s| matches!(s, CompiledSegment::Static(_))));
             list.route = if is_static_path { list.deps.last().cloned() } else { None };
+            let level = list.level;
+            list.element_key = list.key.as_ref().is_some_and(|key| {
+                !key.has_calls() && deps_of([key]).iter().all(|dep| dep.root == ScopeRef::Item(level))
+            });
         }
     }
 
@@ -739,7 +746,7 @@ impl<'a> Compiler<'a> {
                 let result = key.and_then(|key| {
                     let target = self.compile_child(child_id, out)?;
                     out.nodes[*target].list =
-                        Some(CompiledList { iterable, key, level, deps: Arc::default(), route: None });
+                        Some(CompiledList { iterable, key, level, deps: Arc::default(), route: None, element_key: false });
                     Ok(target)
                 });
                 self.scopes.pop();

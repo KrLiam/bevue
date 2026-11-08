@@ -14,7 +14,11 @@
 //! as [`ChangeFlags::SELF`]; prefer the typed mutators ([`Value::set`], [`Value::get_mut`],
 //! [`Value::push`], [`Value::insert`], ...) which mark only what actually changed.
 
-use std::{fmt, ops::DerefMut};
+use std::{
+    fmt,
+    ops::DerefMut,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 use bevy::{ecs::entity::Entity, platform::collections::HashMap};
 
@@ -82,14 +86,28 @@ pub struct Value {
     t: ValueType,
     /// How this node changed since the last [`Value::clear_changes`].
     flags: ChangeFlags,
+    /// Identifies a list element across moves, so lists can match elements to what rendered them
+    /// without re-reading them. `0` for values that were never put in a list. Stored in what would
+    /// otherwise be padding.
+    id: u32,
+}
+
+/// The next element id. Ids wrap after 2³² elements were created, which could only confuse two
+/// elements of one list if both lived through all of those insertions.
+static NEXT_ID: AtomicU32 = AtomicU32::new(1);
+
+/// Reserves `count` consecutive element ids, returning the first. Callers skip `0`.
+fn reserve_ids(count: u32) -> u32 {
+    NEXT_ID.fetch_add(count, Ordering::Relaxed).max(1)
 }
 
 impl Clone for Value {
-    /// Clones the data. The clone starts with no change flags.
+    /// Clones the data, keeping element ids. The clone starts with no change flags.
     fn clone(&self) -> Self {
         Self {
             t: self.t.clone(),
             flags: ChangeFlags::NONE,
+            id: self.id,
         }
     }
 }
@@ -123,13 +141,20 @@ impl DerefMut for Value {
 
 impl Value {
     /// The null value.
-    pub const NULL: Value = Value { t: ValueType::Null, flags: ChangeFlags::NONE };
+    pub const NULL: Value = Value { t: ValueType::Null, flags: ChangeFlags::NONE, id: 0 };
 
     fn new(t: ValueType) -> Self {
         Self {
             t,
             flags: ChangeFlags::NONE,
+            id: 0,
         }
+    }
+
+    /// The id of this list element: it follows the element when the list is reordered, and a new
+    /// element gets a new one. `0` if the value was never put in a list.
+    pub fn element_id(&self) -> u32 {
+        self.id
     }
 
     /// Creates a null value.
@@ -152,8 +177,16 @@ impl Value {
     pub fn entity(value: Entity) -> Self {
         Self::new(ValueType::Entity(value))
     }
-    /// Creates a list value.
-    pub fn list(value: Vec<Value>) -> Self {
+    /// Creates a list value. Elements without an [element id](Value::element_id) get one.
+    pub fn list(mut value: Vec<Value>) -> Self {
+        let missing = value.iter().filter(|v| v.id == 0).count() as u32;
+        if missing > 0 {
+            let mut next = reserve_ids(missing);
+            for element in value.iter_mut().filter(|v| v.id == 0) {
+                element.id = next;
+                next = next.wrapping_add(1).max(1);
+            }
+        }
         Self::new(ValueType::List(value))
     }
     /// Creates an dict value.
@@ -405,7 +438,7 @@ impl Value {
                 self.flags.insert(ChangeFlags::SHAPE | ChangeFlags::SUBTREE);
             }
         }
-        let Value { t, flags } = self;
+        let Value { t, flags, .. } = self;
         let child = match (segment, t) {
             (PathSegment::Key(key), ValueType::Dict(map)) => map.get_mut(key.as_ref()).unwrap(),
             (PathSegment::Key(key), ValueType::Struct(s)) => s.get_mut(key).unwrap(),
@@ -578,6 +611,37 @@ impl Value {
         }
     }
 
+    /// Moves the list element at `from` to index `to`, shifting the elements in between, and
+    /// changing the list's shape if they differ. Panics if either index is out of bounds.
+    pub fn move_element(&mut self, from: usize, to: usize) {
+        let ValueType::List(list) = &mut self.t else { return };
+        if from == to {
+            return;
+        }
+        if from < to {
+            list[from..=to].rotate_left(1);
+        } else {
+            list[to..=from].rotate_right(1);
+        }
+        self.flags.insert(ChangeFlags::SHAPE);
+    }
+
+    /// Keeps the list elements for which `keep(index, element)` is true, changing the list's shape
+    /// if any is removed.
+    pub fn retain(&mut self, mut keep: impl FnMut(usize, &Value) -> bool) {
+        let ValueType::List(list) = &mut self.t else { return };
+        let len = list.len();
+        let mut index = 0;
+        list.retain(|element| {
+            let kept = keep(index, element);
+            index += 1;
+            kept
+        });
+        if list.len() != len {
+            self.flags.insert(ChangeFlags::SHAPE);
+        }
+    }
+
     /// Reorders this list so that element `i` is the element previously at `order[i]`, changing
     /// its shape if the order differs. `order` must be a permutation of the list's indices.
     pub fn permute(&mut self, order: &[usize]) {
@@ -635,11 +699,13 @@ impl Value {
         }
     }
 
-    /// Creates a value already marked as [`ChangeFlags::SELF`], used for new children.
+    /// Creates a value already marked as [`ChangeFlags::SELF`], used for new children. It gets a
+    /// new element id.
     fn changed(t: ValueType) -> Self {
         Self {
             t,
             flags: ChangeFlags::SELF,
+            id: reserve_ids(1),
         }
     }
 
@@ -1295,6 +1361,37 @@ mod tests {
         assert!(!d.set(point(1, 2)));
         assert!(d.as_struct().is_some());
         assert!(!d.is_dirty());
+    }
+
+    #[test]
+    fn element_ids() {
+        let mut list = value!([1, 2, 3]);
+        let ids: Vec<u32> = list.as_list().unwrap().iter().map(Value::element_id).collect();
+        assert!(ids.iter().all(|id| *id != 0));
+        assert_eq!(ids.iter().collect::<std::collections::HashSet<_>>().len(), 3);
+
+        // Ids follow elements when the list is reordered, and are kept by clones.
+        list.permute(&[2, 0, 1]);
+        let moved: Vec<u32> = list.as_list().unwrap().iter().map(Value::element_id).collect();
+        assert_eq!(moved, vec![ids[2], ids[0], ids[1]]);
+        assert_eq!(list.clone().as_list().unwrap()[0].element_id(), ids[2]);
+
+        // New elements get new ids, also when re-inserting a removed element.
+        let removed = list.remove_at(0).unwrap();
+        list.insert_at(1, removed);
+        list.push(4);
+        let after: Vec<u32> = list.as_list().unwrap().iter().map(Value::element_id).collect();
+        assert_eq!(after[0], ids[0]);
+        assert!(!ids.contains(&after[1]) && !ids.contains(&after[3]));
+
+        // Ids are not data.
+        assert_eq!(list, value!([1, 3, 2, 4]));
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn element_ids_take_no_space() {
+        assert_eq!(std::mem::size_of::<Value>(), std::mem::size_of::<(ValueType, u64)>());
     }
 
     #[test]

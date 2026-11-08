@@ -831,11 +831,18 @@ fn duplicate_keys_reuse_items_in_order() {
     );
     let initial = children(app.world(), root);
 
-    // Duplicate keys are matched in order: the first item with key 1 is reused for the first
-    // element with that key, and the second one is dropped.
+    // Items follow the elements they render, even with duplicate keys: removing the first element
+    // drops its item, and the item of the second keeps showing it.
     props(&mut app, root).get_mut("xs").unwrap().remove_at(0);
     app.update();
-    assert_eq!(children(app.world(), root), vec![initial[0], initial[2]]);
+    assert_eq!(children(app.world(), root), vec![initial[1], initial[2]]);
+    assert_eq!(texts(app.world(), root), vec!["1b", "2c"]);
+
+    // New elements with a duplicate key take the remaining items with that key in order.
+    props(&mut app, root).get_mut("xs").unwrap().set(value!([{ "k": 2, "v": "x" }, { "k": 1, "v": "y" }]));
+    app.update();
+    assert_eq!(children(app.world(), root), vec![initial[2], initial[1]]);
+    assert_eq!(texts(app.world(), root), vec!["2x", "1y"]);
 }
 
 #[test]
@@ -1582,6 +1589,66 @@ mod update_stats {
         world.get_mut::<BevueProps>(root).unwrap().value = value;
         *world.get_mut::<TemplateInstance>(root).unwrap() = instance;
         stats
+    }
+
+    #[test]
+    fn keyed_lists_match_unchanged_elements_without_rerendering() {
+        let mut app = app();
+        let items: Vec<Value> = (0..20).map(|i| value!({ "id": i, "label": (format!("l{i}")) })).collect();
+        let root = spawn(
+            &mut app,
+            r#"<div><span v-for="(item, i) in items" :key="item.id">{{i}}{{item.label}}</span></div>"#,
+            value!({ "items": (Value::list(items)) }),
+        );
+        let initial = children(app.world(), root);
+        let label = |i: usize| format!("l{i}");
+
+        // Moving one element: only its item and the index bindings of the items in between fire.
+        let moved = {
+            let mut props = props(&mut app, root);
+            let items = props.get_mut("items").unwrap();
+            let element = items.remove_at(15).unwrap();
+            items.insert_at(2, element);
+            update(&mut app, root)
+        };
+        let mut expected: Vec<Entity> = initial.clone();
+        let entity = expected.remove(15);
+        expected.insert(2, entity);
+        assert_eq!(children(app.world(), root), expected);
+        // The moved item (index and label) plus the index texts of the 13 items it moved across.
+        assert_eq!(moved.fired, 1 + 13);
+        let texts = texts(app.world(), root);
+        assert_eq!(texts[2], format!("2{}", label(15)));
+        assert_eq!(texts[3], format!("3{}", label(2)));
+
+        // Reordering every element keeps every item with its element.
+        let order: Vec<usize> = (0..20).rev().collect();
+        props(&mut app, root).get_mut("items").unwrap().permute(&order);
+        update(&mut app, root);
+        let reversed: Vec<Entity> = expected.iter().rev().copied().collect();
+        assert_eq!(children(app.world(), root), reversed);
+
+        // A key changed in place gets a new item.
+        props(&mut app, root).at_mut(&path("items[0].id")).unwrap().set(99);
+        update(&mut app, root);
+        assert_ne!(children(app.world(), root)[0], reversed[0]);
+        assert_eq!(&children(app.world(), root)[1..], &reversed[1..]);
+    }
+
+    #[test]
+    fn keys_that_do_not_depend_on_the_element_alone_are_evaluated() {
+        let mut app = app();
+        // Keyed by position: removing the first element drops the last item.
+        let root = spawn(
+            &mut app,
+            r#"<div><span v-for="(x, i) in xs" :key="i">{{x}}</span></div>"#,
+            value!({ "xs": ["a", "b", "c"] }),
+        );
+        let initial = children(app.world(), root);
+        props(&mut app, root).get_mut("xs").unwrap().remove_at(0);
+        app.update();
+        assert_eq!(children(app.world(), root), initial[..2].to_vec());
+        assert_eq!(texts(app.world(), root), vec!["b", "c"]);
     }
 
     #[test]
@@ -2369,6 +2436,37 @@ mod queries {
     }
 
     #[test]
+    fn membership_changes_without_data_changes() {
+        let mut app = query_app();
+        enemy(&mut app, "ana", 5);
+        let friend = app.world_mut().spawn((Name::new("friend"), Health { current: 1, max: 1 })).id();
+        let root = spawn_query(&mut app, LIST);
+        // A few idle frames, so the next syncs take the fast pass.
+        app.update();
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["ana 5 "]);
+
+        // Only a marker changes: the entity's data components are untouched.
+        app.world_mut().entity_mut(friend).insert(Enemy);
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["ana 5 ", "friend 1 "]);
+        app.update();
+        app.world_mut().entity_mut(friend).insert(Dead);
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["ana 5 "]);
+        app.update();
+        app.world_mut().entity_mut(friend).remove::<Dead>();
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["ana 5 ", "friend 1 "]);
+
+        // Data changes after the membership settled are still picked up by the fast pass.
+        app.update();
+        app.world_mut().get_mut::<Health>(friend).unwrap().current = 0;
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["ana 5 ", "friend 0 "]);
+    }
+
+    #[test]
     fn rows_follow_order_by() {
         let mut app = query_app();
         let ana = enemy(&mut app, "ana", 5);
@@ -2425,6 +2523,79 @@ mod queries {
         let classes = |entity: Entity| app.world().get::<ClassList>(entity).map(|c| format!("{c:?}")).unwrap_or_default();
         let knight_row = children(app.world(), children(app.world(), root)[0])[1];
         assert!(classes(knight_row).contains("selected") && classes(knight_row).contains("low"));
+    }
+
+    #[test]
+    fn sorted_rows_stay_correct_under_random_changes() {
+        let mut app = query_app();
+        let mut seed = 0x2545F4914F6CDD1Du64;
+        let mut rand = move |bound: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % bound as u64) as u32
+        };
+        let mut units: Vec<Entity> = (0..40).map(|i| enemy(&mut app, &format!("u{i:02}"), rand(20))).collect();
+        let root = spawn_query(
+            &mut app,
+            r#"<props><query name="enemies" data="Name, Health" with="Enemy" without="Dead" order-by="health.current desc, name"/></props>
+            <div><p v-for="e in enemies" :key="e.entity">{{ e.name }} {{ e.health.current }}</p></div>"#,
+        );
+        let expected = |world: &World| {
+            let mut rows: Vec<(u32, String)> = Vec::new();
+            let mut query = world.try_query_filtered::<(&Name, &Health), (bevy::ecs::query::With<Enemy>, bevy::ecs::query::Without<Dead>)>().unwrap();
+            for (name, health) in query.iter(world) {
+                rows.push((health.current, name.to_string()));
+            }
+            rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            rows.into_iter().map(|(hp, name)| format!("{name} {hp}")).collect::<Vec<_>>()
+        };
+        let row_of = |app: &App, root: Entity, name: &str| {
+            let rows = children(app.world(), root);
+            rows.into_iter().find(|row| app.world().get::<Text>(*row).is_some_and(|t| t.0.starts_with(&format!("{name} "))))
+        };
+
+        for frame in 0..60 {
+            // One change most frames; sometimes a few, sometimes most rows.
+            let changes = match frame % 10 {
+                3 => 3,
+                7 => 30,
+                _ => 1,
+            };
+            let tracked = units[0];
+            let tracked_name = app.world().get::<Name>(tracked).map(|n| n.to_string());
+            let tracked_row = tracked_name.as_ref().and_then(|n| row_of(&app, root, n));
+            for _ in 0..changes {
+                let unit = units[rand(units.len() as u32) as usize];
+                if let Some(mut health) = app.world_mut().get_mut::<Health>(unit) {
+                    health.current = rand(20);
+                }
+            }
+            match frame % 6 {
+                1 => {
+                    let unit = units.remove(1 + rand(units.len() as u32 - 1) as usize);
+                    app.world_mut().entity_mut(unit).despawn();
+                }
+                2 => units.push(enemy(&mut app, &format!("n{frame:02}"), rand(20))),
+                4 => {
+                    let unit = units[rand(units.len() as u32) as usize];
+                    if app.world().get::<Dead>(unit).is_some() {
+                        app.world_mut().entity_mut(unit).remove::<Dead>();
+                    } else {
+                        app.world_mut().entity_mut(unit).insert(Dead);
+                    }
+                }
+                _ => {}
+            }
+            app.update();
+            assert_eq!(texts(app.world(), root), expected(app.world()), "frame {frame}");
+            // A unit that is still listed keeps its row entity when it moves.
+            if let (Some(name), Some(row)) = (tracked_name, tracked_row)
+                && let Some(now) = row_of(&app, root, &name)
+            {
+                assert_eq!(now, row, "frame {frame}: the row of {name} was respawned");
+            }
+        }
     }
 
     #[test]
