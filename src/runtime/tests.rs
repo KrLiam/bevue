@@ -143,8 +143,10 @@ fn class_binding() {
 }
 
 mod styles {
-    use bevy::{color::Color, ecs::change_detection::Tick, ui::BackgroundColor};
+    use bevy::{camera::visibility::Visibility, color::Color, ecs::change_detection::Tick, ui::BackgroundColor};
     use bevy_flair::prelude::{InlineStyle, Styled};
+
+    use crate::runtime::WaitingForStyleSheet;
 
     use super::*;
 
@@ -319,6 +321,70 @@ mod styles {
         // A template without style attributes is left without a stylesheet.
         let other = spawn(&mut app, r#"<div><p>x</p></div>"#, Value::empty_dict());
         assert!(!matches!(app.world().get::<Styled>(other), Some(Styled::StyleSheet(_))));
+    }
+
+    const STYLED: &str = r#"
+        <template><div><p class="box">x</p></div></template>
+        <style>.box { background-color: #00ff00; }</style>
+    "#;
+
+    fn waiting(world: &World, entity: Entity) -> bool {
+        world.get::<WaitingForStyleSheet>(entity).is_some()
+    }
+
+    fn visibility(world: &World, entity: Entity) -> Visibility {
+        *world.get::<Visibility>(entity).expect("expected a visibility")
+    }
+
+    /// A template is hidden until its stylesheet loads, so its nodes never show up unstyled.
+    #[test]
+    fn hidden_until_stylesheet_loads() {
+        let mut app = app();
+        let template = crate::parser::parse_template(STYLED).unwrap();
+        let handle = app.world_mut().resource_mut::<Assets<BevueTemplate>>().add(template);
+        let root = app.world_mut().spawn((Template::new(handle), Visibility::Visible)).id();
+        app.update();
+        let p = children(app.world(), root)[0];
+
+        assert!(waiting(app.world(), root));
+        assert_eq!(visibility(app.world(), root), Visibility::Hidden);
+
+        for _ in 0..500 {
+            if !waiting(app.world(), root) {
+                break;
+            }
+            // Still hidden while flair has not styled the nodes.
+            assert_eq!(visibility(app.world(), root), Visibility::Hidden);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            app.update();
+        }
+        assert!(!waiting(app.world(), root), "stylesheet never loaded");
+        // Shown with its previous visibility, and styled in the same frame.
+        assert_eq!(visibility(app.world(), root), Visibility::Visible);
+        assert_eq!(background(app.world(), p), Color::srgb(0.0, 1.0, 0.0));
+    }
+
+    /// A template spawned again after its previous instance was despawned reuses the loaded
+    /// stylesheet instead of loading it again, so it is styled and visible right away.
+    #[test]
+    fn stylesheet_kept_after_despawn() {
+        let mut app = app();
+        let template = crate::parser::parse_template(STYLED).unwrap();
+        let handle = app.world_mut().resource_mut::<Assets<BevueTemplate>>().add(template);
+
+        let first = app.world_mut().spawn(Template::new(handle.clone())).id();
+        app.update();
+        let p = children(app.world(), first)[0];
+        wait_for_background(&mut app, p, Color::srgb(0.0, 1.0, 0.0));
+        app.world_mut().entity_mut(first).despawn();
+        app.update();
+
+        let second = app.world_mut().spawn(Template::new(handle)).id();
+        app.update();
+        let p = children(app.world(), second)[0];
+        assert!(!waiting(app.world(), second));
+        assert_ne!(visibility(app.world(), second), Visibility::Hidden);
+        assert_eq!(background(app.world(), p), Color::srgb(0.0, 1.0, 0.0));
     }
 }
 

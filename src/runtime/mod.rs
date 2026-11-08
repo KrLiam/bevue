@@ -23,7 +23,7 @@ pub use props::{
 };
 pub use render::{
     apply_template_classes_and_styles, on_render_template, update_templates, watch_template_components, CompiledTemplates,
-    Template, TemplateRendered, WaitingForTemplate,
+    reveal_styled_templates, Template, TemplateRendered, WaitingForStyleSheet, WaitingForTemplate,
 };
 
 /// The systems of the Bevue runtime, run in this order in `PostUpdate`, before `bevy_flair`'s
@@ -36,7 +36,7 @@ pub enum BevueSystems {
     Render,
     /// Applies `BevueProps` changes to rendered templates.
     Update,
-    /// Attaches stylesheets.
+    /// Attaches stylesheets and shows templates whose stylesheet finished loading.
     Style,
 }
 
@@ -79,7 +79,9 @@ impl Plugin for BevueRuntimePlugin {
                     .chain()
                     .in_set(BevueSystems::Render),
                 update_templates.in_set(BevueSystems::Update),
-                apply_template_classes_and_styles.in_set(BevueSystems::Style),
+                (reveal_styled_templates, apply_template_classes_and_styles)
+                    .chain()
+                    .in_set(BevueSystems::Style),
             ),
         );
     }

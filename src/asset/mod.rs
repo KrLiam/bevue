@@ -1,6 +1,6 @@
 use bevy::{
     app::{App, Plugin},
-    asset::{io::Reader, AssetApp, AssetLoader, AssetPath, AssetServer, Assets, LoadContext},
+    asset::{io::Reader, AssetApp, AssetLoader, AssetPath, AssetServer, Assets, Handle, LoadContext},
     ecs::resource::Resource,
     platform::collections::HashMap,
     reflect::TypePath,
@@ -93,9 +93,13 @@ impl AssetLoader for BevueTemplateLoader {
 
 /// The stylesheets Bevue generated for rendered templates, by their path in Bevy's `embedded://`
 /// asset source (e.g. `bevue/inventory.html.css`).
+///
+/// Also keeps the handles of every stylesheet attached to a template alive, so a template that is
+/// despawned and spawned again finds its stylesheet loaded instead of loading it from scratch.
 #[derive(Resource, Default, Debug)]
 pub struct BevueStylesheets {
     sheets: HashMap<PathBuf, String>,
+    handles: HashMap<String, Handle<StyleSheet>>,
 }
 
 impl BevueStylesheets {
@@ -114,6 +118,11 @@ impl BevueStylesheets {
         }
         self.sheets.insert(path.to_owned(), css.to_owned());
         true
+    }
+
+    /// The handle of the stylesheet at asset path `path`, loading it the first time.
+    pub(crate) fn load(&mut self, asset_server: &AssetServer, path: String) -> Handle<StyleSheet> {
+        self.handles.entry(path).or_insert_with_key(|path| asset_server.load(path.clone())).clone()
     }
 }
 

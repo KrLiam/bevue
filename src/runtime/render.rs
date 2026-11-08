@@ -20,6 +20,7 @@ use bevy::{
     log::{debug, error, warn},
     platform::{collections::HashMap, time::Instant},
 };
+use bevy::camera::visibility::Visibility;
 use bevy_flair::prelude::{Styled, StyleSheet};
 
 use crate::asset::BevueStylesheets;
@@ -185,6 +186,37 @@ pub struct TemplateRendered(pub AssetId<BevueTemplate>);
 
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WaitingForTemplate;
+
+/// A rendered template whose stylesheet is still loading. Its root is hidden meanwhile, so its
+/// nodes are not shown without their styles, and gets `previous` back once the stylesheet loads.
+#[derive(Component, Debug, Clone)]
+pub struct WaitingForStyleSheet {
+    pub handle: Handle<StyleSheet>,
+    pub previous: Visibility,
+}
+
+/// Whether `handle` and all of its `@import`s finished loading, successfully or not.
+fn stylesheet_ready(asset_server: &AssetServer, handle: &Handle<StyleSheet>) -> bool {
+    if !asset_server.is_managed(handle) {
+        return true;
+    }
+    let state = asset_server.recursive_dependency_load_state(handle);
+    state.is_loaded() || state.is_failed()
+}
+
+/// Shows templates hidden by [`WaitingForStyleSheet`] once their stylesheet is ready. Runs before
+/// `bevy_flair`, so they are styled in the frame they become visible.
+pub fn reveal_styled_templates(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    waiting: Query<(Entity, &WaitingForStyleSheet)>,
+) {
+    for (entity, waiting) in &waiting {
+        if stylesheet_ready(&asset_server, &waiting.handle) {
+            commands.entity(entity).insert(waiting.previous).remove::<WaitingForStyleSheet>();
+        }
+    }
+}
 
 #[derive(Event, Clone)]
 pub struct RenderTemplate {
@@ -459,6 +491,7 @@ pub fn apply_template_classes_and_styles(
     root_templates: Query<(&Template, &TemplateInstance)>,
     parents: Query<&ChildOf>,
     styled: Query<&Styled>,
+    visibility: Query<(Option<&Visibility>, Option<&WaitingForStyleSheet>)>,
 ) {
     for (entity, template_ref) in &template_nodes {
         if template_ref.root != entity {
@@ -484,7 +517,12 @@ pub fn apply_template_classes_and_styles(
                 let html_path_str = if let Some(p) = root_template.handle.path() {
                     p.path().to_string_lossy().to_string()
                 } else {
-                    format!("inline_{entity}")
+                    // Named after the asset, not the entity, so every instance of a template
+                    // shares one stylesheet.
+                    use std::hash::{BuildHasher, Hash, Hasher};
+                    let mut hasher = bevy::platform::hash::FixedState::default().build_hasher();
+                    root_template.handle.id().hash(&mut hasher);
+                    format!("inline_{:016x}", hasher.finish())
                 };
 
                 // Generated stylesheets live in Bevy's `embedded://` source, which can be written
@@ -514,8 +552,21 @@ pub fn apply_template_classes_and_styles(
         };
 
         if let Some(path) = style_path {
-            let style_handle: Handle<StyleSheet> = asset_server.load(path);
-            commands.entity(entity).insert(Styled::new(style_handle));
+            let style_handle = stylesheets.bypass_change_detection().load(&asset_server, path);
+            let mut root = commands.entity(entity);
+            // Hide the template until its stylesheet is ready, or its nodes show up unstyled.
+            if !stylesheet_ready(&asset_server, &style_handle) {
+                let (current, waiting) = visibility.get(entity).unwrap_or_default();
+                let previous = match waiting {
+                    Some(waiting) => waiting.previous,
+                    None => current.copied().unwrap_or_default(),
+                };
+                root.insert((
+                    WaitingForStyleSheet { handle: style_handle.clone(), previous },
+                    Visibility::Hidden,
+                ));
+            }
+            root.insert(Styled::new(style_handle));
         }
     }
 }
