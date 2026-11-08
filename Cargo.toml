@@ -22,6 +22,11 @@ bevy_flair = { version = "0.8.1" }
 tl = "^0.7.8"
 winnow = "^1.0.3"
 
+[features]
+# Times every `Props` and `<query>` sync and logs it (at `debug` when something changed, `trace`
+# otherwise). Off by default: the timing runs every frame.
+debug = []
+
 [dev-dependencies]
 bevy = { version = "0.19", default-features = false, features = [
     "ui",

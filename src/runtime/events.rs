@@ -4,6 +4,7 @@ use std::borrow::Cow;
 
 use bevy::{
     ecs::{
+        change_detection::DetectChangesMut,
         component::Component,
         entity::Entity,
         event::EntityEvent,
@@ -106,15 +107,16 @@ pub fn dispatch_bevue_event(world: &mut World, event: BevueEvent) {
     // Resolve the handler with the instance and props taken out, as nested calls may run here.
     let Some(instance) = world
         .get_mut::<TemplateInstance>(root)
-        .map(|mut instance| std::mem::take(&mut *instance))
+        .map(|mut instance| std::mem::take(instance.bypass_change_detection()))
     else {
         return;
     };
     let props = take_props(world, root);
     let resolved = instance.resolve_event(world, &props, event.entity, &event.name, &event.args);
     restore_props(world, root, props);
+    // Only renders mark the instance as changed.
     if let Some(mut slot) = world.get_mut::<TemplateInstance>(root) {
-        *slot = instance;
+        *slot.bypass_change_detection() = instance;
     }
 
     // Run the handlers with everything back in place, so they can freely mutate the template.

@@ -3,20 +3,24 @@
 use std::{marker::PhantomData, sync::Arc};
 
 use bevy::{
-    app::{App, PostUpdate},
+    app::App,
     ecs::{
         change_detection::{DetectChanges, DetectChangesMut, Mut, Ref},
         component::{Component, ComponentId},
         entity::Entity,
         query::{Changed, QueryState, With},
         resource::{IsResource, Resource},
-        schedule::IntoScheduleConfigs,
-        system::Query,
+        system::{Query, SystemState},
         world::{EntityRef, FilteredEntityRef, World},
     },
-    log::{debug, trace, warn},
-    platform::{collections::HashMap, time::Instant},
+    log::warn,
+    platform::collections::HashMap,
     prelude::{Deref, DerefMut},
+};
+#[cfg(feature = "debug")]
+use bevy::{
+    log::{debug, trace},
+    platform::time::Instant,
 };
 
 use crate::{
@@ -28,8 +32,8 @@ use crate::{
         value::Value,
     },
     runtime::{
+        query::{TemplateQueries, sync_queries},
         render::{restore_props, take_props},
-        BevueSystems,
     },
 };
 
@@ -175,7 +179,9 @@ fn sync_value_at(data: &dyn Props, value: &mut Value, key: Option<&PropPath>, ma
     value.is_dirty()
 }
 
-/// Times a sync system's work, logging once per run that synced anything.
+/// Times a sync system's work, logging once per run that synced anything. Only with the `debug`
+/// feature; otherwise it just runs the syncs.
+#[cfg(feature = "debug")]
 #[derive(Default)]
 struct SyncTimer {
     start: Option<Instant>,
@@ -183,7 +189,12 @@ struct SyncTimer {
     changed: usize,
 }
 
+#[cfg(feature = "debug")]
 impl SyncTimer {
+    fn new() -> Self {
+        Self::default()
+    }
+
     fn record(&mut self, sync: impl FnOnce() -> bool) {
         self.start.get_or_insert_with(Instant::now);
         self.synced += 1;
@@ -204,13 +215,29 @@ impl SyncTimer {
     }
 }
 
+#[cfg(not(feature = "debug"))]
+struct SyncTimer;
+
+#[cfg(not(feature = "debug"))]
+impl SyncTimer {
+    fn new() -> Self {
+        Self
+    }
+
+    fn record(&mut self, sync: impl FnOnce() -> bool) {
+        sync();
+    }
+
+    fn log<T>(self) {}
+}
+
 /// Copies changed `T` components into the props of templates with a [`PropsComponent<T>`].
 #[allow(clippy::type_complexity)]
 pub fn sync_component_props<T: Component + Props>(
     mut targets: Query<(Entity, Ref<PropsComponent<T>>, &mut BevueProps, Option<&PropsReadMask>)>,
     sources: Query<Ref<T>>,
 ) {
-    let mut timer = SyncTimer::default();
+    let mut timer = SyncTimer::new();
     for (entity, source, mut props, mask) in &mut targets {
         let Ok(data) = sources.get(source.entity.unwrap_or(entity)) else { continue };
         if data.is_changed() || source.is_changed() {
@@ -231,7 +258,7 @@ pub fn sync_resource_props<R: Component + Props>(
     mut targets: Query<(Ref<PropsResource<R>>, &mut BevueProps, Option<&PropsReadMask>)>,
 ) {
     let Some(resource) = resource.iter().next() else { return };
-    let mut timer = SyncTimer::default();
+    let mut timer = SyncTimer::new();
     for (source, mut props, mask) in &mut targets {
         if resource.is_changed() || source.is_changed() {
             let mask = mask.map(|m| &*m.0);
@@ -477,13 +504,65 @@ pub trait RegisterableProps: Props + Sized {
 
 impl<T: Component + Props> RegisterableProps for T {
     fn register(app: &mut App) {
-        let component_id = app.world_mut().register_component::<T>();
-        app.world_mut().get_resource_or_init::<PropsTypeRegistry>().register::<T>(component_id);
-        app.add_systems(
-            PostUpdate,
-            (sync_component_props::<T>, sync_resource_props::<T>).in_set(BevueSystems::SyncProps),
-        );
+        let world = app.world_mut();
+        if world.get_resource::<PropsTypeRegistry>().is_some_and(|r| r.get(T::type_path()).is_some()) {
+            return;
+        }
+        let component_id = world.register_component::<T>();
+        world.get_resource_or_init::<PropsTypeRegistry>().register::<T>(component_id);
+        let syncer = TypeSyncer::<T> { components: SystemState::new(world), resources: SystemState::new(world) };
+        world.get_resource_or_init::<PropsSyncers>().0.push(Box::new(syncer));
     }
+}
+
+// Syncing every registered type from one system
+
+/// Syncs one registered [`Props`] type into the templates mounting it.
+pub trait PropsSyncer: Send + Sync {
+    fn sync(&mut self, world: &mut World);
+}
+
+/// The syncers of the types registered with [`BevuePropsAppExt::register_props`]. They all run in
+/// one system, [`sync_props_and_queries`], instead of two systems per type: each system costs the
+/// scheduler some time every frame, even when it has nothing to do.
+#[derive(Resource, Default)]
+pub struct PropsSyncers(pub Vec<Box<dyn PropsSyncer>>);
+
+type ComponentSyncParams<T> = (
+    Query<'static, 'static, (Entity, Ref<'static, PropsComponent<T>>, &'static mut BevueProps, Option<&'static PropsReadMask>)>,
+    Query<'static, 'static, Ref<'static, T>>,
+);
+type ResourceSyncParams<T> = (
+    Query<'static, 'static, Ref<'static, T>, With<IsResource>>,
+    Query<'static, 'static, (Ref<'static, PropsResource<T>>, &'static mut BevueProps, Option<&'static PropsReadMask>)>,
+);
+
+/// Runs [`sync_component_props`] and [`sync_resource_props`] for `T`, with their own change ticks.
+struct TypeSyncer<T: Component + Props> {
+    components: SystemState<ComponentSyncParams<T>>,
+    resources: SystemState<ResourceSyncParams<T>>,
+}
+
+impl<T: Component + Props> PropsSyncer for TypeSyncer<T> {
+    fn sync(&mut self, world: &mut World) {
+        if let Ok((targets, sources)) = self.components.get_mut(world) {
+            sync_component_props(targets, sources);
+        }
+        if let Ok((resource, targets)) = self.resources.get_mut(world) {
+            sync_resource_props(resource, targets);
+        }
+    }
+}
+
+/// Syncs every registered `Props` component and resource, then every `<query>`, into the props of
+/// the templates using them.
+pub fn sync_props_and_queries(world: &mut World, queries: &mut QueryState<Entity, With<TemplateQueries>>) {
+    world.try_resource_scope(|world, mut syncers: Mut<PropsSyncers>| {
+        for syncer in &mut syncers.0 {
+            syncer.sync(world);
+        }
+    });
+    sync_queries(world, queries);
 }
 
 /// Registers [`Props`] components and resources as template props sources.

@@ -25,7 +25,7 @@ use bevy_flair::prelude::{Styled, StyleSheet};
 
 use crate::asset::BevueStylesheets;
 use crate::core::compile::CompiledTemplate;
-use crate::core::template::{BevueTemplate, TemplateRef};
+use crate::core::template::BevueTemplate;
 use crate::core::value::Value;
 use crate::runtime::{
     components::{load_components, BevueComponents, ComponentDependencies, WorldComponents},
@@ -511,19 +511,14 @@ pub fn apply_template_classes_and_styles(
     asset_server: Res<AssetServer>,
     embedded: Res<EmbeddedAssetRegistry>,
     mut stylesheets: ResMut<BevueStylesheets>,
-    template_nodes: Query<(Entity, &TemplateRef), Changed<TemplateRef>>,
-    root_templates: Query<(&Template, &TemplateInstance)>,
+    // Rendering inserts a new instance; updates and event handlers bypass change detection. Only
+    // template roots have one, so this does not visit every node.
+    rendered: Query<(Entity, &Template, &TemplateInstance), Changed<TemplateInstance>>,
     parents: Query<&ChildOf>,
     styled: Query<&Styled>,
     visibility: Query<(Option<&Visibility>, Option<&WaitingForStyleSheet>)>,
 ) {
-    for (entity, template_ref) in &template_nodes {
-        if template_ref.root != entity {
-            continue;
-        }
-        let Ok((root_template, instance)) = root_templates.get(entity) else {
-            continue;
-        };
+    for (entity, root_template, instance) in &rendered {
 
         // `bevy_flair` only applies inline styles to entities that have a stylesheet, their own or
         // an inherited one. A template with `style` attributes and neither gets an empty one.

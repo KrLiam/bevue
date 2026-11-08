@@ -1,5 +1,5 @@
 use bevy::{
-    app::{App, Plugin, PostUpdate, PreUpdate}, asset::AssetEventSystems, ecs::{message::Messages, schedule::{IntoScheduleConfigs, SystemSet}}, ui::UiSystems, window::{RequestRedraw, WindowEvent},
+    app::{App, Plugin, PostUpdate, PreUpdate}, asset::AssetEventSystems, ecs::{message::Messages, schedule::{IntoScheduleConfigs, SystemSet, common_conditions::{any_with_component, resource_exists_and_changed}}}, ui::UiSystems, window::{RequestRedraw, WindowEvent},
 };
 use bevy_flair::{FlairPlugin, parser::FlairCssParserPlugin, style::StyleSystems};
 
@@ -52,6 +52,7 @@ impl Plugin for BevueRuntimePlugin {
             app.add_plugins(FlairPlugin);
         }
         app.init_resource::<CompiledTemplates>();
+        app.init_resource::<props::PropsSyncers>();
         app.init_resource::<Messages<WindowEvent>>();
         app.init_resource::<Messages<RequestRedraw>>();
         app.add_observer(on_render_template);
@@ -76,12 +77,21 @@ impl Plugin for BevueRuntimePlugin {
         app.add_systems(
             PostUpdate,
             (
-                (components::load_components, watch_template_components)
+                // One system syncs every registered props type and query: systems cost the scheduler
+                // time every frame even with nothing to do, so Bevue keeps their number small and
+                // skips the ones with nothing to do with run conditions.
+                props::sync_props_and_queries.in_set(BevueSystems::SyncProps),
+                (
+                    components::load_components.run_if(resource_exists_and_changed::<BevueComponents>),
+                    watch_template_components,
+                )
                     .chain()
                     .in_set(BevueSystems::Render),
-                query::sync_queries.in_set(BevueSystems::SyncProps),
                 update_templates.in_set(BevueSystems::Update),
-                (reveal_styled_templates, apply_template_classes_and_styles)
+                (
+                    reveal_styled_templates.run_if(any_with_component::<WaitingForStyleSheet>),
+                    apply_template_classes_and_styles,
+                )
                     .chain()
                     .in_set(BevueSystems::Style),
             ),

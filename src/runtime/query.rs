@@ -87,6 +87,19 @@ fn watch_components(world: &mut World, components: impl IntoIterator<Item = Comp
     world.spawn(Observer::new(bump_membership::<Despawn>).with_components(new.iter().copied()));
 }
 
+/// What one sync of a query did, for logs.
+#[derive(Debug, Default, Clone, Copy)]
+#[cfg_attr(not(feature = "debug"), allow(dead_code))]
+struct QuerySyncStats {
+    /// Whether every matching entity was visited, to find the ones that started or stopped
+    /// matching, instead of only those with changed components.
+    full: bool,
+    rows: usize,
+    changed: usize,
+    added: usize,
+    removed: usize,
+}
+
 /// A `<query>` mounted on a template entity.
 pub struct MountedQuery {
     key: PropPath,
@@ -192,7 +205,8 @@ impl MountedQuery {
     ///
     /// Unless the [`QueryMembership`] generation changed since the last full pass, no entity can
     /// have started or stopped matching: only entities with changed components are looked at.
-    fn sync(&mut self, world: &World, props: &mut Value, mask: Option<&ReadMask>, this_run: Tick) {
+    /// Returns what it did, or `None` if the template does not read the query.
+    fn sync(&mut self, world: &World, props: &mut Value, mask: Option<&ReadMask>, this_run: Tick) -> Option<QuerySyncStats> {
         let last_run = std::mem::replace(&mut self.last_run, this_run);
         let generation = world.get_resource::<QueryMembership>().map_or(0, |m| m.generation);
         let full = self.membership != Some(generation);
@@ -200,11 +214,8 @@ impl MountedQuery {
         // What the template reads of a row.
         let row_mask = match mask {
             None => Some(ReadMask::all_ref()),
-            Some(mask) => match mask.at(&self.key) {
-                Some(list) => list.elements(),
-                // The template does not read this query.
-                None => return,
-            },
+            // `None` if the template does not read this query.
+            Some(mask) => mask.at(&self.key)?.elements(),
         };
         let MountedQuery {
             key,
@@ -236,6 +247,7 @@ impl MountedQuery {
             Value::structure(names, fields)
         };
 
+        let mut stats = QuerySyncStats { full, ..Default::default() };
         props.update_at(key, |list| {
             if list.as_list().is_none() {
                 list.set(Value::list(Vec::new()));
@@ -316,6 +328,9 @@ impl MountedQuery {
                 }
             }
 
+            stats.changed = changed_rows.len();
+            stats.added = added.len();
+
             // Rows whose sort keys changed move to their new position, before rows are removed or
             // added: new rows are inserted by binary search, which needs a sorted list.
             if !order_by.is_empty() && !changed_rows.is_empty() {
@@ -325,6 +340,7 @@ impl MountedQuery {
 
             // Entities that stopped matching.
             if full && seen < rows.len() {
+                stats.removed = rows.len() - seen;
                 let first = stamps.iter().position(|s| *s != stamp).unwrap_or(rows.len());
                 for (entity, row_stamp) in rows.iter().zip(stamps.iter()) {
                     if *row_stamp != stamp {
@@ -354,7 +370,9 @@ impl MountedQuery {
                 stamps.insert(position, stamp);
                 reindex(rows, index, position..rows.len());
             }
+            stats.rows = rows.len();
         });
+        Some(stats)
     }
 }
 
@@ -492,6 +510,25 @@ pub(crate) fn mount_queries(world: &mut World, entity: Entity, declarations: &[Q
     }
 }
 
+/// Logs a query sync at `debug` when rows changed, were added or removed, and at `trace` otherwise
+/// (queries are synced every frame), like the sync of `Props` components and resources. Only with
+/// the `debug` feature.
+#[cfg(feature = "debug")]
+fn log_sync(key: &PropPath, entity: Entity, stats: QuerySyncStats, start: bevy::platform::time::Instant) {
+    use bevy::log::{debug, trace};
+    let elapsed = start.elapsed();
+    let QuerySyncStats { full, rows, changed, added, removed } = stats;
+    let pass = if full { "full" } else { "changed rows only" };
+    if changed + added + removed > 0 {
+        debug!(
+            "synced query '{key}' into the template on {entity}: {rows} rows, {changed} changed, {added} added, \
+             {removed} removed ({pass}), in {elapsed:?}"
+        );
+    } else {
+        trace!("synced query '{key}' into the template on {entity}: {rows} rows, nothing changed ({pass}), in {elapsed:?}");
+    }
+}
+
 /// Syncs the rows of every mounted query into the props of its template.
 pub fn sync_queries(world: &mut World, targets: &mut QueryState<Entity, With<TemplateQueries>>) {
     let entities: Vec<Entity> = targets.iter(world).collect();
@@ -509,7 +546,13 @@ pub fn sync_queries(world: &mut World, targets: &mut QueryState<Entity, With<Tem
         let mask = world.get::<PropsReadMask>(entity).map(|m| m.0.clone());
         let mut props = take_props(world, entity);
         for query in &mut queries {
-            query.sync(world, &mut props, mask.as_deref(), this_run);
+            #[cfg(feature = "debug")]
+            let start = bevy::platform::time::Instant::now();
+            let _stats = query.sync(world, &mut props, mask.as_deref(), this_run);
+            #[cfg(feature = "debug")]
+            if let Some(stats) = _stats {
+                log_sync(&query.key, entity, stats, start);
+            }
         }
         let dirty = props.is_dirty();
         restore_props(world, entity, props);
