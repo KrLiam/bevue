@@ -327,9 +327,13 @@ impl Value {
         }
     }
 
-    /// Gets the list element at `index`.
+    /// Gets the list element at `index`, or the struct field at position `index`.
     pub fn index(&self, index: usize) -> Option<&Value> {
-        self.as_list()?.get(index)
+        match &self.t {
+            ValueType::List(list) => list.get(index),
+            ValueType::Struct(s) => s.fields.get(index),
+            _ => None,
+        }
     }
 
     /// Gets the child at `segment`.
@@ -369,11 +373,14 @@ impl Value {
         }
     }
 
-    /// Gets the list element at `index` for mutation, marking this node as
-    /// [`ChangeFlags::SUBTREE`].
+    /// Gets the list element at `index`, or the struct field at position `index`, for mutation,
+    /// marking this node as [`ChangeFlags::SUBTREE`].
     pub fn index_mut(&mut self, index: usize) -> Option<&mut Value> {
-        let ValueType::List(list) = &mut self.t else { return None };
-        let child = list.get_mut(index)?;
+        let child = match &mut self.t {
+            ValueType::List(list) => list.get_mut(index)?,
+            ValueType::Struct(s) => s.fields.get_mut(index)?,
+            _ => return None,
+        };
         self.flags.insert(ChangeFlags::SUBTREE);
         Some(child)
     }
@@ -443,6 +450,10 @@ impl Value {
             (PathSegment::Key(key), ValueType::Dict(map)) => map.get_mut(key.as_ref()).unwrap(),
             (PathSegment::Key(key), ValueType::Struct(s)) => s.get_mut(key).unwrap(),
             (PathSegment::Index(i), ValueType::List(list)) => match list.get_mut(*i) {
+                Some(child) => child,
+                None => return false,
+            },
+            (PathSegment::Index(i), ValueType::Struct(s)) => match s.fields.get_mut(*i) {
                 Some(child) => child,
                 None => return false,
             },

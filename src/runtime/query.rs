@@ -100,6 +100,18 @@ struct QuerySyncStats {
     removed: usize,
 }
 
+/// Interns a row field name, so aliases live as long as the row schemas using them.
+fn intern(name: &str) -> &'static str {
+    static NAMES: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    let mut names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(interned) = names.iter().find(|n| **n == name) {
+        return interned;
+    }
+    let interned: &'static str = Box::leak(name.to_owned().into_boxed_str());
+    names.push(interned);
+    interned
+}
+
 /// A `<query>` mounted on a template entity.
 pub struct MountedQuery {
     key: PropPath,
@@ -181,7 +193,24 @@ impl MountedQuery {
         let components = data.iter().map(|(r, _)| r).chain(&with).chain(&without).map(|r| r.component_id);
         watch_components(world, components.collect::<Vec<_>>());
 
-        let names = row_schema(std::iter::once("entity").chain(data.iter().map(|(r, _)| r.name)).collect());
+        // Rows hold the components in `data` order, under their alias or name, then the entity, so
+        // `row.0` is the first component.
+        let mut names: Vec<&'static str> = declaration
+            .data
+            .iter()
+            .zip(&data)
+            .map(|(component, (registration, _))| component.alias.as_deref().map_or(registration.name, intern))
+            .collect();
+        names.push("entity");
+        if let Some(duplicate) = names.iter().enumerate().find_map(|(i, n)| names[..i].contains(n).then_some(n)) {
+            warn!(
+                "query '{}' on {entity} has two row fields named '{duplicate}'; rename one with `as`, \
+                 e.g. data=\"Health as hp\"",
+                declaration.name
+            );
+            return None;
+        }
+        let names = row_schema(names);
         let changed_queries = data.iter().map(|(r, _)| (r.changed_query)(world)).collect();
         Some(Self {
             key,
@@ -232,11 +261,10 @@ impl MountedQuery {
             membership,
             ..
         } = self;
-        let field_masks: Vec<Option<&ReadMask>> =
-            data.iter().map(|(registration, _)| row_mask.and_then(|m| m.field(registration.name))).collect();
+        let field_masks: Vec<Option<std::borrow::Cow<ReadMask>>> =
+            (0..data.len()).map(|i| row_mask.and_then(|m| m.struct_field(names[i]))).collect();
         let row_value = |entity_ref: &FilteredEntityRef| {
             let mut fields = Vec::with_capacity(names.len());
-            fields.push(Value::entity(entity_ref.id()));
             for ((registration, _), mask) in data.iter().zip(&field_masks) {
                 let value = match (mask, (registration.read_filtered)(entity_ref)) {
                     (Some(mask), Some(component)) => component.to_value_masked(mask),
@@ -244,6 +272,7 @@ impl MountedQuery {
                 };
                 fields.push(value);
             }
+            fields.push(Value::entity(entity_ref.id()));
             Value::structure(names, fields)
         };
 
@@ -278,7 +307,7 @@ impl MountedQuery {
                     // Changed, inserted, or a missing optional component.
                     let component = (registration.read_filtered)(entity_ref);
                     list.update_at(&[PathSegment::Index(row)], |row| {
-                        row.update_field(field + 1, |value| match component {
+                        row.update_field(field, |value| match component {
                             Some(component) => component.sync_value_masked(value, mask),
                             None => {
                                 value.set(Value::null());

@@ -62,6 +62,8 @@ pub enum CompiledSegment {
     Static(PathSegment),
     /// An index computed from an expression, e.g. `rows[i]`.
     Dynamic(Box<CompiledExpr>),
+    /// A component of the entity reached so far, by type path: `entity.@Health`.
+    Component(Cow<'static, str>),
 }
 
 /// An expression with its identifiers resolved.
@@ -136,6 +138,9 @@ impl CompiledExpr {
                             index.dependencies(out);
                             break;
                         }
+                        // What follows is read from the entity at runtime, which bindings track
+                        // themselves.
+                        CompiledSegment::Component(_) => break,
                     }
                 }
                 if *root != ScopeRef::Event {
@@ -857,6 +862,9 @@ impl<'a> Compiler<'a> {
             }
             Expression::Access { target, field } => {
                 self.extend(self.expr(target)?, CompiledSegment::Static(PathSegment::interned_key(field.as_str())))?
+            }
+            Expression::Component { target, type_path } => {
+                self.extend(self.expr(target)?, CompiledSegment::Component(type_path.clone()))?
             }
             Expression::Index { target, index } => {
                 let target = self.expr(target)?;

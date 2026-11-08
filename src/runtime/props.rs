@@ -297,9 +297,6 @@ pub struct PropsRegistration {
 #[derive(Resource, Default, Debug)]
 pub struct PropsTypeRegistry {
     types: HashMap<&'static str, PropsRegistration>,
-    /// The types by [`Props::name`], the name a template uses to read a component of an entity:
-    /// `selected.health` reads the `Health` component of the entity `selected`.
-    names: HashMap<&'static str, PropsRegistration>,
 }
 
 fn read_component<T: Component + Props>(entity: EntityRef<'_>) -> Option<&dyn Props> {
@@ -344,12 +341,6 @@ impl PropsTypeRegistry {
         };
         self.types.insert(T::type_path(), registration);
         self.types.insert(T::short_type_path(), registration);
-        self.names.insert(T::name(), registration);
-    }
-
-    /// Gets a type by its [`Props::name`].
-    pub fn by_name(&self, name: &str) -> Option<&PropsRegistration> {
-        self.names.get(name)
     }
 
     /// Gets a type by its full or short type path.

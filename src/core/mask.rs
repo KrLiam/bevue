@@ -68,6 +68,22 @@ impl ReadMask {
         self.fields.iter().find(|(key, _)| key == name).map(|(_, mask)| mask)
     }
 
+    /// The mask of the struct field `name`. A struct field can also be read by position
+    /// (`row.0`), which the mask records like a list index, so this adds what is read through any
+    /// index. `None` if the field is not read.
+    pub fn struct_field(&self, name: &str) -> Option<Cow<'_, ReadMask>> {
+        match (self.field(name), self.elements()) {
+            (Some(field), Some(_)) if field.is_all() => Some(Cow::Borrowed(field)),
+            (Some(field), Some(elements)) => {
+                let mut merged = field.clone();
+                merged.merge(elements);
+                Some(Cow::Owned(merged))
+            }
+            (Some(mask), None) | (None, Some(mask)) => Some(Cow::Borrowed(mask)),
+            (None, None) => None,
+        }
+    }
+
     /// The mask of the elements of a list, or `None` if they are not read.
     pub fn elements(&self) -> Option<&ReadMask> {
         if self.all {

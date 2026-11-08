@@ -161,8 +161,8 @@ fn expand(mut input: DeriveInput) -> syn::Result<TokenStream2> {
                             return #props::Props::to_value(self);
                         }
                         #value::structure(FIELDS, ::std::vec![ #(
-                            match mask.field(#keys) {
-                                ::core::option::Option::Some(m) => #props::Props::to_value_masked(&self.#idents, m),
+                            match mask.struct_field(#keys) {
+                                ::core::option::Option::Some(m) => #props::Props::to_value_masked(&self.#idents, &m),
                                 ::core::option::Option::None => #value::null(),
                             }
                         ),* ])
@@ -177,8 +177,8 @@ fn expand(mut input: DeriveInput) -> syn::Result<TokenStream2> {
                             return;
                         }
                         #(
-                            if let ::core::option::Option::Some(m) = mask.field(#keys) {
-                                #props::sync_struct_field_masked(target, #indices, &self.#idents, m);
+                            if let ::core::option::Option::Some(m) = mask.struct_field(#keys) {
+                                #props::sync_struct_field_masked(target, #indices, &self.#idents, &m);
                             }
                         )*
                     }

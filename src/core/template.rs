@@ -224,6 +224,9 @@ impl BinaryOp {
 pub enum Expression {
     Identifier(Identifier),
     Access { target: Box<Expression>, field: Identifier },
+    /// A component of the entity `target` evaluates to, by its type: `target.@Health` or
+    /// `@Health(target)`. The type is a short or full type path of a registered `Props` type.
+    Component { target: Box<Expression>, type_path: Cow<'static, str> },
     Index { target: Box<Expression>, index: Box<Expression> },
     /// A call to a registered function: `function(args...)`.
     Call { function: Identifier, args: Vec<Expression> },
@@ -486,6 +489,9 @@ pub struct QueryComponent {
     pub type_path: Cow<'static, str>,
     /// Whether entities without the component match, with `null` in its place. Written `Type?`.
     pub optional: bool,
+    /// The row field the component is read under, written `Type as alias`. Without one, it is
+    /// the type's `Props::name`.
+    pub alias: Option<Cow<'static, str>>,
 }
 
 /// An `order-by` key of a [`QueryDeclaration`]: a path into the rows.

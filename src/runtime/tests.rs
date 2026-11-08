@@ -2285,7 +2285,7 @@ mod entity_components {
         let bo = app.world_mut().spawn((Name::new("Bo"), Health { current: 7, max: 7 })).id();
         let root = spawn(
             &mut app,
-            r#"<div><p>{{ selected.name }}: {{ selected.health.current }}/{{ selected.health.max }}</p><p>{{ selected.mana }}</p></div>"#,
+            r#"<div><p>{{ selected.@Name }}: {{ selected.@Health.current }}/{{ @Health(selected).max }}</p><p>{{ selected.@Mana }}</p></div>"#,
             value!({ "selected": ana }),
         );
         assert_eq!(texts(app.world(), root), vec!["Ana: 5/10", "1"]);
@@ -2328,9 +2328,9 @@ mod entity_components {
         let root = spawn(
             &mut app,
             r#"<div>
-                <p v-if="selected.target">targets {{ selected.target.name }}</p>
+                <p v-if="selected.@Target">targets {{ selected.@Target.@Name }}</p>
                 <p v-else>idle</p>
-                <span v-for="e in party" :key="e">{{ e.name }}</span>
+                <span v-for="e in party" :key="e">{{ @Name(e) }}</span>
             </div>"#,
             value!({ "selected": ana, "party": [ana, bo] }),
         );
@@ -2344,6 +2344,26 @@ mod entity_components {
         app.world_mut().entity_mut(ana).remove::<Target>();
         app.update();
         assert_eq!(texts(app.world(), root), vec!["idle", "Ana", "Bob"]);
+    }
+
+    #[test]
+    fn components_are_named_by_type() {
+        #[derive(crate::Props, Component)]
+        struct Unregistered(u32);
+
+        let mut app = entity_app();
+        let ana = app.world_mut().spawn((Name::new("Ana"), Health { current: 5, max: 10 }, Unregistered(1))).id();
+        let root = spawn(
+            &mut app,
+            r#"<div>
+                <p>{{ e.@bevue::runtime::tests::entity_components::Health.current }}</p>
+                <p>{{ e.health }}|{{ e.@Unregistered }}|{{ e.@Missing }}|{{ e.@Name }}</p>
+            </div>"#,
+            value!({ "e": ana }),
+        );
+        // Full type paths work; a field-like name after an entity, an unregistered type and an
+        // unknown type all read null.
+        assert_eq!(texts(app.world(), root), vec!["5", "|||Ana"]);
     }
 }
 
@@ -2596,6 +2616,39 @@ mod queries {
                 assert_eq!(now, row, "frame {frame}: the row of {name} was respawned");
             }
         }
+    }
+
+    #[test]
+    fn aliases_and_positions() {
+        let mut app = query_app();
+        let ana = enemy(&mut app, "ana", 5);
+        enemy(&mut app, "bo", 7);
+        let root = spawn_query(
+            &mut app,
+            r#"<props><query name="enemies" data="Health as hp, Name" with="Enemy" order-by="hp.current desc"/></props>
+            <div><p v-for="e in enemies" :key="e.entity">{{ e.1 }} {{ e.0.current }}/{{ e.hp.max }} {{ e.2 == e.entity }}</p></div>"#,
+        );
+        assert_eq!(texts(app.world(), root), vec!["bo 7/10 true", "ana 5/10 true"]);
+        let props = app.world().get::<BevueProps>(root).unwrap().value.clone();
+        let fields: Vec<&str> = props.at(&path("enemies[0]")).unwrap().as_struct().unwrap().names().to_vec();
+        assert_eq!(fields, vec!["hp", "name", "entity"]);
+
+        // Fields read only by position are synced, and the alias sorts.
+        app.world_mut().get_mut::<Health>(ana).unwrap().current = 9;
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["ana 9/10 true", "bo 7/10 true"]);
+    }
+
+    #[test]
+    fn duplicate_row_fields_are_rejected() {
+        let mut app = query_app();
+        enemy(&mut app, "ana", 5);
+        let root = spawn_query(
+            &mut app,
+            r#"<props><query name="enemies" data="Health, Name as health" with="Enemy"/></props>
+            <div><p v-for="e in enemies">{{ e.health }}</p></div>"#,
+        );
+        assert!(texts(app.world(), root).is_empty());
     }
 
     #[test]

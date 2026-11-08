@@ -224,13 +224,28 @@ fn parse_query_declaration(tag: &HTMLTag<'_>) -> Result<QueryDeclaration> {
 
     let name = name.map(str::trim).filter(|n| !n.is_empty()).ok_or_else(|| error("<query> requires a name".into()))?;
     PropPath::parse(name).map_err(|e| error(e.to_string()))?;
-    let data: Vec<QueryComponent> = type_list(data)
-        .into_iter()
-        .map(|type_path| match type_path.strip_suffix('?') {
-            Some(stripped) => QueryComponent { type_path: Cow::Owned(stripped.trim().to_string()), optional: true },
-            None => QueryComponent { type_path, optional: false },
-        })
-        .collect();
+    let mut components = Vec::new();
+    for item in type_list(data) {
+        let words: Vec<&str> = item.split_whitespace().collect();
+        let (type_path, alias) = match words[..] {
+            [type_path] => (type_path, None),
+            [type_path, "as", alias] => {
+                let valid = alias.starts_with(|c: char| c.is_alphabetic() || c == '_')
+                    && alias.chars().all(|c| c.is_alphanumeric() || c == '_');
+                if !valid {
+                    return Err(error(format!("invalid alias '{alias}' in data, expected an identifier")));
+                }
+                (type_path, Some(Cow::Owned(alias.to_string())))
+            }
+            _ => return Err(error(format!("unexpected '{item}' in data, expected `Type`, `Type?` or `Type as alias`"))),
+        };
+        let (type_path, optional) = match type_path.strip_suffix('?') {
+            Some(stripped) => (stripped, true),
+            None => (type_path, false),
+        };
+        components.push(QueryComponent { type_path: Cow::Owned(type_path.to_string()), optional, alias });
+    }
+    let data = components;
     if data.is_empty() {
         return Err(error("<query> requires data: the components of each row, e.g. data=\"Name, Health\"".into()));
     }
@@ -975,6 +990,15 @@ use super::*;
         assert_eq!(query.name, "enemies");
         let data: Vec<_> = query.data.iter().map(|c| (c.type_path.as_ref(), c.optional)).collect();
         assert_eq!(data, vec![("Name", false), ("Health", false), ("Target", true)]);
+        assert!(query.data.iter().all(|c| c.alias.is_none()));
+
+        let template = parse_template(r#"<props><query name="q" data="Health as hp, Target? as t, Name"/></props><div/>"#).unwrap();
+        let data: Vec<_> = template.queries[0]
+            .data
+            .iter()
+            .map(|c| (c.type_path.as_ref(), c.optional, c.alias.as_deref()))
+            .collect();
+        assert_eq!(data, vec![("Health", false, Some("hp")), ("Target", true, Some("t")), ("Name", false, None)]);
         assert_eq!(query.with, vec!["Enemy"]);
         assert_eq!(query.without, vec!["Dead", "Hidden"]);
         let keys: Vec<_> = query.order_by.iter().map(|k| (k.path.to_string(), k.descending)).collect();
@@ -985,6 +1009,10 @@ use super::*;
         assert!(error("<props><query name='q'/></props><div/>").contains("requires data"));
         assert!(error("<props><query name='q' data='A' order-by='a up'/></props><div/>").contains("asc or desc"));
         assert!(error("<props><query name='q' data='A' sort='a'/></props><div/>").contains("unknown attribute"));
+        assert!(error("<props><query name='q' data='A as'/></props><div/>").contains("expected `Type`"));
+        assert!(error("<props><query name='q' data='A as b c'/></props><div/>").contains("expected `Type`"));
+        assert!(error("<props><query name='q' data='A as 1b'/></props><div/>").contains("invalid alias"));
+        assert!(error("<props><query name='q' data='A B'/></props><div/>").contains("expected `Type`"));
     }
 
     #[test]

@@ -129,6 +129,18 @@ fn parse_int_literal(input: &mut &str) -> ModalResult<i32> {
     slice.parse::<i32>().map_err(|_| winnow::error::ErrMode::Backtrack(ContextError::new()))
 }
 
+/// Parses the type path after `@`: `Health` or `my_game::units::Health`.
+fn parse_component_type(input: &mut &str) -> ModalResult<Cow<'static, str>> {
+    let _ = literal("@").parse_next(input)?;
+    let mut path = ident_str.parse_next(input).map_err(|e| e.cut())?.to_string();
+    while input.starts_with("::") {
+        let _ = literal("::").parse_next(input)?;
+        path.push_str("::");
+        path.push_str(ident_str.parse_next(input).map_err(|e| e.cut())?);
+    }
+    Ok(Cow::Owned(path))
+}
+
 /// Parses an atom (primary expression before any dot-access):
 /// - parenthesized expression
 /// - string literal
@@ -137,9 +149,18 @@ fn parse_int_literal(input: &mut &str) -> ModalResult<i32> {
 /// - integer literal
 /// - object literal `{ key: expr, 'key': expr }`
 /// - function call `ident(expr, ...)`
+/// - component of an entity `@Type(expr)`
 /// - boolean or identifier
 fn parse_atom(input: &mut &str) -> ModalResult<Expression> {
     let _: &str = multispace0.parse_next(input)?;
+
+    // Component of an entity: `@Health(entity)`
+    if input.starts_with('@') {
+        let type_path = parse_component_type.parse_next(input)?;
+        let _: &str = multispace0.parse_next(input)?;
+        let target = delimited('(', parse_expr_internal, ')').parse_next(input).map_err(|e| e.cut())?;
+        return Ok(Expression::Component { target: Box::new(target), type_path });
+    }
     
     // Parentheses
     if input.starts_with('(') {
@@ -332,6 +353,12 @@ fn parse_postfix(input: &mut &str) -> ModalResult<Expression> {
             let checkpoint = *input;
             let _ = literal(".").parse_next(input)?;
             let _: &str = multispace0.parse_next(input)?;
+            // Component of an entity: `entity.@Health`
+            if input.starts_with('@') {
+                let type_path = parse_component_type.parse_next(input)?;
+                current = Expression::Component { target: Box::new(current), type_path };
+                continue;
+            }
             match ident_str.parse_next(input) {
                 Ok(field_name) => {
                     current = Expression::Access {
@@ -570,6 +597,7 @@ mod tests {
             Expression::Bool(b) => b.to_string(),
             Expression::String(s) => format!("'{s}'"),
             Expression::Access { target, field } => format!("{}.{}", show(target), field.as_str()),
+            Expression::Component { target, type_path } => format!("{}.@{type_path}", show(target)),
             Expression::Index { target, index } => format!("{}[{}]", show(target), show(index)),
             Expression::Call { function, args } => {
                 format!("{}({})", function.as_str(), args.iter().map(show).collect::<Vec<_>>().join(", "))
@@ -635,6 +663,27 @@ mod tests {
             assert_eq!(show(&parse_expression(source)), expected, "{source}");
         }
         for source in ["a +", "* a", "a ? b", "a ? b :", "a ? : c", "a &&& b", "a = b", "a ! b", "1 2"] {
+            assert!(try_parse_expression(source).is_err(), "{source} should not parse");
+        }
+    }
+
+    #[test]
+    fn test_component_notation() {
+        for (source, expected) in [
+            ("e.@Health", "e.@Health"),
+            ("e.@Health.current", "e.@Health.current"),
+            ("@Health(e).current", "e.@Health.current"),
+            ("@Health( a.b ).max", "a.b.@Health.max"),
+            ("e.@Target.@Name", "e.@Target.@Name"),
+            ("@Name(@Target(e))", "e.@Target.@Name"),
+            ("e.@my_game::units::Health.max", "e.@my_game::units::Health.max"),
+            ("(a || b).@Health", "(a Or b).@Health"),
+            ("e.@Health.current * 3 < m", "((e.@Health.current Mul 3) Lt m)"),
+            ("rows[i].@Health", "rows[i].@Health"),
+        ] {
+            assert_eq!(show(&parse_expression(source)), expected, "{source}");
+        }
+        for source in ["e.@", "e.@3", "@Health", "@Health(e", "@(e)", "e.@Health::"] {
             assert!(try_parse_expression(source).is_err(), "{source} should not parse");
         }
     }

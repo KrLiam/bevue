@@ -56,12 +56,12 @@ pub trait Host {
     /// Calls the registered function `name`.
     fn call(&mut self, name: &str, args: Vec<Value>) -> Value;
 
-    /// Reads the component named `component` of `entity`, then follows as much of `path` into it
-    /// as the component's data allows. Returns the value reached and how many segments of `path`
+    /// Reads the component of type `type_path` (a registered `Props` type, by short or full path)
+    /// of `entity`, then follows as much of `path` into it as the component's data allows. Returns the value reached and how many segments of `path`
     /// were followed, or `None` if the entity or component does not exist. The default reads
     /// nothing.
-    fn read_entity(&mut self, entity: Entity, component: &str, path: &[PathSegment]) -> Option<(Value, usize)> {
-        let _ = (entity, component, path);
+    fn read_entity(&mut self, entity: Entity, type_path: &str, path: &[PathSegment]) -> Option<(Value, usize)> {
+        let _ = (entity, type_path, path);
         None
     }
 }
@@ -174,8 +174,9 @@ pub fn eval<'r, 'p: 'r>(expr: &'r CompiledExpr, ctx: &mut EvalCtx<'p, '_, '_>) -
     }
 }
 
-/// Follows `segments` from `start`, evaluating dynamic indices. A key after an entity names one
-/// of its components, which is read through [`Host::read_entity`]; the value is then owned.
+/// Follows `segments` from `start`, evaluating dynamic indices. A component segment
+/// (`entity.@Health`) reads that component of the entity reached so far through
+/// [`Host::read_entity`]; the value is then owned.
 fn navigate<'v>(
     start: &'v Value,
     segments: &[CompiledSegment],
@@ -187,23 +188,23 @@ fn navigate<'v>(
         let segment = match &segments[i] {
             CompiledSegment::Static(s) => Cow::Borrowed(s),
             CompiledSegment::Dynamic(index) => Cow::Owned(value_segment(&eval(index, ctx))?),
+            CompiledSegment::Component(type_path) => {
+                let entity = current.as_entity()?;
+                // The static segments that follow are read inside the component.
+                let rest: Vec<PathSegment> = segments[i + 1..]
+                    .iter()
+                    .map_while(|s| match s {
+                        CompiledSegment::Static(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                let (value, followed) = ctx.call.read_entity(entity, type_path, &rest)?;
+                current = Cow::Owned(value);
+                i += 1 + followed;
+                continue;
+            }
         };
         i += 1;
-        if let Some(entity) = current.as_entity() {
-            let PathSegment::Key(component) = &*segment else { return None };
-            // The static segments that follow are read inside the component.
-            let rest: Vec<PathSegment> = segments[i..]
-                .iter()
-                .map_while(|s| match s {
-                    CompiledSegment::Static(s) => Some(s.clone()),
-                    CompiledSegment::Dynamic(_) => None,
-                })
-                .collect();
-            let (value, followed) = ctx.call.read_entity(entity, component, &rest)?;
-            current = Cow::Owned(value);
-            i += followed;
-            continue;
-        }
         current = match current {
             Cow::Borrowed(value) => Cow::Borrowed(value.child(&segment)?),
             Cow::Owned(value) => Cow::Owned(value.child(&segment)?.clone()),

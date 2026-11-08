@@ -18,10 +18,10 @@
         </div>
 
         <div v-if="selection.entity" class="panel">
-            <p>{{ selection.entity.name }}</p>
-            <p>Health: {{ selection.entity.health.current }}/{{ selection.entity.health.max }}</p>
-            <p v-if="selection.entity.target">
-                Attacking {{ selection.entity.target.name }} ({{ selection.entity.target.health.current }} hp)
+            <p>{{ selection.entity.@Name }}</p>
+            <p>Health: {{ selection.entity.@Health.current }}/{{ selection.entity.@Health.max }}</p>
+            <p v-if="selection.entity.@Target">
+                Attacking {{ selection.entity.@Target.@Name }} ({{ @Health(selection.entity.@Target).current }} hp)
             </p>
             <button class="row" @click="select()">Close</button>
         </div>

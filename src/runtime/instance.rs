@@ -65,8 +65,12 @@ impl Host for Caller<'_> {
         call_function(self.world, self.root, self.entity, name, args)
     }
 
-    fn read_entity(&mut self, entity: Entity, component: &str, path: &[PathSegment]) -> Option<(Value, usize)> {
-        let registration = *self.world.get_resource::<PropsTypeRegistry>()?.by_name(component)?;
+    fn read_entity(&mut self, entity: Entity, type_path: &str, path: &[PathSegment]) -> Option<(Value, usize)> {
+        let registration = self.world.get_resource::<PropsTypeRegistry>().and_then(|r| r.get(type_path)).copied();
+        let Some(registration) = registration else {
+            warn_unknown_component(type_path);
+            return None;
+        };
         // Recorded even if missing, so the binding updates when the component is inserted.
         self.reads.push((entity, registration.component_id));
         let mut data = (registration.read)(self.world.get_entity(entity).ok()?)?;
@@ -81,6 +85,15 @@ impl Host for Caller<'_> {
             followed += 1;
         }
         Some((data.to_value(), followed))
+    }
+}
+
+/// Warns once per type path that a template reads a component type that is not registered.
+fn warn_unknown_component(type_path: &str) {
+    static WARNED: std::sync::Mutex<Option<HashSet<String>>> = std::sync::Mutex::new(None);
+    let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+    if warned.get_or_insert_with(HashSet::default).insert(type_path.to_owned()) {
+        bevy::log::warn!("a template reads the component `@{type_path}`, which is not registered; register it with `app.register_props`");
     }
 }
 

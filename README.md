@@ -119,8 +119,8 @@ reads are copied and compared: a field no template shows costs nothing when it c
 
 ### Entities
 
-An `Entity` is a prop like any other, and a path that continues past one reads that entity's
-registered components by name. Bevy's `Name` can be registered too.
+An `Entity` is also a prop and can be read in templates. `entity.@Type` is the postfix query notation, it queries for the `Type` component on the `entity`. The component type can either be the short or full path, e.g. `entity.@Health` or `entity.@my_game::Health`. Alternatively, prefix notation is also available e.g `@Type(entity)`. The type must be
+registered with `register_props`; Bevy's `Name` is registered by default.
 
 ```rust
 #[derive(Resource, Props, Default)]
@@ -137,31 +137,34 @@ app.register_props::<Selection>().register_props::<Health>().register_props::<Ta
 
 ```html
 <div v-if="selection.entity">
-    <p>{{ selection.entity.name }}: {{ selection.entity.health.current }}/{{ selection.entity.health.max }}</p>
-    <p v-if="selection.entity.target">attacking {{ selection.entity.target.name }}</p>
+    <p>{{ selection.entity.@Name }}: {{ selection.entity.@Health.current }}/{{ @Health(selection.entity).max }}</p>
+    <p v-if="selection.entity.@Target">attacking {{ selection.entity.@Target.@Name }}</p>
 </div>
 ```
 
 The text updates when the selection changes, and when `Health` (or `Name`, `Target`...) of the
-selected entity changes, is inserted or removed, or when the entity is despawned.
+selected entity changes, is inserted or removed, or when the entity is despawned. A component the
+entity does not have reads `null`; an unregistered type also reads `null`, with a warning.
 
 ### Queries
 
-A `<query>` lists the entities matching a query, one row per entity with `entity` and the
-components in `data`:
+A `<query>` lists the entities matching a query, one row per entity with the components in `data`
+and `entity`:
 
 ```html
 <props>
-    <query name="enemies" data="Name, Health, Target?" with="Enemy" without="Dead" order-by="health.current desc, name"/>
+    <query name="enemies" data="Name, Health as hp, Target?" with="Enemy" without="Dead" order-by="hp.current desc, name"/>
 </props>
 
 <button v-for="e in enemies" :key="e.entity" @click="select(e.entity)">
-    {{ e.name }}: {{ e.health.current }}
+    {{ e.name }}: {{ e.hp.current }} {{ e.1.max }}
 </button>
 ```
 
-- `data`: the components of each row, read under their name. `Type?` is optional: entities without
-  it match too, with `null` in its place.
+- `data`: the components of each row, read under their name in snake case (`Health` is `health`)
+  or under an alias, `Type as alias`. They can also be read by position: `e.0` is the first one,
+  `e.1` the second... and `entity` comes after them. `Type?` is optional: entities without it
+  match too, with `null` in its place.
 - `with` / `without`: components the entities must have or not have. A marker is registered like
   any other type: `#[derive(Component, Props)] struct Enemy;`.
 - `order-by`: paths into the rows, each `asc` (the default) or `desc`. Without it, rows keep the
