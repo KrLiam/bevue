@@ -13,11 +13,12 @@ use bevy::{
         observer::On,
         lifecycle::HookContext,
         query::{Changed, QueryState, With},
+        resource::Resource,
         system::{Command, Commands, In, IntoSystem, Query, Res, ResMut, command::run_system_cached_with},
         world::{DeferredWorld, World},
     },
     log::{debug, error, warn},
-    platform::time::Instant,
+    platform::{collections::HashMap, time::Instant},
 };
 use bevy_flair::prelude::{Styled, StyleSheet};
 
@@ -26,7 +27,7 @@ use crate::core::compile::CompiledTemplate;
 use crate::core::template::{BevueTemplate, TemplateRef};
 use crate::core::value::Value;
 use crate::runtime::{
-    components::{load_components, ComponentDependencies, WorldComponents},
+    components::{load_components, BevueComponents, ComponentDependencies, WorldComponents},
     functions::{
         assert_not_reserved, box_function, BevueCtx, BevueFunctionFactory, BoxedBevueFunction, TemplateFunctions,
     },
@@ -138,6 +139,47 @@ fn unregister_template_functions(mut world: DeferredWorld, ctx: HookContext) {
 }
 
 
+/// Templates compiled with the components they use, so a template is compiled once rather than on
+/// every render. An entry is dropped when its template or one of its components changes.
+#[derive(Resource, Default)]
+pub struct CompiledTemplates {
+    cache: HashMap<AssetId<BevueTemplate>, CachedTemplate>,
+}
+
+struct CachedTemplate {
+    compiled: Arc<CompiledTemplate>,
+    dependencies: ComponentDependencies,
+}
+
+impl CompiledTemplates {
+    /// The compiled form of the template `id`, if it is cached.
+    pub fn get(&self, id: AssetId<BevueTemplate>) -> Option<&Arc<CompiledTemplate>> {
+        self.cache.get(&id).map(|cached| &cached.compiled)
+    }
+
+    pub fn len(&self) -> usize {
+        self.cache.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cache.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.cache.clear();
+    }
+
+    /// Drops the templates that are `modified` or use a modified component, and those that
+    /// rendered an empty node for a component in `added`.
+    fn invalidate(&mut self, modified: &HashSet<&AssetId<BevueTemplate>>, added: &HashSet<&AssetId<BevueTemplate>>) {
+        self.cache.retain(|id, cached| {
+            !modified.contains(id)
+                && !cached.dependencies.assets.iter().any(|id| modified.contains(id))
+                && !cached.dependencies.pending.iter().any(|id| added.contains(id))
+        });
+    }
+}
+
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TemplateRendered(pub AssetId<BevueTemplate>);
 
@@ -162,9 +204,12 @@ pub fn on_render_template(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn watch_template_components(
     mut commands: Commands,
     assets: Res<Assets<BevueTemplate>>,
+    mut compiled: ResMut<CompiledTemplates>,
+    components: Option<Res<BevueComponents>>,
     mut asset_events: MessageReader<AssetEvent<BevueTemplate>>,
     mut failed_events: MessageReader<AssetLoadFailedEvent<BevueTemplate>>,
     changed_templates: Query<(Entity, &Template), Changed<Template>>,
@@ -185,12 +230,22 @@ pub fn watch_template_components(
             AssetEvent::Added { id } => {
                 added_asset_ids.insert(id);
             }
-            _ => {}
+            AssetEvent::Removed { id } | AssetEvent::Unused { id } => {
+                compiled.cache.remove(id);
+            }
         }
     }
     // A component that failed to load is no longer waited for.
     let failed: Vec<_> = failed_events.read().map(|event| event.id).collect();
     added_asset_ids.extend(&failed);
+
+    // Compiled templates expand their components, so they are compiled again when a component
+    // changes, or when the set of registered components does.
+    if components.is_some_and(|components| components.is_changed()) {
+        compiled.clear();
+    } else if !compiled.is_empty() && (!modified_asset_ids.is_empty() || !added_asset_ids.is_empty()) {
+        compiled.invalidate(&modified_asset_ids, &added_asset_ids);
+    }
 
     if !modified_asset_ids.is_empty() || !added_asset_ids.is_empty() {
         for (entity, template, dependencies) in &all_templates {
@@ -253,19 +308,34 @@ pub fn watch_template_components(
 pub fn render_template(input: In<RenderTemplate>, world: &mut World) {
     let start = Instant::now();
     load_components(world);
-    let (template, compiled, dependencies, loading) = {
-        let Some(templates) = world.get_resource::<Assets<BevueTemplate>>() else {
-            error!("Assets<BevueTemplate> resource not found");
-            return;
-        };
-        let Some(template) = templates.get(&input.template) else {
-            warn!("BevueTemplate asset not loaded yet");
-            return;
-        };
-        let components = WorldComponents::new(world, templates);
-        let compiled = CompiledTemplate::compile_with(template, &components);
-        let loading = components.is_loading();
-        (Arc::new(template.clone()), compiled, components.into_dependencies(), loading)
+    let cached = world.get_resource::<CompiledTemplates>().and_then(|cache| cache.cache.get(&input.template.id()));
+    let (compiled, dependencies, loading) = match cached {
+        Some(cached) => (Ok(cached.compiled.clone()), cached.dependencies.clone(), false),
+        None => {
+            let Some(templates) = world.get_resource::<Assets<BevueTemplate>>() else {
+                error!("Assets<BevueTemplate> resource not found");
+                return;
+            };
+            let Some(template) = templates.get(&input.template) else {
+                warn!("BevueTemplate asset not loaded yet");
+                return;
+            };
+            let components = WorldComponents::new(world, templates);
+            let compiled = CompiledTemplate::compile_with(template, &components).map(Arc::new);
+            let loading = components.is_loading();
+            let dependencies = components.into_dependencies();
+            // A template whose components are still loading is compiled again once they are.
+            if let Ok(compiled) = &compiled
+                && !loading
+                && let Some(mut cache) = world.get_resource_mut::<CompiledTemplates>()
+            {
+                cache.bypass_change_detection().cache.insert(
+                    input.template.id(),
+                    CachedTemplate { compiled: compiled.clone(), dependencies: dependencies.clone() },
+                );
+            }
+            (compiled, dependencies, loading)
+        }
     };
 
     let root_entity = match input.ui_root {
@@ -293,7 +363,7 @@ pub fn render_template(input: In<RenderTemplate>, world: &mut World) {
     }
 
     let compiled = match compiled {
-        Ok(compiled) => Arc::new(compiled),
+        Ok(compiled) => compiled,
         Err(e) => {
             error!("Could not render template {:?}: {e}", input.template.path());
             return;
@@ -302,7 +372,7 @@ pub fn render_template(input: In<RenderTemplate>, world: &mut World) {
     mount_declared_props(world, root_entity, &compiled.props);
 
     let mut props = take_props(world, root_entity);
-    let instance = TemplateInstance::render_compiled(world, root_entity, template, compiled, &props);
+    let instance = TemplateInstance::render_compiled(world, root_entity, compiled, &props);
     let stats = instance.stats();
     world.entity_mut(root_entity).insert(instance);
     debug!(

@@ -9,32 +9,38 @@
 //! Bindings inside a `v-for` that read the loop element are registered in that item's own trie,
 //! relative to the element. Element changes are routed to the item at that index, so reordering a
 //! list never re-registers the bindings of the items that moved.
+//!
+//! Everything about a node that does not depend on props (static texts, classes and styles, the
+//! paths each binding reads) is computed once when the template is compiled.
 
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    sync::Arc,
-};
+use std::sync::Arc;
 
 use bevy::{
-    ecs::{component::Component, entity::Entity, hierarchy::ChildOf, world::World},
+    ecs::{
+        component::Component,
+        entity::{Entity, EntityHashMap},
+        hierarchy::{ChildOf, Children},
+        world::{EntityWorldMut, World},
+    },
+    platform::collections::{HashMap, HashSet},
     ui::{Interaction, Node, widget::Text},
 };
 use bevy_flair::prelude::{ClassList, InlineStyle};
 
 use crate::{
     core::{
-        compile::{
-            CompileError, CompiledExpr, CompiledHandler, CompiledSegment, CompiledTemplate, IfChain, ScopeRef, Slot,
-        },
+        compile::{CompileError, CompiledHandler, CompiledTemplate, Dep, ScopeRef, Slot},
         path::PathSegment,
         template::{BevueTemplate, NodeId, TemplateRef, TemplateStyle},
-        value::{ChangeFlags, Value},
+        value::{ChangeFlags, Value, ValueType},
     },
     runtime::{
         functions::call_function,
-        interpolation::{class_names, eval, eval_path, inline_style, no_calls, render_text, EvalCtx, Frame, FrameElement},
+        interpolation::{class_names, eval, inline_style, resolve, write_text, EvalCtx, Frame},
     },
 };
+
+static NULL: Value = Value::NULL;
 
 /// A function caller for expressions evaluated on `entity` of the template rooted at `root`.
 fn caller(world: &mut World, root: Entity, entity: Entity) -> impl FnMut(&str, Vec<Value>) -> Value + '_ {
@@ -122,14 +128,27 @@ pub enum DepMode {
 #[derive(Debug, Default)]
 pub struct DepTrie {
     bindings: Vec<(BindingId, DepMode)>,
-    children: HashMap<PathSegment, DepTrie>,
+    /// Children by path segment. Tries are small, so a list is faster than a map and saves an
+    /// allocation per list item.
+    children: Vec<(PathSegment, DepTrie)>,
     /// `v-for` blocks iterating the list at this path; element changes are routed to their items.
     for_blocks: Vec<BlockId>,
 }
 
 impl DepTrie {
     fn node_mut(&mut self, path: &[PathSegment]) -> &mut DepTrie {
-        path.iter().fold(self, |node, segment| node.children.entry(segment.clone()).or_default())
+        let mut node = self;
+        for segment in path {
+            let index = match node.children.iter().position(|(s, _)| s == segment) {
+                Some(index) => index,
+                None => {
+                    node.children.push((segment.clone(), DepTrie::default()));
+                    node.children.len() - 1
+                }
+            };
+            node = &mut node.children[index].1;
+        }
+        node
     }
 
     fn is_empty(&self) -> bool {
@@ -148,10 +167,11 @@ impl DepTrie {
                 }
             }
             Some((segment, rest)) => {
-                let Some(child) = self.children.get_mut(segment) else { return };
+                let Some(index) = self.children.iter().position(|(s, _)| s == segment) else { return };
+                let child = &mut self.children[index].1;
                 child.remove(rest, binding, block);
                 if child.is_empty() {
-                    self.children.remove(segment);
+                    self.children.swap_remove(index);
                 }
             }
         }
@@ -159,7 +179,7 @@ impl DepTrie {
 
     /// Returns the number of bindings registered in this trie.
     pub fn binding_count(&self) -> usize {
-        self.bindings.len() + self.children.values().map(DepTrie::binding_count).sum::<usize>()
+        self.bindings.len() + self.children.iter().map(|(_, child)| child.binding_count()).sum::<usize>()
     }
 }
 
@@ -189,9 +209,9 @@ struct Binding {
     entity: Entity,
     node: NodeId,
     kind: BindingKind,
-    /// The `v-for` items enclosing the binding, outermost first.
-    scope: Vec<ItemId>,
-    registrations: Vec<(TrieOwner, Vec<PathSegment>)>,
+    /// The innermost `v-for` item enclosing the binding.
+    scope: Option<ItemId>,
+    registrations: Vec<(TrieOwner, Arc<[PathSegment]>)>,
 }
 
 /// Bookkeeping owned by a subtree that can be torn down: a `v-if` branch or a list item.
@@ -199,6 +219,7 @@ struct Binding {
 struct Owned {
     bindings: Vec<BindingId>,
     blocks: Vec<BlockId>,
+    /// Elements with an entry in `elements` or `listeners`.
     elements: Vec<Entity>,
 }
 
@@ -211,8 +232,10 @@ enum OwnerRef {
 
 struct IfBlock {
     parent: Entity,
-    chain: IfChain,
-    scope: Vec<ItemId>,
+    /// The node whose slot `slot` is the chain.
+    node: NodeId,
+    slot: usize,
+    scope: Option<ItemId>,
     active: Option<usize>,
     entity: Option<Entity>,
     owned: Owned,
@@ -222,12 +245,11 @@ struct IfBlock {
 struct ForBlock {
     parent: Entity,
     node: NodeId,
-    scope: Vec<ItemId>,
+    scope: Option<ItemId>,
     items: Vec<ItemId>,
-    keyed: bool,
     binding: Option<BindingId>,
     /// Where element changes are routed from, if the iterable is a static path.
-    route: Option<(TrieOwner, Vec<PathSegment>)>,
+    route: Option<(TrieOwner, Arc<[PathSegment]>)>,
     /// The elements of an iterable that is not a prop path (e.g. `sorted(items)`), as computed
     /// by the last reconcile.
     computed: Option<Arc<[Value]>>,
@@ -238,14 +260,58 @@ enum Block {
     For(ForBlock),
 }
 
+/// What identifies a list item across updates: its `:key`, or its position without one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ItemKey {
+    Position(usize),
+    Null,
+    Bool(bool),
+    Number(u64),
+    String(Box<str>),
+    Other(String),
+}
+
+/// The bits of a number key, with `-0` and `0` the same key.
+fn number_key(n: f64) -> u64 {
+    if n == 0.0 { 0 } else { n.to_bits() }
+}
+
+impl ItemKey {
+    fn of(value: &Value) -> Self {
+        match value.value_type() {
+            ValueType::Null => ItemKey::Null,
+            ValueType::Boolean(b) => ItemKey::Bool(*b),
+            ValueType::Number(n) => ItemKey::Number(number_key(*n)),
+            ValueType::String(s) => ItemKey::String(s.as_str().into()),
+            ValueType::List(_) | ValueType::Dict(_) => ItemKey::Other(value.to_string()),
+        }
+    }
+
+    /// Returns true if `value` is this key, without allocating for scalars.
+    fn matches(&self, value: &Value) -> bool {
+        match (self, value.value_type()) {
+            (ItemKey::Null, ValueType::Null) => true,
+            (ItemKey::Bool(a), ValueType::Boolean(b)) => a == b,
+            (ItemKey::Number(a), ValueType::Number(b)) => *a == number_key(*b),
+            (ItemKey::String(a), ValueType::String(b)) => **a == **b,
+            (ItemKey::Other(a), ValueType::List(_) | ValueType::Dict(_)) => *a == value.to_string(),
+            _ => false,
+        }
+    }
+}
+
 struct Item {
     block: BlockId,
     index: usize,
-    key: String,
+    key: ItemKey,
     entity: Entity,
     trie: DepTrie,
     index_bindings: Vec<BindingId>,
     owned: Owned,
+    /// The item enclosing this item's list.
+    parent: Option<ItemId>,
+    /// The nesting level of the item's list.
+    level: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -262,8 +328,9 @@ struct Pending {
     routed: Vec<(BlockId, usize)>,
     /// Lists replaced wholesale: all of their items must be re-evaluated.
     force_full: HashSet<BlockId>,
-    /// Items spawned during this update, already up to date.
+    /// Items spawned during this update, already up to date. Only tracked during updates.
     fresh: HashSet<ItemId>,
+    track_fresh: bool,
 }
 
 /// An event handler to run: the function to call with its evaluated arguments.
@@ -299,67 +366,67 @@ pub struct UpdateStats {
 #[derive(Component)]
 pub struct TemplateInstance {
     root: Entity,
-    template: Arc<BevueTemplate>,
     compiled: Arc<CompiledTemplate>,
     root_trie: DepTrie,
     root_owned: Owned,
     bindings: Arena<Binding>,
     blocks: Arena<Block>,
     items: Arena<Item>,
-    elements: HashMap<Entity, Vec<SlotState>>,
-    /// Nodes with event listeners: their template node and `v-for` scope.
-    listeners: HashMap<Entity, (NodeId, Vec<ItemId>)>,
+    /// The slots of elements whose children can be reordered: those with an if-chain or a list.
+    elements: EntityHashMap<Vec<SlotState>>,
+    /// Nodes with event listeners: their template node and innermost `v-for` item.
+    listeners: EntityHashMap<(NodeId, Option<ItemId>)>,
+    /// Reused to render texts during updates.
+    text_buffer: String,
 }
 
 impl Default for TemplateInstance {
     fn default() -> Self {
         Self {
             root: Entity::PLACEHOLDER,
-            template: Arc::default(),
             compiled: Arc::default(),
             root_trie: DepTrie::default(),
             root_owned: Owned::default(),
             bindings: Arena::default(),
             blocks: Arena::default(),
             items: Arena::default(),
-            elements: HashMap::new(),
-            listeners: HashMap::new(),
+            elements: EntityHashMap::default(),
+            listeners: EntityHashMap::default(),
+            text_buffer: String::new(),
         }
     }
 }
 
+/// Sets `style` on `entity` if it differs from its current one. An emptied style still replaces
+/// the previous one, or flair keeps applying it.
+fn write_style(entity: &mut EntityWorldMut, style: InlineStyle) {
+    let current = entity.get::<InlineStyle>();
+    if current != Some(&style) && (current.is_some() || style != InlineStyle::default()) {
+        entity.insert(style);
+    }
+}
+
 impl TemplateInstance {
-    /// Spawns the UI tree of `template` under `root`, evaluated against `props`.
-    pub fn render(
-        world: &mut World,
-        root: Entity,
-        template: Arc<BevueTemplate>,
-        props: &Value,
-    ) -> Result<Self, CompileError> {
-        let compiled = Arc::new(CompiledTemplate::compile(&template)?);
-        Ok(Self::render_compiled(world, root, template, compiled, props))
+    /// Compiles `template` and spawns its UI tree under `root`, evaluated against `props`.
+    pub fn render(world: &mut World, root: Entity, template: &BevueTemplate, props: &Value) -> Result<Self, CompileError> {
+        let compiled = Arc::new(CompiledTemplate::compile(template)?);
+        Ok(Self::render_compiled(world, root, compiled, props))
     }
 
-    /// Spawns the UI tree of an already compiled `template` under `root`, evaluated against
+    /// Spawns the UI tree of an already compiled template under `root`, evaluated against
     /// `props`.
-    pub fn render_compiled(
-        world: &mut World,
-        root: Entity,
-        template: Arc<BevueTemplate>,
-        compiled: Arc<CompiledTemplate>,
-        props: &Value,
-    ) -> Self {
-        let mut instance = Self { root, template, compiled, ..Default::default() };
+    pub fn render_compiled(world: &mut World, root: Entity, compiled: Arc<CompiledTemplate>, props: &Value) -> Self {
+        let mut instance = Self { root, compiled, ..Default::default() };
         if let Some(root_id) = instance.compiled.root {
             let mut pending = Pending::default();
-            instance.spawn_element(world, props, &mut pending, root_id, Some(root), None, &[], OwnerRef::Root);
+            instance.spawn_element(world, props, &mut pending, root_id, Some(root), None, &[], None, OwnerRef::Root);
         }
         instance
     }
 
     /// Returns true if any node of the template has a `style` or `:style` attribute.
     pub fn has_inline_styles(&self) -> bool {
-        self.compiled.nodes.iter().any(|node| !node.styles.is_empty())
+        self.compiled.has_inline_styles
     }
 
     /// The styles of the template and of the components it uses.
@@ -367,8 +434,9 @@ impl TemplateInstance {
         &self.compiled.styles
     }
 
-    pub fn template(&self) -> &Arc<BevueTemplate> {
-        &self.template
+    /// The compiled template this instance renders.
+    pub fn compiled(&self) -> &Arc<CompiledTemplate> {
+        &self.compiled
     }
 
     pub fn stats(&self) -> InstanceStats {
@@ -379,7 +447,7 @@ impl TemplateInstance {
     /// re-evaluated, which is used when props were replaced without change flags.
     pub fn update(&mut self, world: &mut World, props: &Value, full: bool) -> UpdateStats {
         let mut stats = UpdateStats { full, ..Default::default() };
-        let mut pending = Pending::default();
+        let mut pending = Pending { track_fresh: true, ..Default::default() };
         if full {
             fire_all(&self.root_trie, &mut pending);
         } else {
@@ -407,7 +475,7 @@ impl TemplateInstance {
             stats.reconciled += fors.len();
             for block in fors {
                 let force = pending.force_full.contains(&block);
-                self.reconcile(world, props, &mut pending, block, force);
+                self.reconcile(world, props, &mut pending, block, force, None);
             }
             for (block_id, index) in routed {
                 self.walk_item(world, props, &mut pending, block_id, index);
@@ -418,7 +486,7 @@ impl TemplateInstance {
         let fired: Vec<_> = pending.fired.drain(..).filter(|id| seen.insert(*id)).collect();
         for &id in &fired {
             if let Some(BindingKind::If(block)) = self.bindings.get(id).map(|b| b.kind) {
-                self.update_if(world, props, &mut pending, block);
+                self.update_if(world, props, &mut pending, block, None);
             }
         }
         for &id in &fired {
@@ -441,23 +509,21 @@ impl TemplateInstance {
         let compiled = self.compiled.clone();
         let list = compiled.get(block.node).list.as_ref().unwrap();
         let parent = block.parent;
-        let frames = self.frames(world, &block.scope, props);
-        let mut call = caller(world, self.root, parent);
-        let Some(path) = eval_path(&list.iterable, &mut EvalCtx::new(&frames, props, &mut call)) else { return };
-        let Some(element) = props.at(&path.join(index)) else { return };
-        let keyed = block.keyed;
         let block_binding = block.binding;
+        let mut frames = self.frames(world, block.scope, props);
+        let mut call = caller(world, self.root, parent);
+        let Some(list_value) = resolve(&list.iterable, &mut EvalCtx::new(&frames, props, &mut call)) else { return };
+        let Some(element) = list_value.index(index) else { return };
 
         let item = self.items.get(item_id).unwrap();
         walk(&item.trie, element, false, pending);
 
         // If the element's key changed in place, the list must be reconciled again so entity
         // identity keeps following keys.
-        if keyed && let Some(key_expr) = &list.key {
-            let mut key_frames = frames;
-            key_frames.push(Frame::path(path.join(index), index));
-            let key = eval(key_expr, &mut EvalCtx::new(&key_frames, props, &mut call)).to_string();
-            if key != item.key
+        if let Some(key_expr) = &list.key {
+            frames.push(Frame::new(element, index));
+            let key = eval(key_expr, &mut EvalCtx::new(&frames, props, &mut call));
+            if !item.key.matches(&key)
                 && let Some(binding) = block_binding
             {
                 pending.fired.push(binding);
@@ -467,112 +533,159 @@ impl TemplateInstance {
 
     // Spawning
 
-    /// Spawns the element for `node_id` (or reuses `entity`) with its subtree.
+    /// Spawns the element for `node_id` (or reuses `entity`) with its subtree. `frames` are the
+    /// frames of the `v-for` items in `scope`.
     #[allow(clippy::too_many_arguments)]
-    fn spawn_element(
+    fn spawn_element<'p>(
         &mut self,
         world: &mut World,
-        props: &Value,
+        props: &'p Value,
         pending: &mut Pending,
         node_id: NodeId,
         entity: Option<Entity>,
         parent: Option<Entity>,
-        scope: &[ItemId],
+        frames: &[Frame<'p>],
+        scope: Option<ItemId>,
         owner: OwnerRef,
     ) -> Entity {
         let compiled = self.compiled.clone();
         let node = compiled.get(node_id);
-        let entity = entity.unwrap_or_else(|| world.spawn_empty().id());
+        let template_ref = TemplateRef::new(self.root, node_id);
 
-        let mut entity_mut = world.entity_mut(entity);
-        entity_mut.insert(TemplateRef::new(self.root, node_id));
-        if !entity_mut.contains::<Node>() {
-            entity_mut.insert(Node::default());
-        }
-        if let Some(parent) = parent {
-            entity_mut.insert(ChildOf(parent));
-            self.owned_mut(owner).elements.push(entity);
+        // A new child whose expressions call no function is evaluated before it exists, and spawned
+        // with all of its components at once. Functions are given the entity, so otherwise it is
+        // spawned first.
+        let deferred = entity.is_none() && parent.is_some() && !node.calls_functions;
+        let existing = (!deferred).then(|| {
+            let entity = entity.unwrap_or_else(|| world.spawn_empty().id());
+            let mut entity_mut = world.entity_mut(entity);
+            entity_mut.insert(template_ref);
+            if !entity_mut.contains::<Node>() {
+                entity_mut.insert(Node::default());
+            }
+            if let Some(parent) = parent {
+                entity_mut.insert(ChildOf(parent));
+            }
+            entity
+        });
+        let call_entity = existing.unwrap_or(Entity::PLACEHOLDER);
+
+        let text = if node.dynamic_text {
+            let mut text = String::new();
+            let mut call = caller(world, self.root, call_entity);
+            write_text(node.text.as_ref().unwrap(), &mut EvalCtx::new(frames, props, &mut call), &mut text);
+            Some(text)
+        } else {
+            node.static_text.clone()
+        };
+        let classes = if node.dynamic_classes {
+            let mut call = caller(world, self.root, call_entity);
+            Some(ClassList::new_with_classes(class_names(&node.classes, &mut EvalCtx::new(frames, props, &mut call))))
+        } else {
+            node.static_classes.clone()
+        };
+        let style = if node.dynamic_styles {
+            let mut call = caller(world, self.root, call_entity);
+            Some(inline_style(&node.styles, &mut EvalCtx::new(frames, props, &mut call)))
+        } else {
+            node.static_style.clone()
+        };
+
+        let mut entity_mut = match existing {
+            Some(entity) => {
+                let mut entity_mut = world.entity_mut(entity);
+                match (text, classes) {
+                    (Some(text), Some(classes)) => {
+                        entity_mut.insert((Text::new(text), classes));
+                    }
+                    (Some(text), None) => {
+                        entity_mut.insert(Text::new(text));
+                    }
+                    (None, classes) => {
+                        if parent.is_none() {
+                            entity_mut.remove::<Text>();
+                        }
+                        if let Some(classes) = classes {
+                            entity_mut.insert(classes);
+                        }
+                    }
+                }
+                entity_mut
+            }
+            None => {
+                let base = (template_ref, Node::default(), ChildOf(parent.unwrap()));
+                match (text, classes) {
+                    (Some(text), Some(classes)) => world.spawn((base, Text::new(text), classes)),
+                    (Some(text), None) => world.spawn((base, Text::new(text))),
+                    (None, Some(classes)) => world.spawn((base, classes)),
+                    (None, None) => world.spawn(base),
+                }
+            }
+        };
+        if let Some(style) = style {
+            write_style(&mut entity_mut, style);
         }
         // `Node` requires `FocusPolicy::Pass`, so every listening node under the cursor gets its own
         // `Interaction`, like DOM events reaching all ancestors.
-        if node.interactive() && !entity_mut.contains::<Interaction>() {
+        if node.interactive && !entity_mut.contains::<Interaction>() {
             entity_mut.insert(Interaction::default());
         }
+        let entity = entity_mut.id();
+
+        if node.dynamic_text {
+            self.add_binding(entity, node_id, BindingKind::Text, scope, owner, &node.text_deps, DepMode::Deep);
+        }
+        if node.dynamic_classes {
+            self.add_binding(entity, node_id, BindingKind::Class, scope, owner, &node.class_deps, DepMode::Deep);
+        }
+        if node.dynamic_styles {
+            self.add_binding(entity, node_id, BindingKind::Style, scope, owner, &node.style_deps, DepMode::Deep);
+        }
         if !node.listeners.is_empty() {
-            self.listeners.insert(entity, (node_id, scope.to_vec()));
+            self.listeners.insert(entity, (node_id, scope));
+        }
+        if parent.is_some() && (node.has_blocks || !node.listeners.is_empty()) {
+            self.owned_mut(owner).elements.push(entity);
         }
 
-        match &node.text {
-            Some(text) if text.is_static() => {
-                let text = render_text(text, &mut EvalCtx::new(&[], props, &mut no_calls));
-                world.entity_mut(entity).insert(Text::new(text));
-            }
-            Some(text) => {
-                let exprs = text.0.iter().filter_map(|f| match f {
-                    crate::core::compile::CompiledFragment::Expr(e) => Some(e),
-                    _ => None,
-                });
-                let id = self.add_binding(entity, node_id, BindingKind::Text, scope, owner, exprs, DepMode::Deep);
-                self.apply(world, props, id);
-            }
-            None if parent.is_none() => {
-                world.entity_mut(entity).remove::<Text>();
-            }
-            None => {}
+        let mut slots = Vec::new();
+        if node.has_blocks {
+            slots.reserve_exact(node.slots.len());
         }
-
-        if node.has_dynamic_classes() {
-            let id = self.add_binding(entity, node_id, BindingKind::Class, scope, owner, node.classes.iter(), DepMode::Deep);
-            self.apply(world, props, id);
-        } else if !node.classes.is_empty() {
-            let names = class_names(&node.classes, &mut EvalCtx::new(&[], props, &mut no_calls));
-            world.entity_mut(entity).insert(ClassList::new_with_classes(names));
-        }
-
-        if node.has_dynamic_styles() {
-            let id = self.add_binding(entity, node_id, BindingKind::Style, scope, owner, node.styles.iter(), DepMode::Deep);
-            self.apply(world, props, id);
-        } else if !node.styles.is_empty() {
-            let style = inline_style(&node.styles, &mut EvalCtx::new(&[], props, &mut no_calls));
-            world.entity_mut(entity).insert(style);
-        }
-
-        let mut slots = Vec::with_capacity(node.slots.len());
-        for slot in &node.slots {
+        for (slot_index, slot) in node.slots.iter().enumerate() {
             match slot {
                 Slot::Static(child) => {
-                    let child = self.spawn_element(world, props, pending, *child, None, Some(entity), scope, owner);
-                    slots.push(SlotState::Static(child));
+                    let child = self.spawn_element(world, props, pending, *child, None, Some(entity), frames, scope, owner);
+                    if node.has_blocks {
+                        slots.push(SlotState::Static(child));
+                    }
                 }
                 Slot::If(chain) => {
                     let block = self.blocks.insert(Block::If(IfBlock {
                         parent: entity,
-                        chain: chain.clone(),
-                        scope: scope.to_vec(),
+                        node: node_id,
+                        slot: slot_index,
+                        scope,
                         active: None,
                         entity: None,
                         owned: Owned::default(),
                         binding: None,
                     }));
                     self.owned_mut(owner).blocks.push(block);
-                    let conditions = chain.0.iter().filter_map(|(cond, _)| cond.as_ref());
-                    let binding =
-                        self.add_binding(entity, node_id, BindingKind::If(block), scope, owner, conditions, DepMode::Deep);
+                    let binding = self.add_binding(entity, node_id, BindingKind::If(block), scope, owner, &chain.1, DepMode::Deep);
                     if let Some(Block::If(b)) = self.blocks.get_mut(block) {
                         b.binding = Some(binding);
                     }
                     slots.push(SlotState::Block(block));
-                    self.update_if(world, props, pending, block);
+                    self.update_if(world, props, pending, block, Some(frames));
                 }
                 Slot::For(child) => {
                     let list = compiled.get(*child).list.as_ref().unwrap();
-                    let keyed = list.key.is_some();
                     let block = self.blocks.insert(Block::For(ForBlock {
                         parent: entity,
                         node: *child,
-                        scope: scope.to_vec(),
+                        scope,
                         items: Vec::new(),
-                        keyed,
                         binding: None,
                         route: None,
                         computed: None,
@@ -581,60 +694,62 @@ impl TemplateInstance {
 
                     // A static iterable path routes element changes into items; a dynamic one
                     // (e.g. `groups[g]`) re-reconciles on any change below its static prefix.
-                    let is_static = matches!(&list.iterable, CompiledExpr::Path { root, segments }
-                        if !matches!(root, ScopeRef::Index(_)) && segments.iter().all(|s| matches!(s, CompiledSegment::Static(_))));
-                    let mode = if is_static { DepMode::Shallow } else { DepMode::Deep };
-                    let binding = self.add_binding(
-                        entity,
-                        *child,
-                        BindingKind::For(block),
-                        scope,
-                        owner,
-                        std::iter::once(&list.iterable),
-                        mode,
-                    );
-                    let route = if is_static {
-                        let mut deps = Vec::new();
-                        list.iterable.dependencies(&mut deps);
-                        deps.pop().and_then(|(root, path)| {
-                            let owner = self.trie_owner(root, scope)?;
-                            self.trie_mut(owner)?.node_mut(&path).for_blocks.push(block);
-                            Some((owner, path))
-                        })
-                    } else {
-                        None
-                    };
+                    let mode = if list.route.is_some() { DepMode::Shallow } else { DepMode::Deep };
+                    let binding = self.add_binding(entity, *child, BindingKind::For(block), scope, owner, &list.deps, mode);
+                    let route = list.route.as_ref().and_then(|dep| {
+                        let owner = self.trie_owner(dep.root, scope)?;
+                        self.trie_mut(owner)?.node_mut(&dep.path).for_blocks.push(block);
+                        Some((owner, dep.path.clone()))
+                    });
                     if let Some(Block::For(b)) = self.blocks.get_mut(block) {
                         b.binding = Some(binding);
                         b.route = route;
                     }
                     slots.push(SlotState::Block(block));
-                    self.reconcile(world, props, pending, block, false);
+                    self.reconcile(world, props, pending, block, false, Some(frames));
                 }
             }
         }
 
-        self.elements.insert(entity, slots);
-        self.sync_children(world, entity);
+        // Children are spawned in slot order, so they start in the right order.
+        if node.has_blocks {
+            self.elements.insert(entity, slots);
+        }
         entity
     }
 
-    /// Re-evaluates an if-chain and swaps the rendered branch if it changed.
-    fn update_if(&mut self, world: &mut World, props: &Value, pending: &mut Pending, block_id: BlockId) {
+    /// Re-evaluates an if-chain and swaps the rendered branch if it changed. `frames` are given
+    /// while the chain's parent is being spawned, which also places the branch in order.
+    fn update_if<'p>(
+        &mut self,
+        world: &mut World,
+        props: &'p Value,
+        pending: &mut Pending,
+        block_id: BlockId,
+        frames: Option<&[Frame<'p>]>,
+    ) {
         let Some(Block::If(block)) = self.blocks.get(block_id) else { return };
-        let frames = self.frames(world, &block.scope, props);
-        let active = {
-            let mut call = caller(world, self.root, block.parent);
-            let mut ctx = EvalCtx::new(&frames, props, &mut call);
-            block.chain.0.iter().position(|(cond, _)| cond.as_ref().is_none_or(|c| eval(c, &mut ctx).is_truthy()))
+        let (parent, scope, current) = (block.parent, block.scope, block.active);
+        let compiled = self.compiled.clone();
+        let Slot::If(chain) = &compiled.get(block.node).slots[block.slot] else { return };
+        let initial = frames.is_some();
+        let owned_frames;
+        let frames = match frames {
+            Some(frames) => frames,
+            None => {
+                owned_frames = self.frames(world, scope, props);
+                &owned_frames
+            }
         };
-        if active == block.active {
+        let active = {
+            let mut call = caller(world, self.root, parent);
+            let mut ctx = EvalCtx::new(frames, props, &mut call);
+            chain.0.iter().position(|(cond, _)| cond.as_ref().is_none_or(|c| eval(c, &mut ctx).is_truthy()))
+        };
+        if active == current {
             return;
         }
-
-        let parent = block.parent;
-        let scope = block.scope.clone();
-        let node = active.map(|i| block.chain.0[i].1);
+        let node = active.map(|i| chain.0[i].1);
 
         let Some(Block::If(block)) = self.blocks.get_mut(block_id) else { return };
         let old_entity = block.entity.take();
@@ -649,78 +764,119 @@ impl TemplateInstance {
 
         if let Some(node) = node {
             let entity =
-                self.spawn_element(world, props, pending, node, None, Some(parent), &scope, OwnerRef::Branch(block_id));
+                self.spawn_element(world, props, pending, node, None, Some(parent), frames, scope, OwnerRef::Branch(block_id));
             if let Some(Block::If(block)) = self.blocks.get_mut(block_id) {
                 block.entity = Some(entity);
             }
         }
-        self.sync_children(world, parent);
+        if !initial {
+            self.sync_children(world, parent);
+        }
     }
 
     /// Matches the items of a list block against the current elements by key, reusing, spawning
-    /// and despawning items as needed.
-    fn reconcile(&mut self, world: &mut World, props: &Value, pending: &mut Pending, block_id: BlockId, force: bool) {
+    /// and despawning items as needed. `frames` are given while the list's parent is being
+    /// spawned, which also places the items in order.
+    fn reconcile<'p>(
+        &mut self,
+        world: &mut World,
+        props: &'p Value,
+        pending: &mut Pending,
+        block_id: BlockId,
+        force: bool,
+        frames: Option<&[Frame<'p>]>,
+    ) {
         let compiled = self.compiled.clone();
         let Some(Block::For(block)) = self.blocks.get(block_id) else { return };
-        let list = compiled.get(block.node).list.as_ref().unwrap();
-        let frames = self.frames(world, &block.scope, props);
-        let mut call = caller(world, self.root, block.parent);
-
-        // An iterable that is a prop path is read in place; anything else (a call) is computed
-        // and cached for the items' frames.
-        let mut ctx = EvalCtx::new(&frames, props, &mut call);
-        let base = eval_path(&list.iterable, &mut ctx);
-        let iterable = eval(&list.iterable, &mut ctx);
-        let elements: &[Value] = iterable.as_list().map(Vec::as_slice).unwrap_or(&[]);
-        let computed: Option<Arc<[Value]>> = match base {
-            Some(_) => None,
-            None => Some(Arc::from(elements.to_vec())),
-        };
-        let element_frame = |index: usize| match (&base, &computed) {
-            (Some(base), _) => Frame::path(base.join(index), index),
-            (None, Some(list)) => Frame { element: FrameElement::Value(list.clone()), index },
-            (None, None) => unreachable!(),
-        };
-
-        let keys: Vec<String> = (0..elements.len())
-            .map(|i| match &list.key {
-                Some(key) => {
-                    let mut key_frames = frames.clone();
-                    key_frames.push(element_frame(i));
-                    eval(key, &mut EvalCtx::new(&key_frames, props, &mut call)).to_string()
-                }
-                None => format!("#{i}"),
-            })
-            .collect();
-        drop(call);
+        let (parent, node, scope) = (block.parent, block.node, block.scope);
         // Items of an iterable that is not a static path get no element routing, so reused
         // items must always be re-evaluated.
         let force = force || block.route.is_none();
+        let list = compiled.get(node).list.as_ref().unwrap();
+        let initial = frames.is_some();
+        let mut item_frames = match frames {
+            Some(frames) => frames.to_vec(),
+            None => self.frames(world, scope, props),
+        };
 
-        let mut by_key: HashMap<String, VecDeque<ItemId>> = HashMap::new();
-        for &item_id in &block.items {
-            let key = self.items.get(item_id).unwrap().key.clone();
-            by_key.entry(key).or_default().push_back(item_id);
-        }
-        let mut reused: Vec<Option<ItemId>> =
-            keys.iter().map(|k| by_key.get_mut(k.as_str()).and_then(VecDeque::pop_front)).collect();
-        let removed: Vec<ItemId> = by_key.into_values().flatten().collect();
+        // An iterable that is a prop path is read in place; anything else (a call) is computed
+        // and kept for the items' frames.
+        let mut call = caller(world, self.root, parent);
+        let base = resolve(&list.iterable, &mut EvalCtx::new(&item_frames, props, &mut call));
+        let computed: Option<Arc<[Value]>> = match base {
+            Some(_) => None,
+            None => {
+                let value = eval(&list.iterable, &mut EvalCtx::new(&item_frames, props, &mut call)).into_owned();
+                Some(value.into_list().unwrap_or_default().into())
+            }
+        };
+        let elements: &[Value] = match (base, &computed) {
+            (Some(base), _) => base.as_list().map(Vec::as_slice).unwrap_or(&[]),
+            (None, Some(list)) => list,
+            (None, None) => &[],
+        };
+        let element_frame = |index: usize| match &computed {
+            Some(list) => Frame::computed(list.clone(), index),
+            None => Frame::new(&elements[index], index),
+        };
 
-        let keyed = block.keyed;
-        let parent = block.parent;
-        let node = block.node;
-        let scope = block.scope.clone();
+        let keys: Vec<ItemKey> = match &list.key {
+            Some(key) => (0..elements.len())
+                .map(|index| {
+                    item_frames.push(element_frame(index));
+                    let key = ItemKey::of(&eval(key, &mut EvalCtx::new(&item_frames, props, &mut call)));
+                    item_frames.pop();
+                    key
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        drop(call);
+        let keyed = list.key.is_some();
+
+        let Some(Block::For(block)) = self.blocks.get(block_id) else { return };
+        let (reused, removed): (Vec<Option<ItemId>>, Vec<ItemId>) = if keyed {
+            // Items are matched by key, in order among items with the same key.
+            let mut by_key: HashMap<&ItemKey, ItemId> = HashMap::with_capacity(block.items.len());
+            let mut duplicates: Vec<(&ItemKey, ItemId)> = Vec::new();
+            for &item_id in &block.items {
+                let key = &self.items.get(item_id).unwrap().key;
+                if by_key.contains_key(key) {
+                    duplicates.push((key, item_id));
+                } else {
+                    by_key.insert(key, item_id);
+                }
+            }
+            let reused = keys
+                .iter()
+                .map(|key| {
+                    by_key.remove(key).or_else(|| {
+                        let index = duplicates.iter().position(|(k, _)| *k == key)?;
+                        Some(duplicates.remove(index).1)
+                    })
+                })
+                .collect();
+            let removed = by_key.into_values().chain(duplicates.into_iter().map(|(_, id)| id)).collect();
+            (reused, removed)
+        } else {
+            // Without keys, items are matched by position.
+            let reused = (0..elements.len()).map(|index| block.items.get(index).copied()).collect();
+            let removed = block.items.get(elements.len()..).unwrap_or_default().to_vec();
+            (reused, removed)
+        };
 
         if let Some(Block::For(block)) = self.blocks.get_mut(block_id) {
-            block.computed = computed;
+            block.computed = computed.clone();
         }
         for item_id in removed {
             self.remove_item(world, item_id);
         }
 
-        let mut new_items = Vec::with_capacity(keys.len());
-        for (index, key) in keys.into_iter().enumerate() {
-            match reused[index].take() {
+        let mut keys = keys.into_iter();
+        let mut new_items = Vec::with_capacity(reused.len());
+        for (index, reused) in reused.into_iter().enumerate() {
+            let key = if keyed { keys.next().unwrap() } else { ItemKey::Position(index) };
+            match reused {
                 Some(item_id) => {
                     let item = self.items.get_mut(item_id).unwrap();
                     if item.index != index {
@@ -744,12 +900,25 @@ impl TemplateInstance {
                         trie: DepTrie::default(),
                         index_bindings: Vec::new(),
                         owned: Owned::default(),
+                        parent: scope,
+                        level: list.level,
                     });
-                    pending.fresh.insert(item_id);
-                    let mut item_scope = scope.clone();
-                    item_scope.push(item_id);
-                    let entity =
-                        self.spawn_element(world, props, pending, node, None, Some(parent), &item_scope, OwnerRef::Item(item_id));
+                    if pending.track_fresh {
+                        pending.fresh.insert(item_id);
+                    }
+                    item_frames.push(element_frame(index));
+                    let entity = self.spawn_element(
+                        world,
+                        props,
+                        pending,
+                        node,
+                        None,
+                        Some(parent),
+                        &item_frames,
+                        Some(item_id),
+                        OwnerRef::Item(item_id),
+                    );
+                    item_frames.pop();
                     self.items.get_mut(item_id).unwrap().entity = entity;
                     new_items.push(item_id);
                 }
@@ -759,31 +928,29 @@ impl TemplateInstance {
         if let Some(Block::For(block)) = self.blocks.get_mut(block_id) {
             block.items = new_items;
         }
-        self.sync_children(world, parent);
+        if !initial {
+            self.sync_children(world, parent);
+        }
     }
 
     // Bindings
 
     #[allow(clippy::too_many_arguments)]
-    fn add_binding<'e>(
+    fn add_binding(
         &mut self,
         entity: Entity,
         node: NodeId,
         kind: BindingKind,
-        scope: &[ItemId],
+        scope: Option<ItemId>,
         owner: OwnerRef,
-        exprs: impl Iterator<Item = &'e CompiledExpr>,
+        deps: &[Dep],
         mode: DepMode,
     ) -> BindingId {
-        let mut deps = Vec::new();
-        for expr in exprs {
-            expr.dependencies(&mut deps);
-        }
-        let id = self.bindings.insert(Binding { entity, node, kind, scope: scope.to_vec(), registrations: Vec::new() });
+        let id = self.bindings.insert(Binding { entity, node, kind, scope, registrations: Vec::new() });
 
         let mut registrations = Vec::with_capacity(deps.len());
-        for (root, path) in deps {
-            let Some(trie_owner) = self.trie_owner(root, scope) else { continue };
+        for dep in deps {
+            let Some(trie_owner) = self.trie_owner(dep.root, scope) else { continue };
             match trie_owner {
                 TrieOwner::ItemIndex(item) => {
                     if let Some(item) = self.items.get_mut(item) {
@@ -792,11 +959,11 @@ impl TemplateInstance {
                 }
                 _ => {
                     if let Some(trie) = self.trie_mut(trie_owner) {
-                        trie.node_mut(&path).bindings.push((id, mode));
+                        trie.node_mut(&dep.path).bindings.push((id, mode));
                     }
                 }
             }
-            registrations.push((trie_owner, path));
+            registrations.push((trie_owner, dep.path.clone()));
         }
         self.bindings.get_mut(id).unwrap().registrations = registrations;
         self.owned_mut(owner).bindings.push(id);
@@ -806,68 +973,77 @@ impl TemplateInstance {
     /// Re-evaluates a text, class or style binding and writes it to its entity if it changed.
     fn apply(&mut self, world: &mut World, props: &Value, id: BindingId) {
         let Some(binding) = self.bindings.get(id) else { return };
+        let (entity, scope) = (binding.entity, binding.scope);
         let node = self.compiled.get(binding.node);
         match binding.kind {
             BindingKind::Text => {
-                let frames = self.frames(world, &binding.scope, props);
-                let mut call = caller(world, self.root, binding.entity);
-                let text = render_text(node.text.as_ref().unwrap(), &mut EvalCtx::new(&frames, props, &mut call));
+                let frames = self.frames(world, scope, props);
+                let mut text = std::mem::take(&mut self.text_buffer);
+                text.clear();
+                let mut call = caller(world, self.root, entity);
+                write_text(node.text.as_ref().unwrap(), &mut EvalCtx::new(&frames, props, &mut call), &mut text);
                 drop(call);
-                let Ok(mut entity) = world.get_entity_mut(binding.entity) else { return };
-                match entity.get_mut::<Text>() {
-                    Some(mut current) => {
-                        if current.0 != text {
-                            current.0 = text;
+                if let Ok(mut entity) = world.get_entity_mut(entity) {
+                    match entity.get_mut::<Text>() {
+                        Some(mut current) => {
+                            if current.0 != text {
+                                current.0.clone_from(&text);
+                            }
+                        }
+                        None => {
+                            entity.insert(Text::new(text.clone()));
                         }
                     }
-                    None => {
-                        entity.insert(Text::new(text));
-                    }
                 }
+                self.text_buffer = text;
             }
             BindingKind::Class => {
-                let frames = self.frames(world, &binding.scope, props);
-                let mut call = caller(world, self.root, binding.entity);
+                let frames = self.frames(world, scope, props);
+                let mut call = caller(world, self.root, entity);
                 let names = class_names(&node.classes, &mut EvalCtx::new(&frames, props, &mut call));
                 drop(call);
                 let classes = ClassList::new_with_classes(names);
-                let Ok(mut entity) = world.get_entity_mut(binding.entity) else { return };
+                let Ok(mut entity) = world.get_entity_mut(entity) else { return };
                 if entity.get::<ClassList>() != Some(&classes) {
                     entity.insert(classes);
                 }
             }
             BindingKind::Style => {
-                let frames = self.frames(world, &binding.scope, props);
-                let mut call = caller(world, self.root, binding.entity);
+                let frames = self.frames(world, scope, props);
+                let mut call = caller(world, self.root, entity);
                 let style = inline_style(&node.styles, &mut EvalCtx::new(&frames, props, &mut call));
                 drop(call);
-                let Ok(mut entity) = world.get_entity_mut(binding.entity) else { return };
-                // An emptied style still replaces the previous one, or flair keeps applying it.
-                let current = entity.get::<InlineStyle>();
-                if current != Some(&style) && (current.is_some() || style != InlineStyle::default()) {
-                    entity.insert(style);
-                }
+                let Ok(mut entity) = world.get_entity_mut(entity) else { return };
+                write_style(&mut entity, style);
             }
             BindingKind::If(_) | BindingKind::For(_) => {}
         }
     }
 
-    /// Resolves the frames of the `v-for` items in `scope` for evaluation.
-    fn frames(&self, world: &mut World, scope: &[ItemId], props: &Value) -> Vec<Frame> {
-        let mut frames: Vec<Frame> = Vec::with_capacity(scope.len());
-        for &item_id in scope {
+    /// Resolves the frames of the `v-for` items enclosing `scope`, outermost first.
+    fn frames<'p>(&self, world: &mut World, scope: Option<ItemId>, props: &'p Value) -> Vec<Frame<'p>> {
+        let mut chain = Vec::new();
+        let mut current = scope;
+        while let Some(item_id) = current {
             let Some(item) = self.items.get(item_id) else { break };
+            chain.push(item);
+            current = item.parent;
+        }
+
+        let mut frames: Vec<Frame<'p>> = Vec::with_capacity(chain.len());
+        for item in chain.into_iter().rev() {
             let Some(Block::For(block)) = self.blocks.get(item.block) else { break };
-            let element = match &block.computed {
-                Some(list) => FrameElement::Value(list.clone()),
+            let frame = match &block.computed {
+                Some(list) => Frame::computed(list.clone(), item.index),
                 None => {
                     let list = self.compiled.get(block.node).list.as_ref().unwrap();
                     let mut call = caller(world, self.root, block.parent);
-                    let base = eval_path(&list.iterable, &mut EvalCtx::new(&frames, props, &mut call));
-                    FrameElement::Path(base.unwrap_or_default().join(item.index))
+                    let element = resolve(&list.iterable, &mut EvalCtx::new(&frames, props, &mut call))
+                        .and_then(|list| list.index(item.index));
+                    Frame::new(element.unwrap_or(&NULL), item.index)
                 }
             };
-            frames.push(Frame { element, index: item.index });
+            frames.push(frame);
         }
         frames
     }
@@ -882,10 +1058,10 @@ impl TemplateInstance {
         name: &str,
         args: &[Value],
     ) -> Vec<ResolvedHandler> {
-        let Some((node_id, scope)) = self.listeners.get(&entity) else { return Vec::new() };
+        let Some(&(node_id, scope)) = self.listeners.get(&entity) else { return Vec::new() };
         let compiled = self.compiled.clone();
         let mut resolved = Vec::new();
-        for listener in compiled.get(*node_id).listeners_for(name) {
+        for listener in compiled.get(node_id).listeners_for(name) {
             let Some(handler) = &listener.handler else { continue };
             let (function, args) = match handler {
                 CompiledHandler::Function(function) => (function.to_string(), args.to_vec()),
@@ -919,11 +1095,23 @@ impl TemplateInstance {
         self.root
     }
 
-    fn trie_owner(&self, root: ScopeRef, scope: &[ItemId]) -> Option<TrieOwner> {
+    /// The trie a dependency on `root` is registered in, for a binding inside `scope`.
+    fn trie_owner(&self, root: ScopeRef, scope: Option<ItemId>) -> Option<TrieOwner> {
+        let item_at = |level: usize| {
+            let mut current = scope;
+            while let Some(item_id) = current {
+                let item = self.items.get(item_id)?;
+                if item.level == level {
+                    return Some(item_id);
+                }
+                current = item.parent;
+            }
+            None
+        };
         Some(match root {
             ScopeRef::Props => TrieOwner::Root,
-            ScopeRef::Item(level) => TrieOwner::Item(*scope.get(level)?),
-            ScopeRef::Index(level) => TrieOwner::ItemIndex(*scope.get(level)?),
+            ScopeRef::Item(level) => TrieOwner::Item(item_at(level)?),
+            ScopeRef::Index(level) => TrieOwner::ItemIndex(item_at(level)?),
             ScopeRef::Event => return None,
         })
     }
@@ -1006,7 +1194,7 @@ impl TemplateInstance {
         }
     }
 
-    /// Orders `parent`'s children as its slots dictate.
+    /// Orders `parent`'s children as its slots dictate, after a block changed.
     fn sync_children(&self, world: &mut World, parent: Entity) {
         let Some(slots) = self.elements.get(&parent) else { return };
         let mut children = Vec::new();
@@ -1023,7 +1211,19 @@ impl TemplateInstance {
             }
         }
         children.retain(|e| *e != Entity::PLACEHOLDER);
-        if let Ok(mut parent) = world.get_entity_mut(parent) {
+        let Ok(mut parent) = world.get_entity_mut(parent) else { return };
+        let current: &[Entity] = parent.get::<Children>().map_or(&[], |c| &**c);
+        if current == children.as_slice() {
+            return;
+        }
+        if current.len() == children.len() {
+            // The same children in another order: every rendered child is already a child of
+            // `parent`, as spawned items and branches are, so sorting is enough.
+            let positions: EntityHashMap<usize> = children.iter().enumerate().map(|(i, e)| (*e, i)).collect();
+            if let Some(mut current) = parent.get_mut::<Children>() {
+                current.sort_by_key(|e| positions.get(e).copied().unwrap_or(usize::MAX));
+            }
+        } else {
             parent.replace_children(&children);
         }
     }
@@ -1109,7 +1309,7 @@ fn has_real_change(value: &Value) -> bool {
 fn fire_all(trie: &DepTrie, pending: &mut Pending) {
     pending.fired.extend(trie.bindings.iter().map(|(id, _)| *id));
     pending.force_full.extend(trie.for_blocks.iter().copied());
-    for child in trie.children.values() {
+    for (_, child) in &trie.children {
         fire_all(child, pending);
     }
 }

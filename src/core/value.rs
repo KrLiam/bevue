@@ -211,12 +211,34 @@ impl Value {
     /// Renders this value as interpolated text: strings are written raw and `null` is empty.
     pub fn to_text(&self) -> String {
         match &self.t {
-            ValueType::Null => String::new(),
-            ValueType::Boolean(b) => b.to_string(),
-            ValueType::Number(n) => n.to_string(),
             ValueType::String(s) => s.clone(),
-            ValueType::List(_) | ValueType::Dict(_) => self.to_string(),
+            _ => {
+                let mut out = String::new();
+                self.write_text(&mut out);
+                out
+            }
         }
+    }
+
+    /// Appends this value as interpolated text to `out`, like [`Value::to_text`].
+    pub fn write_text(&self, out: &mut String) {
+        use std::fmt::Write;
+        match &self.t {
+            ValueType::Null => {}
+            ValueType::Boolean(b) => out.push_str(if *b { "true" } else { "false" }),
+            ValueType::Number(n) => {
+                let _ = write!(out, "{n}");
+            }
+            ValueType::String(s) => out.push_str(s),
+            ValueType::List(_) | ValueType::Dict(_) => {
+                let _ = write!(out, "{self}");
+            }
+        }
+    }
+
+    /// Unwraps the list if value is `List`, without copying it.
+    pub fn into_list(self) -> Option<Vec<Value>> {
+        match self.t { ValueType::List(v) => Some(v), _ => None }
     }
 
     // Navigation

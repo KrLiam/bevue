@@ -705,6 +705,100 @@ fn nested_lists_and_indices() {
 }
 
 #[test]
+fn nested_lists_follow_reordered_rows() {
+    let mut app = app();
+    let root = spawn(
+        &mut app,
+        r#"<div>
+            <div v-for="(row, i) in rows" :key="row.id">
+                <span v-for="cell in row.cells">{{row.id}}{{i}}:{{cell}}</span>
+            </div>
+        </div>"#,
+        value!({ "rows": [
+            { "id": "a", "cells": ["x", "y"] },
+            { "id": "b", "cells": ["z"] },
+        ] }),
+    );
+    assert_eq!(texts(app.world(), root), vec!["a0:x", "a0:y", "b1:z"]);
+    let rows = children(app.world(), root);
+
+    props(&mut app, root).get_mut("rows").unwrap().swap(0, 1);
+    app.update();
+    assert_eq!(texts(app.world(), root), vec!["b0:z", "a1:x", "a1:y"]);
+    assert_eq!(children(app.world(), root), vec![rows[1], rows[0]]);
+
+    // The inner lists now read their elements through the moved rows.
+    props(&mut app, root).at_mut(&path("rows[1].cells[0]")).unwrap().set("X");
+    props(&mut app, root).at_mut(&path("rows[0].cells")).unwrap().push("w");
+    app.update();
+    assert_eq!(texts(app.world(), root), vec!["b0:z", "b0:w", "a1:X", "a1:y"]);
+}
+
+#[test]
+fn unkeyed_list_grows_and_shrinks() {
+    let mut app = app();
+    let root = spawn(&mut app, r#"<div><p>head</p><span v-for="(x, i) in xs">{{i}}{{x}}</span><p>tail</p></div>"#, value!({ "xs": [] }));
+    assert_eq!(texts(app.world(), root), vec!["head", "tail"]);
+
+    props(&mut app, root).get_mut("xs").unwrap().push("a");
+    props(&mut app, root).get_mut("xs").unwrap().push("b");
+    app.update();
+    assert_eq!(texts(app.world(), root), vec!["head", "0a", "1b", "tail"]);
+
+    props(&mut app, root).get_mut("xs").unwrap().insert_at(0, "c");
+    app.update();
+    assert_eq!(texts(app.world(), root), vec!["head", "0c", "1a", "2b", "tail"]);
+
+    props(&mut app, root).get_mut("xs").unwrap().truncate(1);
+    app.update();
+    assert_eq!(texts(app.world(), root), vec!["head", "0c", "tail"]);
+    assert_eq!(stats(app.world(), root).items, 1);
+}
+
+#[test]
+fn duplicate_keys_reuse_items_in_order() {
+    let mut app = app();
+    let root = spawn(
+        &mut app,
+        r#"<div><span v-for="x in xs" :key="x.k">{{x.k}}{{x.v}}</span></div>"#,
+        value!({ "xs": [{ "k": 1, "v": "a" }, { "k": 1, "v": "b" }, { "k": 2, "v": "c" }] }),
+    );
+    let initial = children(app.world(), root);
+
+    // Duplicate keys are matched in order: the first item with key 1 is reused for the first
+    // element with that key, and the second one is dropped.
+    props(&mut app, root).get_mut("xs").unwrap().remove_at(0);
+    app.update();
+    assert_eq!(children(app.world(), root), vec![initial[0], initial[2]]);
+}
+
+#[test]
+fn compiled_templates_are_shared_until_modified() {
+    use crate::runtime::render::CompiledTemplates;
+
+    let mut app = app();
+    let template = crate::parser::parse_template(r#"<div><p>{{a}}</p></div>"#).unwrap();
+    let handle = app.world_mut().resource_mut::<Assets<BevueTemplate>>().add(template);
+    let first = app.world_mut().spawn((Template::new(handle.clone()), BevueProps::new(value!({ "a": 1 })))).id();
+    let second = app.world_mut().spawn((Template::new(handle.clone()), BevueProps::new(value!({ "a": 2 })))).id();
+    app.update();
+    let compiled = |app: &App, entity| app.world().get::<TemplateInstance>(entity).unwrap().compiled().clone();
+    assert!(std::sync::Arc::ptr_eq(&compiled(&app, first), &compiled(&app, second)));
+    assert_eq!(app.world().resource::<CompiledTemplates>().len(), 1);
+    assert_eq!(texts(app.world(), second), vec!["2"]);
+
+    let before = compiled(&app, first);
+    let reloaded = crate::parser::parse_template(r#"<div><b>{{a}}!</b></div>"#).unwrap();
+    *app.world_mut().resource_mut::<Assets<BevueTemplate>>().get_mut(&handle).unwrap() = reloaded;
+    app.update();
+    app.update();
+    assert_eq!(texts(app.world(), first), vec!["1!"]);
+    assert_eq!(texts(app.world(), second), vec!["2!"]);
+    assert!(!std::sync::Arc::ptr_eq(&before, &compiled(&app, first)));
+    assert!(std::sync::Arc::ptr_eq(&compiled(&app, first), &compiled(&app, second)));
+}
+
+#[test]
 fn list_inside_if_and_if_inside_list() {
     let mut app = app();
     let root = spawn(

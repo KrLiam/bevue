@@ -22,8 +22,8 @@ pub use props::{
     BevueProps, BevuePropsAppExt, DeclaredProps, PropsComponent, PropsResource, PropsTypeRegistry, RegisterableProps,
 };
 pub use render::{
-    apply_template_classes_and_styles, on_render_template, update_templates, watch_template_components, Template,
-    TemplateRendered, WaitingForTemplate,
+    apply_template_classes_and_styles, on_render_template, update_templates, watch_template_components, CompiledTemplates,
+    Template, TemplateRendered, WaitingForTemplate,
 };
 
 /// The systems of the Bevue runtime, run in this order in `PostUpdate`, before `bevy_flair`'s
@@ -50,6 +50,7 @@ impl Plugin for BevueRuntimePlugin {
         if !app.is_plugin_added::<FlairCssParserPlugin>() {
             app.add_plugins(FlairPlugin);
         }
+        app.init_resource::<CompiledTemplates>();
         app.init_resource::<Messages<WindowEvent>>();
         app.init_resource::<Messages<RequestRedraw>>();
         app.add_observer(on_render_template);

@@ -9,36 +9,50 @@ use crate::core::{
     ops,
     template::BinaryOp,
     compile::{CompiledExpr, CompiledFragment, CompiledSegment, CompiledText, ScopeRef},
-    path::{PathSegment, PropPath},
+    path::PathSegment,
     value::{Value, ValueType},
 };
 
 /// The element of a `v-for` frame.
 #[derive(Debug, Clone, PartialEq)]
-pub enum FrameElement {
-    /// The absolute path of the element in props, for iterables that are prop paths.
-    Path(PropPath),
+pub enum FrameElement<'p> {
+    /// The element itself, for iterables read from props.
+    Ref(&'p Value),
     /// The list computed by a call iterable such as `sorted(items)`; the element is at the
     /// frame's index.
-    Value(Arc<[Value]>),
+    Computed(Arc<[Value]>),
 }
 
 /// A `v-for` frame resolved for evaluation: the current element and its index.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Frame {
-    pub element: FrameElement,
+pub struct Frame<'p> {
+    pub element: FrameElement<'p>,
     pub index: usize,
 }
 
-impl Frame {
-    pub fn path(path: PropPath, index: usize) -> Self {
-        Self { element: FrameElement::Path(path), index }
+impl<'p> Frame<'p> {
+    /// A frame for `element`, read from props, at `index` of its list.
+    pub fn new(element: &'p Value, index: usize) -> Self {
+        Self { element: FrameElement::Ref(element), index }
+    }
+
+    /// A frame for the element at `index` of a computed list.
+    pub fn computed(list: Arc<[Value]>, index: usize) -> Self {
+        Self { element: FrameElement::Computed(list), index }
+    }
+
+    /// The current element.
+    pub fn value(&self) -> &Value {
+        match &self.element {
+            FrameElement::Ref(value) => value,
+            FrameElement::Computed(list) => list.get(self.index).unwrap_or(&NULL),
+        }
     }
 }
 
 /// Everything an expression can read while being evaluated.
 pub struct EvalCtx<'p, 'f, 'c> {
-    pub frames: &'f [Frame],
+    pub frames: &'f [Frame<'p>],
     pub props: &'p Value,
     /// The arguments of the event being handled, for `$event` and `$args`.
     pub event_args: Option<&'p [Value]>,
@@ -47,7 +61,7 @@ pub struct EvalCtx<'p, 'f, 'c> {
 }
 
 impl<'p, 'f, 'c> EvalCtx<'p, 'f, 'c> {
-    pub fn new(frames: &'f [Frame], props: &'p Value, call: &'c mut dyn FnMut(&str, Vec<Value>) -> Value) -> Self {
+    pub fn new(frames: &'f [Frame<'p>], props: &'p Value, call: &'c mut dyn FnMut(&str, Vec<Value>) -> Value) -> Self {
         Self { frames, props, event_args: None, call }
     }
 }
@@ -70,19 +84,19 @@ pub fn eval<'r, 'p: 'r>(expr: &'r CompiledExpr, ctx: &mut EvalCtx<'p, '_, '_>) -
                 None => Cow::Borrowed(&NULL),
             },
             ScopeRef::Props => Cow::Borrowed(navigate(ctx.props, segments, ctx).unwrap_or(&NULL)),
-            ScopeRef::Item(level) => match ctx.frames.get(*level).map(|f| f.element.clone()) {
-                Some(FrameElement::Path(path)) => {
-                    let props = ctx.props;
-                    let start = props.at(&path).unwrap_or(&NULL);
-                    Cow::Borrowed(navigate(start, segments, ctx).unwrap_or(&NULL))
+            ScopeRef::Item(level) => {
+                let frames = ctx.frames;
+                match frames.get(*level) {
+                    Some(Frame { element: FrameElement::Ref(start), .. }) => {
+                        Cow::Borrowed(navigate(start, segments, ctx).unwrap_or(&NULL))
+                    }
+                    Some(frame) => {
+                        let start = frame.value();
+                        Cow::Owned(navigate(start, segments, ctx).cloned().unwrap_or_default())
+                    }
+                    None => Cow::Borrowed(&NULL),
                 }
-                Some(FrameElement::Value(list)) => {
-                    let index = ctx.frames[*level].index;
-                    let start = list.get(index).unwrap_or(&NULL);
-                    Cow::Owned(navigate(start, segments, ctx).cloned().unwrap_or_default())
-                }
-                None => Cow::Borrowed(&NULL),
-            },
+            }
             ScopeRef::Event => {
                 let args = ctx.event_args.unwrap_or(&[]);
                 match segments.split_first() {
@@ -153,26 +167,21 @@ fn navigate<'v>(start: &'v Value, segments: &[CompiledSegment], ctx: &mut EvalCt
     Some(current)
 }
 
-/// Resolves a path expression to an absolute path in props. Returns `None` for literals, calls,
-/// loop indices, event arguments, elements of call iterables and dynamic indices that do not
-/// evaluate to a number or string.
-pub fn eval_path(expr: &CompiledExpr, ctx: &mut EvalCtx<'_, '_, '_>) -> Option<PropPath> {
+/// Resolves a path expression to the value it names in props, borrowed. Returns `None` for
+/// literals, calls, loop indices, event arguments, elements of computed lists and paths that do
+/// not exist.
+pub fn resolve<'p>(expr: &CompiledExpr, ctx: &mut EvalCtx<'p, '_, '_>) -> Option<&'p Value> {
     let CompiledExpr::Path { root, segments } = expr else { return None };
-    let mut path = match root {
-        ScopeRef::Props => PropPath::root(),
-        ScopeRef::Item(level) => match &ctx.frames.get(*level)?.element {
-            FrameElement::Path(path) => path.clone(),
-            FrameElement::Value(_) => return None,
+    let frames = ctx.frames;
+    let start: &'p Value = match root {
+        ScopeRef::Props => ctx.props,
+        ScopeRef::Item(level) => match &frames.get(*level)?.element {
+            FrameElement::Ref(value) => value,
+            FrameElement::Computed(_) => return None,
         },
         ScopeRef::Index(_) | ScopeRef::Event => return None,
     };
-    for segment in segments {
-        match segment {
-            CompiledSegment::Static(s) => path.push(s.clone()),
-            CompiledSegment::Dynamic(index) => path.push(value_segment(&eval(index, ctx))?),
-        }
-    }
-    Some(path)
+    navigate(start, segments, ctx)
 }
 
 /// Converts a value used as an index into a path segment.
@@ -187,13 +196,18 @@ fn value_segment(value: &Value) -> Option<PathSegment> {
 /// Renders interpolated text.
 pub fn render_text(text: &CompiledText, ctx: &mut EvalCtx<'_, '_, '_>) -> String {
     let mut out = String::new();
+    write_text(text, ctx, &mut out);
+    out
+}
+
+/// Renders interpolated text, appending it to `out`.
+pub fn write_text(text: &CompiledText, ctx: &mut EvalCtx<'_, '_, '_>, out: &mut String) {
     for fragment in &text.0 {
         match fragment {
             CompiledFragment::Literal(s) => out.push_str(s),
-            CompiledFragment::Expr(expr) => out.push_str(&eval(expr, ctx).to_text()),
+            CompiledFragment::Expr(expr) => eval(expr, ctx).write_text(out),
         }
     }
-    out
 }
 
 /// Evaluates class attributes like Vue: a string is a whitespace separated list, a list holds
@@ -324,11 +338,12 @@ mod tests {
     fn loop_frames() {
         let props = value!({ "rows": [{ "id": "r0" }, { "id": "r1" }], "grid": ["g0", "g1"] });
         let (compiled, id) = first_text(r#"<div><p v-for="(row, i) in rows">{{row.id}}:{{i}}:{{grid[i]}}</p></div>"#);
-        let frames = [Frame::path(PropPath::parse("rows[1]").unwrap(), 1)];
+        let row = props.at(&crate::core::path::PropPath::parse("rows[1]").unwrap()).unwrap();
+        let frames = [Frame::new(row, 1)];
         assert_eq!(text_of(&compiled, id, &frames, &props), "r1:1:g1");
 
         let computed: Arc<[Value]> = Arc::from(vec![value!({ "id": "c0" }), value!({ "id": "c1" })]);
-        let frames = [Frame { element: FrameElement::Value(computed), index: 0 }];
+        let frames = [Frame::computed(computed, 0)];
         assert_eq!(text_of(&compiled, id, &frames, &props), "c0:0:g0");
     }
 

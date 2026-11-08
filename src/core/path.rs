@@ -1,6 +1,12 @@
 //! Paths into nested prop values, e.g. `a.b[0].c`.
 
-use std::{borrow::Cow, fmt, str::FromStr};
+use std::{
+    borrow::Cow,
+    collections::HashSet,
+    fmt,
+    str::FromStr,
+    sync::{Mutex, OnceLock},
+};
 
 use bevy::prelude::Deref;
 
@@ -35,6 +41,30 @@ impl fmt::Display for PathSegment {
             PathSegment::Key(key) => f.write_str(key),
             PathSegment::Index(i) => write!(f, "[{i}]"),
         }
+    }
+}
+
+/// Returns a `'static` copy of `s`, shared by every call with an equal string.
+///
+/// Template compilation interns the keys of compiled paths, so cloning a [`PathSegment`] of a
+/// compiled template never allocates. Interned strings are never freed: only identifiers and
+/// literal keys of templates are interned, a small set that does not grow when a template is
+/// compiled again.
+pub fn intern(s: &str) -> &'static str {
+    static INTERNED: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let mut interned = INTERNED.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = interned.get(s) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(s.to_owned().into_boxed_str());
+    interned.insert(leaked);
+    leaked
+}
+
+impl PathSegment {
+    /// A key segment with an interned name, which clones without allocating.
+    pub fn interned_key(key: &str) -> Self {
+        PathSegment::Key(Cow::Borrowed(intern(key)))
     }
 }
 

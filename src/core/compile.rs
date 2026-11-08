@@ -9,9 +9,10 @@
 //! replaced by the host's expression for it. The runtime never sees a component, so using one
 //! costs the same as writing its elements in place.
 
-use std::{borrow::Cow, fmt};
+use std::{borrow::Cow, fmt, sync::Arc};
 
 use bevy::asset::Handle;
+use bevy_flair::prelude::{ClassList, InlineStyle};
 
 use crate::core::{
     ops,
@@ -22,6 +23,7 @@ use crate::core::{
     },
     value::Value,
 };
+use crate::runtime::interpolation::{class_names, inline_style, no_calls, render_text, EvalCtx};
 
 /// The root a compiled path starts from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -35,6 +37,22 @@ pub enum ScopeRef {
     /// The arguments of the event being handled, as a list. Only valid in event handlers, where
     /// `$args` is this list and `$event` its first element.
     Event,
+}
+
+/// A path a binding reads, registered so the binding is updated when the value there changes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Dep {
+    pub root: ScopeRef,
+    pub path: Arc<[PathSegment]>,
+}
+
+/// The dependencies of `exprs`, in the order [`CompiledExpr::dependencies`] lists them.
+pub fn deps_of<'a>(exprs: impl IntoIterator<Item = &'a CompiledExpr>) -> Arc<[Dep]> {
+    let mut deps = Vec::new();
+    for expr in exprs {
+        expr.dependencies(&mut deps);
+    }
+    deps.into_iter().map(|(root, path)| Dep { root, path: path.into() }).collect()
 }
 
 /// A path segment that may need evaluating.
@@ -77,6 +95,26 @@ impl CompiledExpr {
             CompiledExpr::Literal(_) => true,
             CompiledExpr::Object(entries) => entries.iter().all(|(_, value)| value.is_static()),
             _ => false,
+        }
+    }
+
+    /// Returns true if evaluating the expression may call a function.
+    pub fn has_calls(&self) -> bool {
+        let segments_call = |segments: &[CompiledSegment]| {
+            segments.iter().any(|s| matches!(s, CompiledSegment::Dynamic(index) if index.has_calls()))
+        };
+        match self {
+            CompiledExpr::Literal(_) => false,
+            CompiledExpr::Call { .. } => true,
+            CompiledExpr::Path { segments, .. } => segments_call(segments),
+            CompiledExpr::Object(entries) => entries.iter().any(|(_, value)| value.has_calls()),
+            CompiledExpr::Unary { operand, .. } => operand.has_calls(),
+            CompiledExpr::Binary { left, right, .. } => left.has_calls() || right.has_calls(),
+            CompiledExpr::Conditional { condition, then, otherwise } => {
+                condition.has_calls() || then.has_calls() || otherwise.has_calls()
+            }
+            CompiledExpr::Text(text) => text.exprs().any(CompiledExpr::has_calls),
+            CompiledExpr::Access { target, segments } => target.has_calls() || segments_call(segments),
         }
     }
 
@@ -162,12 +200,28 @@ impl CompiledText {
     pub fn is_static(&self) -> bool {
         self.0.iter().all(|f| matches!(f, CompiledFragment::Literal(_)))
     }
+
+    /// Returns true if rendering the text reads nothing: its interpolations are all literals.
+    pub fn is_constant(&self) -> bool {
+        self.0.iter().all(|f| match f {
+            CompiledFragment::Literal(_) => true,
+            CompiledFragment::Expr(expr) => expr.is_static(),
+        })
+    }
+
+    /// The expressions of the text's interpolations.
+    pub fn exprs(&self) -> impl Iterator<Item = &CompiledExpr> {
+        self.0.iter().filter_map(|f| match f {
+            CompiledFragment::Expr(expr) => Some(expr),
+            CompiledFragment::Literal(_) => None,
+        })
+    }
 }
 
 /// A `v-if`/`v-else-if`/`v-else` chain. Branches are tried in order; a `None` condition always
-/// matches.
+/// matches. The second field holds the dependencies of all conditions.
 #[derive(Debug, Clone, PartialEq)]
-pub struct IfChain(pub Vec<(Option<CompiledExpr>, NodeId)>);
+pub struct IfChain(pub Vec<(Option<CompiledExpr>, NodeId)>, pub Arc<[Dep]>);
 
 /// What a template child position renders to.
 #[derive(Debug, Clone, PartialEq)]
@@ -189,6 +243,11 @@ pub struct CompiledList {
     pub key: Option<CompiledExpr>,
     /// The nesting level of this loop; its items are `ScopeRef::Item(level)`.
     pub level: usize,
+    /// The dependencies of `iterable`.
+    pub deps: Arc<[Dep]>,
+    /// The path of an iterable that is a prop path without dynamic indices, from which changes of
+    /// single elements are routed to the items rendering them.
+    pub route: Option<Dep>,
 }
 
 /// What an event listener does.
@@ -223,22 +282,97 @@ pub struct CompiledNode {
     pub slots: Vec<Slot>,
     pub list: Option<CompiledList>,
     pub listeners: Vec<CompiledListener>,
+
+    // Computed from the fields above once the node is compiled, so rendering does not have to.
+    /// The text, if it reads nothing.
+    pub static_text: Option<String>,
+    /// The classes, if there are some and they read nothing.
+    pub static_classes: Option<ClassList>,
+    /// The inline style, if there are style attributes and they read nothing.
+    pub static_style: Option<InlineStyle>,
+    /// The dependencies of a text that is not static.
+    pub text_deps: Arc<[Dep]>,
+    /// The dependencies of classes that are not static.
+    pub class_deps: Arc<[Dep]>,
+    /// The dependencies of styles that are not static.
+    pub style_deps: Arc<[Dep]>,
+    pub dynamic_text: bool,
+    pub dynamic_classes: bool,
+    pub dynamic_styles: bool,
+    /// Whether the node listens to an event triggered from `Interaction`.
+    pub interactive: bool,
+    /// Whether any slot is an if-chain or a list, so the order of the children can change.
+    pub has_blocks: bool,
+    /// Whether the text, classes or styles call a function, which is given the node's entity.
+    pub calls_functions: bool,
 }
 
 impl CompiledNode {
     /// Returns true if any class attribute needs evaluating.
     pub fn has_dynamic_classes(&self) -> bool {
-        self.classes.iter().any(|c| !c.is_static())
+        self.dynamic_classes
     }
 
     /// Returns true if any style attribute needs evaluating.
     pub fn has_dynamic_styles(&self) -> bool {
-        self.styles.iter().any(|s| !s.is_static())
+        self.dynamic_styles
     }
 
     /// Returns true if the node listens to an event triggered from `Interaction`.
     pub fn interactive(&self) -> bool {
-        self.listeners.iter().any(|l| INTERACTION_EVENTS.contains(&l.name.as_ref()))
+        self.interactive
+    }
+
+    /// Computes the fields derived from the compiled attributes, slots and listeners.
+    fn finalize(&mut self) {
+        let null = Value::null();
+        let mut call = no_calls;
+        if let Some(text) = &self.text {
+            if text.is_constant() {
+                self.static_text = Some(render_text(text, &mut EvalCtx::new(&[], &null, &mut call)));
+            } else {
+                self.dynamic_text = true;
+                self.text_deps = deps_of(text.exprs());
+            }
+        }
+
+        self.dynamic_classes = self.classes.iter().any(|c| !c.is_static());
+        if self.dynamic_classes {
+            self.class_deps = deps_of(&self.classes);
+        } else if !self.classes.is_empty() {
+            let names = class_names(&self.classes, &mut EvalCtx::new(&[], &null, &mut call));
+            self.static_classes = Some(ClassList::new_with_classes(names));
+        }
+
+        self.dynamic_styles = self.styles.iter().any(|s| !s.is_static());
+        if self.dynamic_styles {
+            self.style_deps = deps_of(&self.styles);
+        } else if !self.styles.is_empty() {
+            self.static_style = Some(inline_style(&self.styles, &mut EvalCtx::new(&[], &null, &mut call)));
+        }
+
+        self.interactive = self.listeners.iter().any(|l| INTERACTION_EVENTS.contains(&l.name.as_ref()));
+        self.calls_functions = self.text.iter().flat_map(CompiledText::exprs).any(CompiledExpr::has_calls)
+            || self.classes.iter().any(CompiledExpr::has_calls)
+            || self.styles.iter().any(CompiledExpr::has_calls);
+
+        for slot in &mut self.slots {
+            match slot {
+                Slot::Static(_) => {}
+                Slot::If(chain) => {
+                    chain.1 = deps_of(chain.0.iter().filter_map(|(condition, _)| condition.as_ref()));
+                    self.has_blocks = true;
+                }
+                Slot::For(_) => self.has_blocks = true,
+            }
+        }
+
+        if let Some(list) = &mut self.list {
+            list.deps = deps_of([&list.iterable]);
+            let is_static_path = matches!(&list.iterable, CompiledExpr::Path { root, segments }
+                if !matches!(root, ScopeRef::Index(_)) && segments.iter().all(|s| matches!(s, CompiledSegment::Static(_))));
+            list.route = if is_static_path { list.deps.last().cloned() } else { None };
+        }
     }
 
     /// The first listener for the event `name`.
@@ -297,6 +431,8 @@ pub struct CompiledTemplate {
     pub styles: Vec<TemplateStyle>,
     /// The props declared by the template and by the components used.
     pub props: Vec<PropsDeclaration>,
+    /// Whether any node has a `style` or `:style` attribute.
+    pub has_inline_styles: bool,
 }
 
 impl CompiledTemplate {
@@ -316,6 +452,7 @@ impl CompiledTemplate {
             nodes: vec![CompiledNode::default(); template.nodes.len()],
             styles: Vec::new(),
             props: template.props.clone(),
+            has_inline_styles: false,
         };
         let Some(root) = compiled.root else {
             return Ok(compiled);
@@ -343,7 +480,15 @@ impl CompiledTemplate {
         if let Some(style) = &root_node.style {
             compiled.add_style(style);
         }
+        compiled.finalize();
         Ok(compiled)
+    }
+
+    fn finalize(&mut self) {
+        for node in &mut self.nodes {
+            node.finalize();
+        }
+        self.has_inline_styles = self.nodes.iter().any(|node| !node.styles.is_empty());
     }
 
     fn add_style(&mut self, style: &TemplateStyle) {
@@ -572,7 +717,7 @@ impl<'a> Compiler<'a> {
                 }
                 let expr = condition.expr.as_ref().map(|e| self.expr(e)).transpose().map_err(|e| e.at(child_id))?;
                 let target = self.compile_child(child_id, out)?;
-                open_chain = Some(IfChain(vec![(expr, target)]));
+                open_chain = Some(IfChain(vec![(expr, target)], Arc::default()));
             } else if let Some(list) = &child.list {
                 let iterable = self.expr(&list.iterable).map_err(|e| e.at(child_id))?;
                 let level = self.scopes.len();
@@ -580,7 +725,8 @@ impl<'a> Compiler<'a> {
                 let key = list.key.as_ref().map(|k| self.expr(k)).transpose().map_err(|e| e.at(child_id));
                 let result = key.and_then(|key| {
                     let target = self.compile_child(child_id, out)?;
-                    out.nodes[*target].list = Some(CompiledList { iterable, key, level });
+                    out.nodes[*target].list =
+                        Some(CompiledList { iterable, key, level, deps: Arc::default(), route: None });
                     Ok(target)
                 });
                 self.scopes.pop();
@@ -690,7 +836,7 @@ impl<'a> Compiler<'a> {
                 }
             }
             Expression::Access { target, field } => {
-                self.extend(self.expr(target)?, CompiledSegment::Static(PathSegment::Key(field.as_str().to_owned().into())))?
+                self.extend(self.expr(target)?, CompiledSegment::Static(PathSegment::interned_key(field.as_str())))?
             }
             Expression::Index { target, index } => {
                 let target = self.expr(target)?;
@@ -731,7 +877,7 @@ impl<'a> Compiler<'a> {
         }
         Ok(CompiledExpr::Path {
             root: ScopeRef::Props,
-            segments: vec![CompiledSegment::Static(PathSegment::Key(ident.as_str().to_owned().into()))],
+            segments: vec![CompiledSegment::Static(PathSegment::interned_key(ident.as_str()))],
         })
     }
 
@@ -764,7 +910,7 @@ impl<'a> Compiler<'a> {
 
 fn literal_segment(value: &Value) -> Result<PathSegment, CompileError> {
     if let Some(s) = value.as_string() {
-        return Ok(PathSegment::Key(s.clone().into()));
+        return Ok(PathSegment::interned_key(s));
     }
     match value.as_number() {
         Some(n) if n >= 0.0 && n.fract() == 0.0 => Ok(PathSegment::Index(n as usize)),
