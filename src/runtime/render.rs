@@ -33,7 +33,7 @@ use crate::runtime::{
         assert_not_reserved, box_function, BevueCtx, BevueFunctionFactory, BoxedBevueFunction, TemplateFunctions,
     },
     instance::TemplateInstance,
-    props::{mount_declared_props, BevueProps},
+    props::{mount_declared_props, set_read_mask, BevueProps},
 };
 
 /// Renders a [`BevueTemplate`] asset under this entity.
@@ -401,7 +401,9 @@ pub fn render_template(input: In<RenderTemplate>, world: &mut World) {
             return;
         }
     };
+    set_read_mask(world, root_entity, compiled.read_mask.clone());
     mount_declared_props(world, root_entity, &compiled.props);
+    crate::runtime::query::mount_queries(world, root_entity, &compiled.queries);
 
     let mut props = take_props(world, root_entity);
     let instance = TemplateInstance::render_compiled(world, root_entity, compiled, &props);
@@ -428,14 +430,28 @@ fn template_name(handle: &Handle<BevueTemplate>) -> String {
     }
 }
 
-/// Applies prop changes to the UI of every rendered template whose [`BevueProps`] changed.
+/// Applies prop changes to the UI of every rendered template whose [`BevueProps`] changed, and of
+/// every template reading entity components that changed.
 pub fn update_templates(
     world: &mut World,
     changed: &mut QueryState<(Entity, Ref<TemplateInstance>), Changed<BevueProps>>,
+    instances: &mut QueryState<(Entity, Ref<TemplateInstance>)>,
 ) {
     // Templates rendered since the last run already reflect the current props.
-    let entities: Vec<Entity> =
+    let changed_props: HashSet<Entity> =
         changed.iter(world).filter(|(_, instance)| !instance.is_added()).map(|(entity, _)| entity).collect();
+    let mut entities: Vec<Entity> = changed_props.iter().copied().collect();
+    entities.extend(
+        instances
+            .iter(world)
+            .filter(|(entity, instance)| instance.has_entity_deps() && !instance.is_added() && !changed_props.contains(entity))
+            .map(|(entity, _)| entity),
+    );
+    if entities.is_empty() {
+        return;
+    }
+    // Changes made after this tick are found by the next run.
+    let this_run = world.increment_change_tick();
     for entity in entities {
         let start = Instant::now();
         let Some(mut instance) = world
@@ -444,11 +460,19 @@ pub fn update_templates(
         else {
             continue;
         };
+        let fired = if instance.has_entity_deps() { instance.changed_entity_bindings(world, this_run) } else { Vec::new() };
+        let props_changed = changed_props.contains(&entity);
+        if !props_changed && fired.is_empty() {
+            if let Some(mut slot) = world.get_mut::<TemplateInstance>(entity) {
+                *slot.bypass_change_detection() = instance;
+            }
+            continue;
+        }
         let mut props = take_props(world, entity);
 
         // Props without any change flags were replaced or added wholesale.
-        let full = !props.is_dirty();
-        let stats = instance.update(world, &props, full);
+        let full = props_changed && !props.is_dirty();
+        let stats = instance.update_with(world, &props, full, fired);
 
         props.clear_changes();
         restore_props(world, entity, props);

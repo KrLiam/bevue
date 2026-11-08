@@ -1,6 +1,7 @@
 //! Proxied property values for the API.
 //!
-//! A [`Value`] is a dynamically typed tree (booleans, numbers, strings, entities, lists and dicts) that
+//! A [`Value`] is a dynamically typed tree (booleans, numbers, strings, entities, lists, dicts and
+//! structs) that
 //! records *where* it was mutated, so the runtime can update only the UI nodes bound to the parts
 //! that changed.
 //!
@@ -163,6 +164,13 @@ impl Value {
     pub fn empty_dict() -> Self {
         Self::dict(HashMap::new())
     }
+    /// Creates a struct value: a dict with a fixed set of keys, `names`, shared by every value of
+    /// the same Rust type. `fields` holds the value of each name, in order.
+    ///
+    /// Panics if `names` and `fields` have different lengths.
+    pub fn structure(names: &'static [&'static str], fields: Vec<Value>) -> Self {
+        Self::new(ValueType::Struct(StructValue::new(names, fields)))
+    }
 
     /// Returns the type variant of this value.
     pub fn value_type(&self) -> &ValueType {
@@ -199,9 +207,29 @@ impl Value {
         match &self.t { ValueType::List(v) => Some(v), _ => None }
     }
 
-    /// Unwraps the dict value if value is `Dict`.
+    /// Unwraps the dict value if value is `Dict`. Structs are not dicts, see [`Value::is_map`].
     pub fn as_dict(&self) -> Option<&HashMap<String, Value>> {
         match &self.t { ValueType::Dict(v) => Some(v), _ => None }
+    }
+
+    /// Unwraps the struct value if value is `Struct`.
+    pub fn as_struct(&self) -> Option<&StructValue> {
+        match &self.t { ValueType::Struct(v) => Some(v), _ => None }
+    }
+
+    /// Returns true if this value has named entries: a dict or a struct.
+    pub fn is_map(&self) -> bool {
+        matches!(self.t, ValueType::Dict(_) | ValueType::Struct(_))
+    }
+
+    /// Iterates the entries of a dict or struct. Dict entries come in no particular order, struct
+    /// entries in field order.
+    pub fn entries(&self) -> Option<Entries<'_>> {
+        match &self.t {
+            ValueType::Dict(map) => Some(Entries::Dict(map.iter())),
+            ValueType::Struct(s) => Some(Entries::Struct(s.names.iter().zip(s.fields.iter()))),
+            _ => None,
+        }
     }
 
     /// Truthiness used by `v-if`: `false`, `0`, `NaN`, `""`, `null` and empty lists and dicts are
@@ -215,6 +243,7 @@ impl Value {
             ValueType::Entity(_) => true,
             ValueType::List(list) => !list.is_empty(),
             ValueType::Dict(map) => !map.is_empty(),
+            ValueType::Struct(s) => !s.is_empty(),
         }
     }
 
@@ -243,7 +272,7 @@ impl Value {
             ValueType::Entity(e) => {
                 let _ = write!(out, "{e}");
             }
-            ValueType::List(_) | ValueType::Dict(_) => {
+            ValueType::List(_) | ValueType::Dict(_) | ValueType::Struct(_) => {
                 let _ = write!(out, "{self}");
             }
         }
@@ -256,9 +285,13 @@ impl Value {
 
     // Navigation
 
-    /// Gets the dict entry at `key`.
+    /// Gets the dict or struct entry at `key`.
     pub fn get(&self, key: &str) -> Option<&Value> {
-        self.as_dict()?.get(key)
+        match &self.t {
+            ValueType::Dict(map) => map.get(key),
+            ValueType::Struct(s) => s.get(key),
+            _ => None,
+        }
     }
 
     /// Gets the list element at `index`.
@@ -279,12 +312,28 @@ impl Value {
         path.iter().try_fold(self, |value, segment| value.child(segment))
     }
 
-    /// Gets the dict entry at `key` for mutation, marking this node as [`ChangeFlags::SUBTREE`].
+    /// Gets the dict or struct entry at `key` for mutation, marking this node as
+    /// [`ChangeFlags::SUBTREE`].
     pub fn get_mut(&mut self, key: &str) -> Option<&mut Value> {
-        let ValueType::Dict(map) = &mut self.t else { return None };
-        let child = map.get_mut(key)?;
+        let child = match &mut self.t {
+            ValueType::Dict(map) => map.get_mut(key)?,
+            ValueType::Struct(s) => s.get_mut(key)?,
+            _ => return None,
+        };
         self.flags.insert(ChangeFlags::SUBTREE);
         Some(child)
+    }
+
+    /// Runs `f` on field `index` of this struct, marking this node as [`ChangeFlags::SUBTREE`]
+    /// only if the field ends up dirty. Does nothing if this value is not a struct with that
+    /// field. Used by `#[derive(Props)]`.
+    pub fn update_field(&mut self, index: usize, f: impl FnOnce(&mut Value)) {
+        let ValueType::Struct(s) = &mut self.t else { return };
+        let Some(field) = s.fields.get_mut(index) else { return };
+        f(field);
+        if field.is_dirty() {
+            self.flags.insert(ChangeFlags::SUBTREE);
+        }
     }
 
     /// Gets the list element at `index` for mutation, marking this node as
@@ -315,8 +364,12 @@ impl Value {
 
     /// Gets the dict entry at `key` for mutation, inserting `null` first if it is missing.
     ///
-    /// A `null` value is turned into an empty dict. Panics if this value is any other non-dict.
+    /// A `null` value is turned into an empty dict, and a struct missing `key` into a dict. Panics
+    /// if this value is any other non-dict.
     pub fn entry(&mut self, key: &str) -> &mut Value {
+        if self.as_struct().is_some_and(|s| s.position(key).is_some()) {
+            return self.get_mut(key).unwrap();
+        }
         let map = self.dict_mut_for_insert("entry");
         if !map.contains_key(key) {
             map.insert(key.to_owned(), Value::changed(ValueType::Null));
@@ -343,7 +396,9 @@ impl Value {
             f(self);
             return true;
         };
-        if let PathSegment::Key(key) = segment {
+        if let PathSegment::Key(key) = segment
+            && !self.as_struct().is_some_and(|s| s.position(key).is_some())
+        {
             let map = self.dict_mut_for_insert("update_at");
             if !map.contains_key(key.as_ref()) {
                 map.insert(key.to_string(), Value::changed(ValueType::Null));
@@ -353,6 +408,7 @@ impl Value {
         let Value { t, flags } = self;
         let child = match (segment, t) {
             (PathSegment::Key(key), ValueType::Dict(map)) => map.get_mut(key.as_ref()).unwrap(),
+            (PathSegment::Key(key), ValueType::Struct(s)) => s.get_mut(key).unwrap(),
             (PathSegment::Index(i), ValueType::List(list)) => match list.get_mut(*i) {
                 Some(child) => child,
                 None => return false,
@@ -370,6 +426,11 @@ impl Value {
     /// differ are marked as changed.
     pub fn sync_from(&mut self, other: &Value) {
         match (&self.t, &other.t) {
+            (ValueType::Struct(old), ValueType::Struct(new)) if old.same_schema(new) => {
+                for (index, value) in new.fields.iter().enumerate() {
+                    self.update_field(index, |child| child.sync_from(value));
+                }
+            }
             (ValueType::Dict(_), ValueType::Dict(new)) => {
                 let removed: Vec<String> = self
                     .as_dict()
@@ -409,6 +470,10 @@ impl Value {
     pub fn set(&mut self, value: impl Into<Value>) -> bool {
         let value = value.into();
         if self.t == value.t {
+            // An equal dict takes the struct form, so later syncs of the struct can diff by field.
+            if matches!((&self.t, &value.t), (ValueType::Dict(_), ValueType::Struct(_))) && !self.is_dirty() {
+                self.t = value.t;
+            }
             return false;
         }
         self.t = value.t;
@@ -419,9 +484,19 @@ impl Value {
     /// Sets the dict entry at `key`. An existing entry is updated with [`Value::set`], a new entry
     /// changes the dict's shape. Returns whether anything changed.
     ///
-    /// A `null` value is turned into an empty dict. Panics if this value is any other non-dict.
+    /// A `null` value is turned into an empty dict, and a struct missing `key` into a dict.
+    /// Panics if this value is any other non-dict.
     pub fn insert(&mut self, key: impl Into<String>, value: impl Into<Value>) -> bool {
         let key = key.into();
+        if let ValueType::Struct(s) = &mut self.t
+            && let Some(existing) = s.get_mut(&key)
+        {
+            let changed = existing.set(value);
+            if changed {
+                self.flags.insert(ChangeFlags::SUBTREE);
+            }
+            return changed;
+        }
         let map = self.dict_mut_for_insert("insert");
         if let Some(existing) = map.get_mut(&key) {
             let changed = existing.set(value);
@@ -435,8 +510,12 @@ impl Value {
         true
     }
 
-    /// Removes the dict entry at `key`, changing the dict's shape if it existed.
+    /// Removes the dict entry at `key`, changing the dict's shape if it existed. A struct with
+    /// `key` is turned into a dict first.
     pub fn remove(&mut self, key: &str) -> Option<Value> {
+        if self.as_struct().is_some_and(|s| s.position(key).is_some()) {
+            self.dict_mut_for_insert("remove");
+        }
         let ValueType::Dict(map) = &mut self.t else { return None };
         let removed = map.remove(key)?;
         self.flags.insert(ChangeFlags::SHAPE);
@@ -499,11 +578,29 @@ impl Value {
         }
     }
 
-    /// Removes all elements of this list or dict.
+    /// Reorders this list so that element `i` is the element previously at `order[i]`, changing
+    /// its shape if the order differs. `order` must be a permutation of the list's indices.
+    pub fn permute(&mut self, order: &[usize]) {
+        let ValueType::List(list) = &mut self.t else { return };
+        assert_eq!(order.len(), list.len(), "Value::permute needs one index per element");
+        if order.iter().enumerate().all(|(i, o)| i == *o) {
+            return;
+        }
+        let mut old: Vec<Option<Value>> = std::mem::take(list).into_iter().map(Some).collect();
+        *list = order.iter().map(|&i| old[i].take().expect("Value::permute needs a permutation")).collect();
+        self.flags.insert(ChangeFlags::SHAPE);
+    }
+
+    /// Removes all elements of this list or dict. A struct becomes an empty dict.
     pub fn clear(&mut self) {
         let was_empty = match &mut self.t {
             ValueType::List(list) => std::mem::take(list).is_empty(),
             ValueType::Dict(map) => std::mem::take(map).is_empty(),
+            ValueType::Struct(s) => {
+                let was_empty = s.is_empty();
+                self.t = ValueType::Dict(HashMap::new());
+                was_empty
+            }
             _ => return,
         };
         if !was_empty {
@@ -533,6 +630,7 @@ impl Value {
         match &mut self.t {
             ValueType::List(list) => list.iter_mut().for_each(Value::clear_changes),
             ValueType::Dict(map) => map.values_mut().for_each(Value::clear_changes),
+            ValueType::Struct(s) => s.fields.iter_mut().for_each(Value::clear_changes),
             _ => {}
         }
     }
@@ -549,6 +647,12 @@ impl Value {
         if self.is_null() {
             self.t = ValueType::Dict(HashMap::new());
             self.flags.insert(ChangeFlags::SELF);
+        }
+        // Turning a struct into a dict keeps its entries, so it is not a change by itself.
+        if let ValueType::Struct(s) = &mut self.t {
+            let names = s.names;
+            let fields = std::mem::take(&mut s.fields);
+            self.t = ValueType::Dict(names.iter().map(|n| n.to_string()).zip(fields).collect());
         }
         match &mut self.t {
             ValueType::Dict(map) => map,
@@ -569,7 +673,7 @@ impl Value {
 }
 
 /// An enum containing all the type variants for attribute values.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub enum ValueType {
     /// The absence of a value.
     #[default]
@@ -586,6 +690,117 @@ pub enum ValueType {
     List(Vec<Value>),
     /// A key-value map.
     Dict(HashMap<String, Value>),
+    /// A key-value map with a fixed set of keys, used for Rust structs. Equal to a dict with the
+    /// same entries.
+    Struct(StructValue),
+}
+
+impl PartialEq for ValueType {
+    fn eq(&self, other: &Self) -> bool {
+        use ValueType::*;
+        match (self, other) {
+            (Null, Null) => true,
+            (Boolean(a), Boolean(b)) => a == b,
+            (Number(a), Number(b)) => a == b,
+            (String(a), String(b)) => a == b,
+            (Entity(a), Entity(b)) => a == b,
+            (List(a), List(b)) => a == b,
+            (Dict(a), Dict(b)) => a == b,
+            (Struct(a), Struct(b)) => a == b,
+            (Struct(s), Dict(map)) | (Dict(map), Struct(s)) => {
+                s.len() == map.len() && s.iter().all(|(k, v)| map.get(k) == Some(v))
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The data of a [`ValueType::Struct`]: field names shared by every value of a Rust type, and the
+/// value of each field.
+#[derive(Clone)]
+pub struct StructValue {
+    names: &'static [&'static str],
+    fields: Vec<Value>,
+}
+
+impl StructValue {
+    /// Panics if `names` and `fields` have different lengths.
+    pub fn new(names: &'static [&'static str], fields: Vec<Value>) -> Self {
+        assert_eq!(names.len(), fields.len(), "a struct value needs one field per name");
+        Self { names, fields }
+    }
+
+    pub fn names(&self) -> &'static [&'static str] {
+        self.names
+    }
+
+    pub fn fields(&self) -> &[Value] {
+        &self.fields
+    }
+
+    pub fn len(&self) -> usize {
+        self.fields.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.fields.is_empty()
+    }
+
+    /// The index of field `name`.
+    pub fn position(&self, name: &str) -> Option<usize> {
+        self.names.iter().position(|n| *n == name)
+    }
+
+    pub fn get(&self, name: &str) -> Option<&Value> {
+        self.position(name).map(|i| &self.fields[i])
+    }
+
+    fn get_mut(&mut self, name: &str) -> Option<&mut Value> {
+        self.position(name).map(|i| &mut self.fields[i])
+    }
+
+    /// Iterates the fields with their names, in order.
+    pub fn iter(&self) -> impl Iterator<Item = (&'static str, &Value)> {
+        self.names.iter().copied().zip(self.fields.iter())
+    }
+
+    /// Returns true if `other` has the same field names, in the same order.
+    pub fn same_schema(&self, other: &StructValue) -> bool {
+        std::ptr::eq(self.names, other.names) || self.names == other.names
+    }
+}
+
+impl PartialEq for StructValue {
+    fn eq(&self, other: &Self) -> bool {
+        if self.same_schema(other) {
+            self.fields == other.fields
+        } else {
+            self.len() == other.len() && self.iter().all(|(k, v)| other.get(k) == Some(v))
+        }
+    }
+}
+
+impl fmt::Debug for StructValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
+    }
+}
+
+/// An iterator over the entries of a dict or struct, see [`Value::entries`].
+pub enum Entries<'a> {
+    Dict(bevy::platform::collections::hash_map::Iter<'a, String, Value>),
+    Struct(std::iter::Zip<std::slice::Iter<'a, &'static str>, std::slice::Iter<'a, Value>>),
+}
+
+impl<'a> Iterator for Entries<'a> {
+    type Item = (&'a str, &'a Value);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Entries::Dict(iter) => iter.next().map(|(k, v)| (k.as_str(), v)),
+            Entries::Struct(iter) => iter.next().map(|(k, v)| (*k, v)),
+        }
+    }
 }
 impl fmt::Display for ValueType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -605,13 +820,18 @@ impl fmt::Display for ValueType {
                 }
                 f.write_str("]")?;
             }
-            ValueType::Dict(map) => {
+            ValueType::Dict(_) | ValueType::Struct(_) => {
+                let (len, entries) = match self {
+                    ValueType::Dict(map) => (map.len(), Entries::Dict(map.iter())),
+                    ValueType::Struct(s) => (s.len(), Entries::Struct(s.names.iter().zip(s.fields.iter()))),
+                    _ => unreachable!(),
+                };
                 f.write_str("{")?;
-                for (i, (key, value)) in map.iter().enumerate() {
+                for (i, (key, value)) in entries.enumerate() {
                     fmt::Debug::fmt(key, f)?;
                     f.write_str(": ")?;
                     fmt::Display::fmt(value, f)?;
-                    if i + 1 < map.len() {
+                    if i + 1 < len {
                         f.write_str(", ")?;
                     }
                 }
@@ -1003,6 +1223,78 @@ mod tests {
         assert!(Value::dict(HashMap::from([("a".to_owned(), Value::null())])).is_truthy());
         assert!(Value::from(Some(1)).is_truthy());
         assert!(!Value::from(None::<i32>).is_truthy());
+    }
+
+    const POINT: &[&str] = &["x", "y"];
+
+    fn point(x: i32, y: i32) -> Value {
+        Value::structure(POINT, vec![Value::from(x), Value::from(y)])
+    }
+
+    #[test]
+    fn struct_reads_like_a_dict() {
+        let p = point(1, 2);
+        assert_eq!(p.get("y"), Some(&Value::from(2)));
+        assert_eq!(p.get("z"), None);
+        assert!(p.is_map());
+        assert!(p.as_dict().is_none());
+        assert_eq!(p.entries().unwrap().map(|(k, _)| k).collect::<Vec<_>>(), vec!["x", "y"]);
+        assert_eq!(p.to_string(), r#"{"x": 1.0, "y": 2.0}"#);
+        assert_eq!(p, value!({ "x": 1, "y": 2 }));
+        assert_eq!(value!({ "y": 2, "x": 1 }), p);
+        assert_ne!(p, value!({ "x": 1 }));
+        assert_ne!(p, point(1, 3));
+        assert!(p.is_truthy());
+        assert!(!Value::structure(&[], vec![]).is_truthy());
+    }
+
+    #[test]
+    fn struct_mutation() {
+        let mut p = point(1, 2);
+        assert!(!p.insert("x", 1));
+        assert!(p.insert("x", 5));
+        assert_eq!(p.flags(), ChangeFlags::SUBTREE);
+        assert!(p.as_struct().is_some());
+        p.clear_changes();
+
+        p.get_mut("y").unwrap().set(7);
+        assert_eq!(p.get("y").unwrap().flags(), ChangeFlags::SELF);
+        p.clear_changes();
+
+        // Unknown keys turn the struct into a dict with the same entries.
+        assert!(p.insert("z", 0));
+        assert!(p.as_dict().is_some());
+        assert!(p.flags().contains(ChangeFlags::SHAPE));
+        assert_eq!(p, value!({ "x": 5, "y": 7, "z": 0 }));
+
+        let mut p = point(1, 2);
+        assert_eq!(p.remove("x"), Some(Value::from(1)));
+        assert_eq!(p, value!({ "y": 2 }));
+    }
+
+    #[test]
+    fn struct_sync_and_update_field() {
+        let mut p = point(1, 2);
+        p.sync_from(&point(1, 3));
+        assert_eq!(p.flags(), ChangeFlags::SUBTREE);
+        assert!(!p.get("x").unwrap().is_dirty());
+        assert_eq!(p.get("y").unwrap().flags(), ChangeFlags::SELF);
+        p.clear_changes();
+
+        p.update_field(0, |x| {
+            x.set(1);
+        });
+        assert!(!p.is_dirty());
+        p.update_field(0, |x| {
+            x.set(9);
+        });
+        assert_eq!(p.flags(), ChangeFlags::SUBTREE);
+
+        // An equal dict takes the struct form without a change.
+        let mut d = value!({ "x": 1, "y": 2 });
+        assert!(!d.set(point(1, 2)));
+        assert!(d.as_struct().is_some());
+        assert!(!d.is_dirty());
     }
 
     #[test]

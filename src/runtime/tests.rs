@@ -934,10 +934,10 @@ fn numeric_member_is_an_index() {
 }
 
 mod props_sources {
-    use bevy::ecs::{component::Component, resource::Resource};
+    use bevy::ecs::{component::Component, resource::Resource, system::In};
 
     use super::*;
-    use crate::runtime::{BevuePropsAppExt, PropsComponent, PropsResource};
+    use crate::runtime::{BevueFunctionsAppExt, BevuePropsAppExt, PropsComponent, PropsResource};
 
     #[derive(crate::Props, Resource, Default)]
     struct Menu {
@@ -1029,6 +1029,111 @@ mod props_sources {
         app.update();
         assert_eq!(texts(app.world(), local), vec!["ana: 10"]);
         assert_eq!(texts(app.world(), remote), vec!["bo: 2"]);
+    }
+
+    #[derive(crate::Props, Resource)]
+    struct Shop {
+        title: String,
+        secret: u32,
+        items: Vec<ShopItem>,
+    }
+
+    #[derive(crate::Props)]
+    struct ShopItem {
+        label: String,
+        price: u32,
+    }
+
+    fn shop() -> Shop {
+        Shop {
+            title: "Shop".into(),
+            secret: 1,
+            items: vec![ShopItem { label: "a".into(), price: 1 }, ShopItem { label: "b".into(), price: 2 }],
+        }
+    }
+
+    fn props_value(app: &App, root: Entity) -> Value {
+        app.world().get::<BevueProps>(root).unwrap().value.clone()
+    }
+
+    #[test]
+    fn only_read_fields_are_synced() {
+        let mut app = app();
+        app.register_props::<Shop>();
+        app.insert_resource(shop());
+        let template = crate::parser::parse_template(
+            r#"<props><resource type="Shop"/></props>
+            <div><p>{{shop.title}}</p><span v-for="item in shop.items">{{item.label}}</span></div>"#,
+        )
+        .unwrap();
+        let handle = app.world_mut().resource_mut::<Assets<BevueTemplate>>().add(template);
+        let root = app.world_mut().spawn(Template::new(handle)).id();
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["Shop", "a", "b"]);
+
+        // Fields no binding reads are not copied.
+        let props = props_value(&app, root);
+        assert_eq!(props.at(&path("shop.secret")), Some(&Value::null()));
+        assert_eq!(props.at(&path("shop.items[0].price")), Some(&Value::null()));
+        assert_eq!(props.at(&path("shop.items[1].label")), Some(&Value::from("b")));
+
+        // Changing them does not touch the props.
+        let tick = app.world().entity(root).get_ref::<BevueProps>().unwrap().last_changed();
+        app.world_mut().resource_mut::<Shop>().secret = 2;
+        app.world_mut().resource_mut::<Shop>().items[0].price = 5;
+        app.update();
+        assert_eq!(app.world().entity(root).get_ref::<BevueProps>().unwrap().last_changed(), tick);
+
+        // Read fields and list shape still sync.
+        app.world_mut().resource_mut::<Shop>().items.push(ShopItem { label: "c".into(), price: 3 });
+        app.world_mut().resource_mut::<Shop>().items[0].label = "z".into();
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["Shop", "z", "b", "c"]);
+    }
+
+    #[test]
+    fn whole_values_passed_to_functions_are_synced() {
+        fn total(In(ctx): In<crate::runtime::BevueCtx>) -> u32 {
+            let items = ctx.args[0].as_list().cloned().unwrap_or_default();
+            items.iter().filter_map(|i| i.get("price")?.as_number()).sum::<f64>() as u32
+        }
+        let mut app = app();
+        app.register_props::<Shop>().register_bevue_function("total", total);
+        app.insert_resource(shop());
+        let template = crate::parser::parse_template(
+            r#"<props><resource type="Shop"/></props><div><p>{{total(shop.items)}}</p></div>"#,
+        )
+        .unwrap();
+        let handle = app.world_mut().resource_mut::<Assets<BevueTemplate>>().add(template);
+        let root = app.world_mut().spawn(Template::new(handle)).id();
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["3"]);
+        assert_eq!(props_value(&app, root).at(&path("shop.title")), Some(&Value::null()));
+
+        app.world_mut().resource_mut::<Shop>().items[1].price = 10;
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["11"]);
+    }
+
+    #[test]
+    fn mask_change_resyncs_hand_mounted_sources() {
+        let mut app = app();
+        app.register_props::<Shop>();
+        app.insert_resource(shop());
+        let first = crate::parser::parse_template(r#"<div><p>{{shop.title}}</p></div>"#).unwrap();
+        let handle = app.world_mut().resource_mut::<Assets<BevueTemplate>>().add(first);
+        let root = app.world_mut().spawn((Template::new(handle.clone()), PropsResource::<Shop>::default())).id();
+        app.update();
+        app.world_mut().resource_mut::<Shop>().secret = 7;
+        app.update();
+        assert_eq!(props_value(&app, root).at(&path("shop.secret")), Some(&Value::from(1)));
+
+        // The template now reads `secret`, so re-rendering syncs it.
+        let second = crate::parser::parse_template(r#"<div><p>{{shop.secret}}</p></div>"#).unwrap();
+        *app.world_mut().resource_mut::<Assets<BevueTemplate>>().get_mut(&handle).unwrap() = second;
+        app.update();
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["7"]);
     }
 }
 
@@ -2079,5 +2184,265 @@ mod imports {
         wait_for_texts(&mut app, code, &["x"]);
         wait_for_texts(&mut app, parsed, &["y"]);
         assert_eq!(renders(&app, code), 1);
+    }
+}
+
+mod entity_components {
+    use bevy::ecs::{component::Component, name::Name};
+
+    use super::*;
+    use crate::runtime::BevuePropsAppExt;
+
+    #[derive(crate::Props, Component)]
+    struct Health {
+        current: u32,
+        max: u32,
+    }
+
+    #[derive(crate::Props, Component)]
+    struct Target(Entity);
+
+    #[derive(crate::Props, Component)]
+    struct Mana(u32);
+
+    fn entity_app() -> App {
+        let mut app = app();
+        app.register_props::<Health>().register_props::<Name>().register_props::<Target>().register_props::<Mana>();
+        app
+    }
+
+    #[test]
+    fn components_are_read_through_entities() {
+        let mut app = entity_app();
+        let ana = app.world_mut().spawn((Name::new("Ana"), Health { current: 5, max: 10 }, Mana(1))).id();
+        let bo = app.world_mut().spawn((Name::new("Bo"), Health { current: 7, max: 7 })).id();
+        let root = spawn(
+            &mut app,
+            r#"<div><p>{{ selected.name }}: {{ selected.health.current }}/{{ selected.health.max }}</p><p>{{ selected.mana }}</p></div>"#,
+            value!({ "selected": ana }),
+        );
+        assert_eq!(texts(app.world(), root), vec!["Ana: 5/10", "1"]);
+        let [hp, mana] = children(app.world(), root)[..] else { panic!() };
+        let mana_tick = text_changed_tick(app.world(), mana);
+
+        // A component change re-evaluates only the bindings reading it.
+        app.world_mut().get_mut::<Health>(ana).unwrap().current = 4;
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["Ana: 4/10", "1"]);
+        assert_eq!(text_changed_tick(app.world(), mana), mana_tick);
+
+        // Pointing at another entity reads its components and stops watching the old ones.
+        props(&mut app, root).get_mut("selected").unwrap().set(bo);
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["Bo: 7/7", ""]);
+        let hp_tick = text_changed_tick(app.world(), hp);
+        app.world_mut().get_mut::<Health>(ana).unwrap().current = 1;
+        app.update();
+        assert_eq!(text_changed_tick(app.world(), hp), hp_tick);
+
+        // Inserting, removing and despawning are seen too.
+        app.world_mut().entity_mut(bo).insert(Mana(3));
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["Bo: 7/7", "3"]);
+        app.world_mut().entity_mut(bo).remove::<Health>();
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["Bo: /", "3"]);
+        app.world_mut().entity_mut(bo).despawn();
+        app.update();
+        assert_eq!(texts(app.world(), root), vec![": /", ""]);
+    }
+
+    #[test]
+    fn entity_paths_chain_and_work_in_conditions_and_lists() {
+        let mut app = entity_app();
+        let boss = app.world_mut().spawn(Name::new("Boss")).id();
+        let ana = app.world_mut().spawn((Name::new("Ana"), Target(boss))).id();
+        let bo = app.world_mut().spawn(Name::new("Bo")).id();
+        let root = spawn(
+            &mut app,
+            r#"<div>
+                <p v-if="selected.target">targets {{ selected.target.name }}</p>
+                <p v-else>idle</p>
+                <span v-for="e in party" :key="e">{{ e.name }}</span>
+            </div>"#,
+            value!({ "selected": ana, "party": [ana, bo] }),
+        );
+        assert_eq!(texts(app.world(), root), vec!["targets Boss", "Ana", "Bo"]);
+
+        app.world_mut().get_mut::<Name>(boss).unwrap().set("Big Boss");
+        app.world_mut().get_mut::<Name>(bo).unwrap().set("Bob");
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["targets Big Boss", "Ana", "Bob"]);
+
+        app.world_mut().entity_mut(ana).remove::<Target>();
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["idle", "Ana", "Bob"]);
+    }
+}
+
+mod queries {
+    use bevy::ecs::{component::Component, name::Name};
+
+    use super::*;
+    use crate::runtime::BevuePropsAppExt;
+
+    #[derive(crate::Props, Component)]
+    struct Health {
+        current: u32,
+        max: u32,
+    }
+
+    #[derive(crate::Props, Component)]
+    struct Enemy;
+
+    #[derive(crate::Props, Component)]
+    struct Dead;
+
+    #[derive(crate::Props, Component)]
+    struct Level(u32);
+
+    fn query_app() -> App {
+        let mut app = app();
+        app.register_props::<Health>()
+            .register_props::<Name>()
+            .register_props::<Enemy>()
+            .register_props::<Dead>()
+            .register_props::<Level>();
+        app
+    }
+
+    fn enemy(app: &mut App, name: &str, hp: u32) -> Entity {
+        app.world_mut().spawn((Name::new(name.to_owned()), Health { current: hp, max: 10 }, Enemy)).id()
+    }
+
+    fn spawn_query(app: &mut App, source: &str) -> Entity {
+        let template = crate::parser::parse_template(source).unwrap();
+        let handle = app.world_mut().resource_mut::<Assets<BevueTemplate>>().add(template);
+        let root = app.world_mut().spawn(Template::new(handle)).id();
+        app.update();
+        root
+    }
+
+    const LIST: &str = r#"<props>
+            <query name="enemies" data="Name, Health, Level?" with="Enemy" without="Dead"/>
+        </props>
+        <div><p v-for="e in enemies" :key="e.entity">{{ e.name }} {{ e.health.current }} {{ e.level }}</p></div>"#;
+
+    #[test]
+    fn rows_follow_matching_entities() {
+        let mut app = query_app();
+        let ana = enemy(&mut app, "ana", 5);
+        let bo = enemy(&mut app, "bo", 7);
+        app.world_mut().spawn((Name::new("friend"), Health { current: 1, max: 1 }));
+        let root = spawn_query(&mut app, LIST);
+        assert_eq!(texts(app.world(), root), vec!["ana 5 ", "bo 7 "]);
+        let [ana_row, bo_row] = children(app.world(), root)[..] else { panic!() };
+        let bo_tick = text_changed_tick(app.world(), bo_row);
+
+        // One component change re-renders one row.
+        app.world_mut().get_mut::<Health>(ana).unwrap().current = 4;
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["ana 4 ", "bo 7 "]);
+        assert_eq!(text_changed_tick(app.world(), bo_row), bo_tick);
+
+        // Optional components come and go.
+        app.world_mut().entity_mut(bo).insert(Level(3));
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["ana 4 ", "bo 7 3"]);
+        app.world_mut().entity_mut(bo).remove::<Level>();
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["ana 4 ", "bo 7 "]);
+
+        // Entities start and stop matching; the other rows keep their entities.
+        let cy = enemy(&mut app, "cy", 2);
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["ana 4 ", "bo 7 ", "cy 2 "]);
+        app.world_mut().entity_mut(ana).insert(Dead);
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["bo 7 ", "cy 2 "]);
+        assert_eq!(children(app.world(), root)[0], bo_row);
+        app.world_mut().entity_mut(cy).despawn();
+        app.world_mut().entity_mut(bo).remove::<Enemy>();
+        app.update();
+        assert!(texts(app.world(), root).is_empty());
+        assert!(app.world().get_entity(ana_row).is_err());
+    }
+
+    #[test]
+    fn rows_follow_order_by() {
+        let mut app = query_app();
+        let ana = enemy(&mut app, "ana", 5);
+        enemy(&mut app, "bo", 7);
+        enemy(&mut app, "cy", 5);
+        let root = spawn_query(
+            &mut app,
+            r#"<props><query name="enemies" data="Name, Health" with="Enemy" order-by="health.current desc, name"/></props>
+            <div><p v-for="e in enemies" :key="e.entity">{{ e.name }}</p></div>"#,
+        );
+        assert_eq!(texts(app.world(), root), vec!["bo", "ana", "cy"]);
+        let ana_row = children(app.world(), root)[1];
+
+        // A changed key moves the row, keeping its entity.
+        app.world_mut().get_mut::<Health>(ana).unwrap().current = 9;
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["ana", "bo", "cy"]);
+        assert_eq!(children(app.world(), root)[0], ana_row);
+
+        // New entities are inserted at their position.
+        enemy(&mut app, "dee", 6);
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["ana", "bo", "dee", "cy"]);
+    }
+
+    #[test]
+    fn units_example_template() {
+        #[derive(crate::Props, Component)]
+        struct Unit;
+        #[derive(crate::Props, Component)]
+        struct Target(Entity);
+        #[derive(crate::Props, bevy::ecs::resource::Resource, Default)]
+        struct Selection {
+            entity: Option<Entity>,
+        }
+
+        let mut app = query_app();
+        app.register_props::<Unit>().register_props::<Target>().register_props::<Selection>();
+        app.init_resource::<Selection>();
+        let boss = app.world_mut().spawn((Name::new("Dragon"), Health { current: 50, max: 50 })).id();
+        let knight = app.world_mut().spawn((Name::new("Knight"), Health { current: 30, max: 30 }, Unit, Target(boss))).id();
+        app.world_mut().spawn((Name::new("Mage"), Health { current: 15, max: 15 }, Unit));
+        let root = spawn_query(&mut app, include_str!("../../assets/units.html"));
+        let rows = |app: &App| texts(app.world(), root).into_iter().map(|t| t.trim().to_owned()).collect::<Vec<_>>();
+        assert_eq!(rows(&app), vec!["Knight: 30/30", "Mage: 15/15", "Click a unit"]);
+
+        app.world_mut().resource_mut::<Selection>().entity = Some(knight);
+        app.world_mut().get_mut::<Health>(knight).unwrap().current = 9;
+        app.update();
+        assert_eq!(
+            rows(&app),
+            vec!["Mage: 15/15", "Knight: 9/30", "Knight", "Health: 9/30", "Attacking Dragon (50 hp)", "Close"]
+        );
+        let classes = |entity: Entity| app.world().get::<ClassList>(entity).map(|c| format!("{c:?}")).unwrap_or_default();
+        let knight_row = children(app.world(), children(app.world(), root)[0])[1];
+        assert!(classes(knight_row).contains("selected") && classes(knight_row).contains("low"));
+    }
+
+    #[test]
+    fn unread_components_are_not_copied() {
+        let mut app = query_app();
+        let ana = enemy(&mut app, "ana", 5);
+        let root = spawn_query(
+            &mut app,
+            r#"<props><query name="enemies" data="Name, Health" with="Enemy"/></props>
+            <div><p v-for="e in enemies" :key="e.entity">{{ e.name }}</p></div>"#,
+        );
+        let props = app.world().get::<BevueProps>(root).unwrap().value.clone();
+        assert_eq!(props.at(&path("enemies[0].health")), Some(&Value::null()));
+        assert_eq!(props.at(&path("enemies[0].entity")), Some(&Value::entity(ana)));
+
+        let tick = app.world().entity(root).get_ref::<BevueProps>().unwrap().last_changed();
+        app.world_mut().get_mut::<Health>(ana).unwrap().current = 1;
+        app.update();
+        assert_eq!(app.world().entity(root).get_ref::<BevueProps>().unwrap().last_changed(), tick);
     }
 }

@@ -1,4 +1,5 @@
 pub mod compile;
+pub mod mask;
 pub mod ops;
 pub mod path;
 pub mod props;

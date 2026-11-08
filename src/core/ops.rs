@@ -54,7 +54,7 @@ fn arithmetic(left: &Value, right: &Value, f: impl FnOnce(f64, f64) -> f64) -> V
 }
 
 /// Orders two numbers, or two strings alphabetically. Anything else has no order.
-fn compare(left: &Value, right: &Value) -> Option<Ordering> {
+pub fn compare(left: &Value, right: &Value) -> Option<Ordering> {
     match (left.value_type(), right.value_type()) {
         (ValueType::Number(a), ValueType::Number(b)) => a.partial_cmp(b),
         (ValueType::String(a), ValueType::String(b)) => Some(a.cmp(b)),

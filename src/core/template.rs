@@ -479,19 +479,57 @@ impl TemplateImport {
     }
 }
 
+/// A component of the rows of a [`QueryDeclaration`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryComponent {
+    /// The type, by its `Props::type_path` or `Props::short_type_path`.
+    pub type_path: Cow<'static, str>,
+    /// Whether entities without the component match, with `null` in its place. Written `Type?`.
+    pub optional: bool,
+}
+
+/// An `order-by` key of a [`QueryDeclaration`]: a path into the rows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SortKey {
+    pub path: crate::core::path::PropPath,
+    pub descending: bool,
+}
+
+/// A `<query>` element of the template's `<props>`: a list of the entities matching a query, one
+/// row per entity holding `entity` and the registered components in `data` by their `Props::name`.
+///
+/// ```html
+/// <query name="enemies" data="Name, Health, Target?" with="Enemy" without="Dead" order-by="health.current desc"/>
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryDeclaration {
+    /// The key the list is mounted at.
+    pub name: Cow<'static, str>,
+    pub data: Vec<QueryComponent>,
+    /// Components the entities must have, by type path.
+    pub with: Vec<Cow<'static, str>>,
+    /// Components the entities must not have, by type path.
+    pub without: Vec<Cow<'static, str>>,
+    /// How the rows are sorted. Rows with equal keys, and all rows without keys, keep the order
+    /// in which their entities started matching.
+    pub order_by: Vec<SortKey>,
+}
+
 #[derive(Asset, TypePath, Debug, Clone, Default, PartialEq, Deref, DerefMut)]
 pub struct BevueTemplate {
     #[deref]
     pub nodes: Vec<TemplateNode>,
     /// The props declared in the template's `<props>` element.
     pub props: Vec<PropsDeclaration>,
+    /// The queries declared in the template's `<props>` element.
+    pub queries: Vec<QueryDeclaration>,
     /// The components imported with `<import>` elements, which only this template can use.
     pub imports: Vec<TemplateImport>,
 }
 
 impl BevueTemplate {
     pub fn new(nodes: Vec<TemplateNode>) -> Self {
-        Self { nodes, props: Vec::new(), imports: Vec::new() }
+        Self { nodes, props: Vec::new(), queries: Vec::new(), imports: Vec::new() }
     }
 
     /// Makes the template `handle` usable in this template as the component `<name/>`, replacing
@@ -515,6 +553,11 @@ impl BevueTemplate {
 
     pub fn with_props(mut self, props: impl IntoIterator<Item = PropsDeclaration>) -> Self {
         self.props.extend(props);
+        self
+    }
+
+    pub fn with_queries(mut self, queries: impl IntoIterator<Item = QueryDeclaration>) -> Self {
+        self.queries.extend(queries);
         self
     }
 

@@ -126,6 +126,7 @@ fn expand(mut input: DeriveInput) -> syn::Result<TokenStream2> {
         Data::Struct(data) => match &data.fields {
             Fields::Named(fields) => {
                 let mut keys = Vec::new();
+                let mut indices = Vec::new();
                 let mut idents = Vec::new();
                 let mut types: Vec<&Type> = Vec::new();
                 let mut skipped = Vec::new();
@@ -136,27 +137,57 @@ fn expand(mut input: DeriveInput) -> syn::Result<TokenStream2> {
                         skipped.push(ident);
                         continue;
                     }
+                    indices.push(keys.len());
                     keys.push(LitStr::new(&attrs.rename.unwrap_or_else(|| ident.to_string()), ident.span()));
                     idents.push(ident);
                     types.push(&field.ty);
                 }
                 quote! {
                     fn to_value(&self) -> #value {
-                        let mut map = ::std::collections::HashMap::<::std::string::String, #value>::new();
-                        #( map.insert(::std::string::String::from(#keys), #props::Props::to_value(&self.#idents)); )*
-                        <#value as ::std::convert::From<_>>::from(map)
+                        const FIELDS: &[&str] = &[#( #keys ),*];
+                        #value::structure(FIELDS, ::std::vec![ #( #props::Props::to_value(&self.#idents) ),* ])
                     }
                     fn sync_value(&self, target: &mut #value) {
-                        if target.as_dict().is_none() {
+                        const FIELDS: &[&str] = &[#( #keys ),*];
+                        if !target.as_struct().is_some_and(|s| s.names() == FIELDS) {
                             target.set(#props::Props::to_value(self));
                             return;
                         }
-                        #( #props::sync_field(target, #keys, &self.#idents); )*
+                        #( #props::sync_struct_field(target, #indices, &self.#idents); )*
+                    }
+                    fn to_value_masked(&self, mask: &#props::ReadMask) -> #value {
+                        const FIELDS: &[&str] = &[#( #keys ),*];
+                        if mask.is_all() {
+                            return #props::Props::to_value(self);
+                        }
+                        #value::structure(FIELDS, ::std::vec![ #(
+                            match mask.field(#keys) {
+                                ::core::option::Option::Some(m) => #props::Props::to_value_masked(&self.#idents, m),
+                                ::core::option::Option::None => #value::null(),
+                            }
+                        ),* ])
+                    }
+                    fn sync_value_masked(&self, target: &mut #value, mask: &#props::ReadMask) {
+                        const FIELDS: &[&str] = &[#( #keys ),*];
+                        if mask.is_all() {
+                            return #props::Props::sync_value(self, target);
+                        }
+                        if !target.as_struct().is_some_and(|s| s.names() == FIELDS) {
+                            target.set(#props::Props::to_value_masked(self, mask));
+                            return;
+                        }
+                        #(
+                            if let ::core::option::Option::Some(m) = mask.field(#keys) {
+                                #props::sync_struct_field_masked(target, #indices, &self.#idents, m);
+                            }
+                        )*
                     }
                     fn apply_value(&mut self, value: &#value) -> ::core::result::Result<(), #props::PropsError> {
-                        let dict = value.as_dict().ok_or_else(|| #props::PropsError::expected("dict", value))?;
+                        if !value.is_map() {
+                            return ::core::result::Result::Err(#props::PropsError::expected("dict", value));
+                        }
                         #(
-                            if let ::core::option::Option::Some(v) = dict.get(#keys) {
+                            if let ::core::option::Option::Some(v) = value.get(#keys) {
                                 #props::Props::apply_value(&mut self.#idents, v).map_err(|e| e.in_field(#keys))?;
                             }
                         )*
@@ -209,6 +240,12 @@ fn expand(mut input: DeriveInput) -> syn::Result<TokenStream2> {
                         }
                         fn sync_value(&self, target: &mut #value) {
                             #props::Props::sync_value(&self.0, target)
+                        }
+                        fn to_value_masked(&self, mask: &#props::ReadMask) -> #value {
+                            #props::Props::to_value_masked(&self.0, mask)
+                        }
+                        fn sync_value_masked(&self, target: &mut #value, mask: &#props::ReadMask) {
+                            #props::Props::sync_value_masked(&self.0, target, mask)
                         }
                         fn apply_value(&mut self, value: &#value) -> ::core::result::Result<(), #props::PropsError> {
                             #props::Props::apply_value(&mut self.0, value)

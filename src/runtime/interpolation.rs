@@ -2,7 +2,7 @@
 
 use std::{borrow::Cow, sync::Arc};
 
-use bevy::log::warn;
+use bevy::{ecs::entity::Entity, log::warn};
 use bevy_flair::prelude::InlineStyle;
 
 use crate::core::{
@@ -50,18 +50,40 @@ impl<'p> Frame<'p> {
     }
 }
 
+/// What an expression can reach outside of its props: registered functions and the components of
+/// entities.
+pub trait Host {
+    /// Calls the registered function `name`.
+    fn call(&mut self, name: &str, args: Vec<Value>) -> Value;
+
+    /// Reads the component named `component` of `entity`, then follows as much of `path` into it
+    /// as the component's data allows. Returns the value reached and how many segments of `path`
+    /// were followed, or `None` if the entity or component does not exist. The default reads
+    /// nothing.
+    fn read_entity(&mut self, entity: Entity, component: &str, path: &[PathSegment]) -> Option<(Value, usize)> {
+        let _ = (entity, component, path);
+        None
+    }
+}
+
+impl<F: FnMut(&str, Vec<Value>) -> Value> Host for F {
+    fn call(&mut self, name: &str, args: Vec<Value>) -> Value {
+        self(name, args)
+    }
+}
+
 /// Everything an expression can read while being evaluated.
 pub struct EvalCtx<'p, 'f, 'c> {
     pub frames: &'f [Frame<'p>],
     pub props: &'p Value,
     /// The arguments of the event being handled, for `$event` and `$args`.
     pub event_args: Option<&'p [Value]>,
-    /// Calls a registered function by name.
-    pub call: &'c mut dyn FnMut(&str, Vec<Value>) -> Value,
+    /// Calls registered functions and reads entities.
+    pub call: &'c mut dyn Host,
 }
 
 impl<'p, 'f, 'c> EvalCtx<'p, 'f, 'c> {
-    pub fn new(frames: &'f [Frame<'p>], props: &'p Value, call: &'c mut dyn FnMut(&str, Vec<Value>) -> Value) -> Self {
+    pub fn new(frames: &'f [Frame<'p>], props: &'p Value, call: &'c mut dyn Host) -> Self {
         Self { frames, props, event_args: None, call }
     }
 }
@@ -83,16 +105,16 @@ pub fn eval<'r, 'p: 'r>(expr: &'r CompiledExpr, ctx: &mut EvalCtx<'p, '_, '_>) -
                 Some(frame) => Cow::Owned(Value::from(frame.index)),
                 None => Cow::Borrowed(&NULL),
             },
-            ScopeRef::Props => Cow::Borrowed(navigate(ctx.props, segments, ctx).unwrap_or(&NULL)),
+            ScopeRef::Props => navigate(ctx.props, segments, ctx).unwrap_or(Cow::Borrowed(&NULL)),
             ScopeRef::Item(level) => {
                 let frames = ctx.frames;
                 match frames.get(*level) {
                     Some(Frame { element: FrameElement::Ref(start), .. }) => {
-                        Cow::Borrowed(navigate(start, segments, ctx).unwrap_or(&NULL))
+                        navigate(start, segments, ctx).unwrap_or(Cow::Borrowed(&NULL))
                     }
                     Some(frame) => {
                         let start = frame.value();
-                        Cow::Owned(navigate(start, segments, ctx).cloned().unwrap_or_default())
+                        Cow::Owned(navigate(start, segments, ctx).map(Cow::into_owned).unwrap_or_default())
                     }
                     None => Cow::Borrowed(&NULL),
                 }
@@ -102,23 +124,23 @@ pub fn eval<'r, 'p: 'r>(expr: &'r CompiledExpr, ctx: &mut EvalCtx<'p, '_, '_>) -
                 match segments.split_first() {
                     None => Cow::Owned(Value::list(args.to_vec())),
                     Some((CompiledSegment::Static(PathSegment::Index(i)), rest)) => match args.get(*i) {
-                        Some(start) => Cow::Borrowed(navigate(start, rest, ctx).unwrap_or(&NULL)),
+                        Some(start) => navigate(start, rest, ctx).unwrap_or(Cow::Borrowed(&NULL)),
                         None => Cow::Borrowed(&NULL),
                     },
                     Some(_) => {
                         let list = Value::list(args.to_vec());
-                        Cow::Owned(navigate(&list, segments, ctx).cloned().unwrap_or_default())
+                        Cow::Owned(navigate(&list, segments, ctx).map(Cow::into_owned).unwrap_or_default())
                     }
                 }
             }
         },
         CompiledExpr::Call { function, args, segments } => {
             let args: Vec<Value> = args.iter().map(|arg| eval(arg, ctx).into_owned()).collect();
-            let result = (ctx.call)(function, args);
+            let result = ctx.call.call(function, args);
             if segments.is_empty() {
                 return Cow::Owned(result);
             }
-            Cow::Owned(navigate(&result, segments, ctx).cloned().unwrap_or_default())
+            Cow::Owned(navigate(&result, segments, ctx).map(Cow::into_owned).unwrap_or_default())
         }
         CompiledExpr::Text(text) => Cow::Owned(Value::from(render_text(text, ctx))),
         CompiledExpr::Unary { op, operand } => Cow::Owned(ops::unary(*op, &eval(operand, ctx))),
@@ -140,7 +162,7 @@ pub fn eval<'r, 'p: 'r>(expr: &'r CompiledExpr, ctx: &mut EvalCtx<'p, '_, '_>) -
         }
         CompiledExpr::Access { target, segments } => {
             let target = eval(target, ctx);
-            Cow::Owned(navigate(&target, segments, ctx).cloned().unwrap_or_default())
+            Cow::Owned(navigate(&target, segments, ctx).map(Cow::into_owned).unwrap_or_default())
         }
         CompiledExpr::Object(entries) => {
             let mut dict = Value::empty_dict();
@@ -152,16 +174,39 @@ pub fn eval<'r, 'p: 'r>(expr: &'r CompiledExpr, ctx: &mut EvalCtx<'p, '_, '_>) -
     }
 }
 
-/// Follows `segments` from `start`, evaluating dynamic indices.
-fn navigate<'v>(start: &'v Value, segments: &[CompiledSegment], ctx: &mut EvalCtx<'_, '_, '_>) -> Option<&'v Value> {
-    let mut current = start;
-    for segment in segments {
-        current = match segment {
-            CompiledSegment::Static(s) => current.child(s)?,
-            CompiledSegment::Dynamic(index) => {
-                let segment = value_segment(&eval(index, ctx))?;
-                current.child(&segment)?
-            }
+/// Follows `segments` from `start`, evaluating dynamic indices. A key after an entity names one
+/// of its components, which is read through [`Host::read_entity`]; the value is then owned.
+fn navigate<'v>(
+    start: &'v Value,
+    segments: &[CompiledSegment],
+    ctx: &mut EvalCtx<'_, '_, '_>,
+) -> Option<Cow<'v, Value>> {
+    let mut current = Cow::Borrowed(start);
+    let mut i = 0;
+    while i < segments.len() {
+        let segment = match &segments[i] {
+            CompiledSegment::Static(s) => Cow::Borrowed(s),
+            CompiledSegment::Dynamic(index) => Cow::Owned(value_segment(&eval(index, ctx))?),
+        };
+        i += 1;
+        if let Some(entity) = current.as_entity() {
+            let PathSegment::Key(component) = &*segment else { return None };
+            // The static segments that follow are read inside the component.
+            let rest: Vec<PathSegment> = segments[i..]
+                .iter()
+                .map_while(|s| match s {
+                    CompiledSegment::Static(s) => Some(s.clone()),
+                    CompiledSegment::Dynamic(_) => None,
+                })
+                .collect();
+            let (value, followed) = ctx.call.read_entity(entity, component, &rest)?;
+            current = Cow::Owned(value);
+            i += followed;
+            continue;
+        }
+        current = match current {
+            Cow::Borrowed(value) => Cow::Borrowed(value.child(&segment)?),
+            Cow::Owned(value) => Cow::Owned(value.child(&segment)?.clone()),
         };
     }
     Some(current)
@@ -181,7 +226,11 @@ pub fn resolve<'p>(expr: &CompiledExpr, ctx: &mut EvalCtx<'p, '_, '_>) -> Option
         },
         ScopeRef::Index(_) | ScopeRef::Event => return None,
     };
-    navigate(start, segments, ctx)
+    // Values read through entities are not in props.
+    match navigate(start, segments, ctx)? {
+        Cow::Borrowed(value) => Some(value),
+        Cow::Owned(_) => None,
+    }
 }
 
 /// Converts a value used as an index into a path segment.
@@ -224,8 +273,9 @@ fn push_classes(value: &Value, out: &mut Vec<String>) {
     match value.value_type() {
         ValueType::String(s) => out.extend(s.split_whitespace().map(str::to_owned)),
         ValueType::List(list) => list.iter().for_each(|v| push_classes(v, out)),
-        ValueType::Dict(map) => {
-            let mut active: Vec<_> = map.iter().filter(|(_, v)| v.is_truthy()).map(|(k, _)| k.clone()).collect();
+        ValueType::Dict(_) | ValueType::Struct(_) => {
+            let entries = value.entries().into_iter().flatten();
+            let mut active: Vec<_> = entries.filter(|(_, v)| v.is_truthy()).map(|(k, _)| k.to_owned()).collect();
             // Dict iteration order is unspecified; keep the class list stable.
             active.sort();
             out.extend(active);
@@ -262,10 +312,10 @@ fn push_styles(value: &Value, out: &mut InlineStyle) {
             }
         }
         ValueType::List(list) => list.iter().for_each(|v| push_styles(v, out)),
-        ValueType::Dict(map) => {
+        ValueType::Dict(_) | ValueType::Struct(_) => {
             // Dict iteration order is unspecified; sorting keeps the style stable and puts a
             // shorthand before its longhands (`margin` before `margin-left`).
-            let mut entries: Vec<_> = map.iter().collect();
+            let mut entries: Vec<_> = value.entries().into_iter().flatten().collect();
             entries.sort_by(|a, b| a.0.cmp(b.0));
             for (key, value) in entries {
                 set_declaration(out, key, value);

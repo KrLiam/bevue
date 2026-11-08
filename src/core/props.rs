@@ -17,6 +17,8 @@ use std::{any::Any, borrow::Cow, fmt};
 
 use bevy::{ecs::entity::Entity, platform::collections::HashMap, reflect::utility::GenericTypePathCell};
 
+pub use crate::core::mask::ReadMask;
+
 use crate::core::{
     path::{AsPropPath, PathParseError, PathSegment, PropPath},
     value::{Value, ValueType},
@@ -40,6 +42,20 @@ pub trait Props: Send + Sync + 'static {
     /// replaces `target` if it differs.
     fn sync_value(&self, target: &mut Value) {
         target.set(self.to_value());
+    }
+
+    /// Converts the parts of this data that `mask` reads into a [`Value`]. Members that are not
+    /// read may be left out or be `null`. The default converts everything.
+    fn to_value_masked(&self, mask: &ReadMask) -> Value {
+        let _ = mask;
+        self.to_value()
+    }
+
+    /// Like [`Props::sync_value`], but only for the parts that `mask` reads: members that are not
+    /// read are neither copied nor compared. The default syncs everything.
+    fn sync_value_masked(&self, target: &mut Value, mask: &ReadMask) {
+        let _ = mask;
+        self.sync_value(target);
     }
 
     /// Updates this data from `value`.
@@ -254,10 +270,23 @@ pub fn sync_element(target: &mut Value, index: usize, element: &dyn Props) {
     target.update_at(&[PathSegment::Index(index)], |child| element.sync_value(child));
 }
 
-/// Gets the dict entry `name` of `value`, for `#[derive(Props)]`.
+/// Syncs `field` into field `index` of the struct `target`, marking `target` only if it changed.
+/// Used by `#[derive(Props)]`.
+pub fn sync_struct_field(target: &mut Value, index: usize, field: &dyn Props) {
+    target.update_field(index, |child| field.sync_value(child));
+}
+
+/// Like [`sync_struct_field`], syncing only what `mask` reads.
+pub fn sync_struct_field_masked(target: &mut Value, index: usize, field: &dyn Props, mask: &ReadMask) {
+    target.update_field(index, |child| field.sync_value_masked(child, mask));
+}
+
+/// Gets the dict or struct entry `name` of `value`, for `#[derive(Props)]`.
 pub fn require_field<'a>(value: &'a Value, name: &'static str) -> Result<&'a Value, PropsError> {
-    let dict = value.as_dict().ok_or_else(|| PropsError::expected("dict", value))?;
-    dict.get(name).ok_or(PropsError::MissingField(name))
+    if !value.is_map() {
+        return Err(PropsError::expected("dict", value));
+    }
+    value.get(name).ok_or(PropsError::MissingField(name))
 }
 
 // Errors
@@ -414,6 +443,28 @@ impl Props for Entity {
     leaf_any!();
 }
 
+impl Props for bevy::ecs::name::Name {
+    fn to_value(&self) -> Value {
+        Value::from(self.as_str())
+    }
+    fn sync_value(&self, target: &mut Value) {
+        if target.as_string().map(String::as_str) != Some(self.as_str()) {
+            target.set(self.as_str());
+        }
+    }
+    fn apply_value(&mut self, value: &Value) -> Result<(), PropsError> {
+        *self = Self::from_value(value)?;
+        Ok(())
+    }
+    fn from_value(value: &Value) -> Result<Self, PropsError> {
+        value.as_string().map(|s| Self::new(s.clone())).ok_or_else(|| PropsError::expected("string", value))
+    }
+    fn name() -> &'static str {
+        "name"
+    }
+    leaf_any!();
+}
+
 impl Props for String {
     fn to_value(&self) -> Value {
         Value::string(self.clone())
@@ -466,6 +517,20 @@ impl<T: Props> Props for Option<T> {
             Some(value) => value.sync_value(target),
         }
     }
+    fn to_value_masked(&self, mask: &ReadMask) -> Value {
+        self.as_ref().map(|value| value.to_value_masked(mask)).unwrap_or_default()
+    }
+    fn sync_value_masked(&self, target: &mut Value, mask: &ReadMask) {
+        match self {
+            None => {
+                target.set(Value::null());
+            }
+            Some(value) if target.is_null() => {
+                target.set(value.to_value_masked(mask));
+            }
+            Some(value) => value.sync_value_masked(target, mask),
+        }
+    }
     fn apply_value(&mut self, value: &Value) -> Result<(), PropsError> {
         match (self.as_mut(), value.is_null()) {
             (_, true) => *self = None,
@@ -515,12 +580,49 @@ fn sync_slice<T: Props>(slice: &[T], target: &mut Value) {
     }
 }
 
+/// Like [`sync_slice`], syncing only what `mask` reads of each element. If elements are not read,
+/// the list holds `null`s: only its length is kept up to date.
+fn sync_slice_masked<T: Props>(slice: &[T], target: &mut Value, mask: &ReadMask) {
+    if mask.is_all() {
+        return sync_slice(slice, target);
+    }
+    let elements = mask.elements();
+    let element_value = |element: &T| elements.map_or_else(Value::null, |m| element.to_value_masked(m));
+    let Some(len) = target.as_list().map(Vec::len) else {
+        target.set(Value::list(slice.iter().map(element_value).collect()));
+        return;
+    };
+    if let Some(elements) = elements {
+        for (i, element) in slice.iter().enumerate().take(len) {
+            target.update_at(&[PathSegment::Index(i)], |child| element.sync_value_masked(child, elements));
+        }
+    }
+    target.truncate(slice.len());
+    for element in slice.iter().skip(len) {
+        target.push(element_value(element));
+    }
+}
+
+fn slice_to_value_masked<T: Props>(slice: &[T], mask: &ReadMask) -> Value {
+    if mask.is_all() {
+        return Value::list(slice.iter().map(Props::to_value).collect());
+    }
+    let elements = mask.elements();
+    Value::list(slice.iter().map(|e| elements.map_or_else(Value::null, |m| e.to_value_masked(m))).collect())
+}
+
 impl<T: Props> Props for Vec<T> {
     fn to_value(&self) -> Value {
         Value::list(self.iter().map(Props::to_value).collect())
     }
     fn sync_value(&self, target: &mut Value) {
         sync_slice(self, target);
+    }
+    fn to_value_masked(&self, mask: &ReadMask) -> Value {
+        slice_to_value_masked(self, mask)
+    }
+    fn sync_value_masked(&self, target: &mut Value, mask: &ReadMask) {
+        sync_slice_masked(self, target, mask);
     }
     fn apply_value(&mut self, value: &Value) -> Result<(), PropsError> {
         let list = value.as_list().ok_or_else(|| PropsError::expected("list", value))?;
@@ -559,6 +661,12 @@ impl<T: Props, const N: usize> Props for [T; N] {
     }
     fn sync_value(&self, target: &mut Value) {
         sync_slice(self, target);
+    }
+    fn to_value_masked(&self, mask: &ReadMask) -> Value {
+        slice_to_value_masked(self, mask)
+    }
+    fn sync_value_masked(&self, target: &mut Value, mask: &ReadMask) {
+        sync_slice_masked(self, target, mask);
     }
     fn apply_value(&mut self, value: &Value) -> Result<(), PropsError> {
         let list = value.as_list().ok_or_else(|| PropsError::expected("list", value))?;
@@ -611,24 +719,60 @@ macro_rules! impl_map {
                     target.update_at(std::slice::from_ref(&segment), |child| value.sync_value(child));
                 }
             }
+            // Only the entries read by name are kept: dynamic keys (`tags[name]`) read the whole
+            // map.
+            fn to_value_masked(&self, mask: &ReadMask) -> Value {
+                if mask.is_all() {
+                    return self.to_value();
+                }
+                Value::dict(
+                    self.iter()
+                        .filter_map(|(k, v)| Some((k.clone(), v.to_value_masked(mask.field(k)?))))
+                        .collect(),
+                )
+            }
+            fn sync_value_masked(&self, target: &mut Value, mask: &ReadMask) {
+                if mask.is_all() {
+                    return self.sync_value(target);
+                }
+                if target.as_dict().is_none() {
+                    target.set(self.to_value_masked(mask));
+                    return;
+                }
+                let removed: Vec<String> = target
+                    .as_dict()
+                    .unwrap()
+                    .keys()
+                    .filter(|k| !self.contains_key(*k) || mask.field(k).is_none())
+                    .cloned()
+                    .collect();
+                for key in removed {
+                    target.remove(&key);
+                }
+                for (key, value) in self {
+                    let Some(field_mask) = mask.field(key) else { continue };
+                    let segment = PathSegment::Key(key.clone().into());
+                    target.update_at(std::slice::from_ref(&segment), |child| value.sync_value_masked(child, field_mask));
+                }
+            }
             fn apply_value(&mut self, value: &Value) -> Result<(), PropsError> {
-                let dict = value.as_dict().ok_or_else(|| PropsError::expected("dict", value))?;
-                self.retain(|k, _| dict.contains_key(k));
-                for (key, element) in dict {
+                let entries = value.entries().ok_or_else(|| PropsError::expected("dict", value))?;
+                self.retain(|k, _| value.get(k).is_some());
+                for (key, element) in entries {
                     match self.get_mut(key) {
                         Some(existing) => existing.apply_value(element),
                         None => T::from_value(element).map(|new| {
-                            self.insert(key.clone(), new);
+                            self.insert(key.to_owned(), new);
                         }),
                     }
-                    .map_err(|e| e.in_field(key.clone()))?;
+                    .map_err(|e| e.in_field(key))?;
                 }
                 Ok(())
             }
             fn from_value(value: &Value) -> Result<Self, PropsError> {
-                let dict = value.as_dict().ok_or_else(|| PropsError::expected("dict", value))?;
-                dict.iter()
-                    .map(|(k, v)| T::from_value(v).map(|v| (k.clone(), v)).map_err(|e| e.in_field(k.clone())))
+                let entries = value.entries().ok_or_else(|| PropsError::expected("dict", value))?;
+                entries
+                    .map(|(k, v)| T::from_value(v).map(|v| (k.to_owned(), v)).map_err(|e| e.in_field(k)))
                     .collect()
             }
             fn kind(&self) -> PropsKind {
@@ -666,6 +810,7 @@ impl Props for Value {
         match self.value_type() {
             ValueType::List(_) => PropsKind::List,
             ValueType::Dict(_) => PropsKind::Map,
+            ValueType::Struct(_) => PropsKind::Struct,
             _ => PropsKind::Leaf,
         }
     }
@@ -740,6 +885,28 @@ mod tests {
         main: Entity,
         alt: Option<Entity>,
         all: Vec<Entity>,
+    }
+
+    #[test]
+    fn derived_structs_are_struct_values() {
+        let stack = Stack { id: "coal".into(), count: 3 };
+        let value = stack.to_value();
+        assert_eq!(value.as_struct().unwrap().names(), &["id", "count"]);
+        assert_eq!(Stack::from_value(&value), Ok(stack.clone()));
+        // Dicts still convert.
+        assert_eq!(Stack::from_value(&value!({ "id": "coal", "count": 3 })), Ok(stack.clone()));
+
+        let mut synced = value.clone();
+        Stack { count: 4, ..stack.clone() }.sync_value(&mut synced);
+        assert_eq!(synced.flags(), ChangeFlags::SUBTREE);
+        assert!(!synced.get("id").unwrap().is_dirty());
+        assert_eq!(synced.get("count").unwrap().flags(), ChangeFlags::SELF);
+
+        // A dict target is replaced by the struct form.
+        let mut target = value!({ "id": "iron" });
+        stack.sync_value(&mut target);
+        assert!(target.as_struct().is_some());
+        assert_eq!(target, value);
     }
 
     #[test]

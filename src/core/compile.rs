@@ -15,10 +15,11 @@ use bevy::asset::Handle;
 use bevy_flair::prelude::{ClassList, InlineStyle};
 
 use crate::core::{
+    mask::ReadMask,
     ops,
     path::PathSegment,
     template::{
-        BevueTemplate, BinaryOp, UnaryOp, ConditionKind, ElementType, Expression, Identifier, NodeId, PropsDeclaration, TemplateNode, TemplateText,
+        BevueTemplate, BinaryOp, UnaryOp, ConditionKind, QueryDeclaration, ElementType, Expression, Identifier, NodeId, PropsDeclaration, TemplateNode, TemplateText,
         TemplateStyle, TextFragment,
     },
     value::Value,
@@ -431,8 +432,12 @@ pub struct CompiledTemplate {
     pub styles: Vec<TemplateStyle>,
     /// The props declared by the template and by the components used.
     pub props: Vec<PropsDeclaration>,
+    /// The queries declared by the template and by the components used.
+    pub queries: Vec<QueryDeclaration>,
     /// Whether any node has a `style` or `:style` attribute.
     pub has_inline_styles: bool,
+    /// What the template reads from its props.
+    pub read_mask: Arc<ReadMask>,
 }
 
 impl CompiledTemplate {
@@ -452,7 +457,9 @@ impl CompiledTemplate {
             nodes: vec![CompiledNode::default(); template.nodes.len()],
             styles: Vec::new(),
             props: template.props.clone(),
+            queries: template.queries.clone(),
             has_inline_styles: false,
+            read_mask: Arc::default(),
         };
         let Some(root) = compiled.root else {
             return Ok(compiled);
@@ -481,6 +488,7 @@ impl CompiledTemplate {
             compiled.add_style(style);
         }
         compiled.finalize();
+        compiled.read_mask = Arc::new(ReadMask::of(&compiled));
         Ok(compiled)
     }
 
@@ -641,6 +649,11 @@ impl<'a> Compiler<'a> {
         for declaration in &component.props {
             if !out.props.contains(declaration) {
                 out.props.push(declaration.clone());
+            }
+        }
+        for query in &component.queries {
+            if !out.queries.contains(query) {
+                out.queries.push(query.clone());
             }
         }
         Ok(target)

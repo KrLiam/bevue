@@ -11,6 +11,7 @@ pub mod functions;
 pub mod instance;
 pub mod interpolation;
 pub mod props;
+pub mod query;
 pub mod render;
 
 pub use crate::core::template::TemplateRef;
@@ -78,6 +79,7 @@ impl Plugin for BevueRuntimePlugin {
                 (components::load_components, watch_template_components)
                     .chain()
                     .in_set(BevueSystems::Render),
+                query::sync_queries.in_set(BevueSystems::SyncProps),
                 update_templates.in_set(BevueSystems::Update),
                 (reveal_styled_templates, apply_template_classes_and_styles)
                     .chain()

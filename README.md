@@ -114,7 +114,64 @@ A type is read under its name in snake case (`PlayerInventory` is `player_invent
 
 There is nothing else to wire up: change the component or resource as usual and the UI follows.
 Bevue compares the new data with what it rendered and updates only the nodes bound to what
-changed, so editing `inventory.items[1].count` touches a single text.
+changed, so editing `inventory.items[1].count` touches a single text. Only the fields a template
+reads are copied and compared: a field no template shows costs nothing when it changes.
+
+### Entities
+
+An `Entity` is a prop like any other, and a path that continues past one reads that entity's
+registered components by name. Bevy's `Name` can be registered too.
+
+```rust
+#[derive(Resource, Props, Default)]
+struct Selection { entity: Option<Entity> }
+
+#[derive(Component, Props)]
+struct Health { current: u32, max: u32 }
+
+#[derive(Component, Props)]
+struct Target(Entity);
+
+app.register_props::<Selection>().register_props::<Health>().register_props::<Target>().register_props::<Name>();
+```
+
+```html
+<div v-if="selection.entity">
+    <p>{{ selection.entity.name }}: {{ selection.entity.health.current }}/{{ selection.entity.health.max }}</p>
+    <p v-if="selection.entity.target">attacking {{ selection.entity.target.name }}</p>
+</div>
+```
+
+The text updates when the selection changes, and when `Health` (or `Name`, `Target`...) of the
+selected entity changes, is inserted or removed, or when the entity is despawned.
+
+### Queries
+
+A `<query>` lists the entities matching a query, one row per entity with `entity` and the
+components in `data`:
+
+```html
+<props>
+    <query name="enemies" data="Name, Health, Target?" with="Enemy" without="Dead" order-by="health.current desc, name"/>
+</props>
+
+<button v-for="e in enemies" :key="e.entity" @click="select(e.entity)">
+    {{ e.name }}: {{ e.health.current }}
+</button>
+```
+
+- `data`: the components of each row, read under their name. `Type?` is optional: entities without
+  it match too, with `null` in its place.
+- `with` / `without`: components the entities must have or not have. A marker is registered like
+  any other type: `#[derive(Component, Props)] struct Enemy;`.
+- `order-by`: paths into the rows, each `asc` (the default) or `desc`. Without it, and between
+  equal keys, rows keep the order in which their entities started matching.
+
+All types must be registered with `register_props`. Each frame, only the components of matching
+entities whose change tick moved are compared into their row, and entities that start or stop
+matching add or remove one row. Use `:key="e.entity"` so items follow their entity when rows move.
+
+See `examples/units.rs`.
 
 ## Text and expressions
 

@@ -17,7 +17,8 @@ use std::sync::Arc;
 
 use bevy::{
     ecs::{
-        component::Component,
+        change_detection::Tick,
+        component::{Component, ComponentId},
         entity::{Entity, EntityHashMap},
         hierarchy::{ChildOf, Children},
         world::{EntityWorldMut, World},
@@ -36,15 +37,55 @@ use crate::{
     },
     runtime::{
         functions::call_function,
-        interpolation::{class_names, eval, inline_style, resolve, write_text, EvalCtx, Frame},
+        interpolation::{class_names, eval, inline_style, resolve, write_text, EvalCtx, Frame, Host},
+        props::PropsTypeRegistry,
     },
 };
 
 static NULL: Value = Value::NULL;
 
-/// A function caller for expressions evaluated on `entity` of the template rooted at `root`.
-fn caller(world: &mut World, root: Entity, entity: Entity) -> impl FnMut(&str, Vec<Value>) -> Value + '_ {
-    move |name: &str, args: Vec<Value>| call_function(world, root, entity, name, args)
+/// The [`Host`] of expressions evaluated on `entity` of the template rooted at `root`: calls
+/// functions and reads registered components of entities, recording which ones were read.
+struct Caller<'w> {
+    world: &'w mut World,
+    root: Entity,
+    entity: Entity,
+    reads: Vec<(Entity, ComponentId)>,
+}
+
+impl Caller<'_> {
+    /// The components read through entities.
+    fn into_reads(self) -> Vec<(Entity, ComponentId)> {
+        self.reads
+    }
+}
+
+impl Host for Caller<'_> {
+    fn call(&mut self, name: &str, args: Vec<Value>) -> Value {
+        call_function(self.world, self.root, self.entity, name, args)
+    }
+
+    fn read_entity(&mut self, entity: Entity, component: &str, path: &[PathSegment]) -> Option<(Value, usize)> {
+        let registration = *self.world.get_resource::<PropsTypeRegistry>()?.by_name(component)?;
+        // Recorded even if missing, so the binding updates when the component is inserted.
+        self.reads.push((entity, registration.component_id));
+        let mut data = (registration.read)(self.world.get_entity(entity).ok()?)?;
+        let mut followed = 0;
+        for segment in path {
+            let next = match segment {
+                PathSegment::Key(key) => data.field(key),
+                PathSegment::Index(index) => data.element(*index),
+            };
+            let Some(next) = next else { break };
+            data = next;
+            followed += 1;
+        }
+        Some((data.to_value(), followed))
+    }
+}
+
+fn caller(world: &mut World, root: Entity, entity: Entity) -> Caller<'_> {
+    Caller { world, root, entity, reads: Vec::new() }
 }
 
 // Arena
@@ -212,6 +253,15 @@ struct Binding {
     /// The innermost `v-for` item enclosing the binding.
     scope: Option<ItemId>,
     registrations: Vec<(TrieOwner, Arc<[PathSegment]>)>,
+    /// The components read through entities by the last evaluation, sorted.
+    entity_reads: Vec<(Entity, ComponentId)>,
+}
+
+/// The bindings reading a component of an entity.
+struct EntityDep {
+    bindings: Vec<BindingId>,
+    /// Whether the entity had the component when last checked.
+    present: bool,
 }
 
 /// Bookkeeping owned by a subtree that can be torn down: a `v-if` branch or a list item.
@@ -285,7 +335,7 @@ impl ItemKey {
             ValueType::Number(n) => ItemKey::Number(number_key(*n)),
             ValueType::String(s) => ItemKey::String(s.as_str().into()),
             ValueType::Entity(e) => ItemKey::Entity(*e),
-            ValueType::List(_) | ValueType::Dict(_) => ItemKey::Other(value.to_string()),
+            ValueType::List(_) | ValueType::Dict(_) | ValueType::Struct(_) => ItemKey::Other(value.to_string()),
         }
     }
 
@@ -297,7 +347,7 @@ impl ItemKey {
             (ItemKey::Number(a), ValueType::Number(b)) => *a == number_key(*b),
             (ItemKey::String(a), ValueType::String(b)) => **a == **b,
             (ItemKey::Entity(a), ValueType::Entity(b)) => a == b,
-            (ItemKey::Other(a), ValueType::List(_) | ValueType::Dict(_)) => *a == value.to_string(),
+            (ItemKey::Other(a), ValueType::List(_) | ValueType::Dict(_) | ValueType::Struct(_)) => *a == value.to_string(),
             _ => false,
         }
     }
@@ -381,6 +431,10 @@ pub struct TemplateInstance {
     listeners: EntityHashMap<(NodeId, Option<ItemId>)>,
     /// Reused to render texts during updates.
     text_buffer: String,
+    /// The bindings reading components through entities, by entity and component.
+    entity_deps: HashMap<(Entity, ComponentId), EntityDep>,
+    /// When the components in `entity_deps` were last checked for changes.
+    entity_tick: Tick,
 }
 
 impl Default for TemplateInstance {
@@ -396,6 +450,8 @@ impl Default for TemplateInstance {
             elements: EntityHashMap::default(),
             listeners: EntityHashMap::default(),
             text_buffer: String::new(),
+            entity_deps: HashMap::default(),
+            entity_tick: Tick::default(),
         }
     }
 }
@@ -419,7 +475,8 @@ impl TemplateInstance {
     /// Spawns the UI tree of an already compiled template under `root`, evaluated against
     /// `props`.
     pub fn render_compiled(world: &mut World, root: Entity, compiled: Arc<CompiledTemplate>, props: &Value) -> Self {
-        let mut instance = Self { root, compiled, ..Default::default() };
+        // Systems running later stamp their changes with a newer tick than this one.
+        let mut instance = Self { root, compiled, entity_tick: world.increment_change_tick(), ..Default::default() };
         if let Some(root_id) = instance.compiled.root {
             let mut pending = Pending::default();
             instance.spawn_element(world, props, &mut pending, root_id, Some(root), None, &[], None, OwnerRef::Root);
@@ -449,8 +506,14 @@ impl TemplateInstance {
     /// Applies the changes recorded in `props` to the UI. With `full`, every binding is
     /// re-evaluated, which is used when props were replaced without change flags.
     pub fn update(&mut self, world: &mut World, props: &Value, full: bool) -> UpdateStats {
+        self.update_with(world, props, full, Vec::new())
+    }
+
+    /// Like [`TemplateInstance::update`], also re-evaluating the bindings in `fired`, e.g. those
+    /// reading entity components that changed.
+    pub(crate) fn update_with(&mut self, world: &mut World, props: &Value, full: bool, fired: Vec<BindingId>) -> UpdateStats {
         let mut stats = UpdateStats { full, ..Default::default() };
-        let mut pending = Pending { track_fresh: true, ..Default::default() };
+        let mut pending = Pending { track_fresh: true, fired, ..Default::default() };
         if full {
             fire_all(&self.root_trie, &mut pending);
         } else {
@@ -573,23 +636,29 @@ impl TemplateInstance {
         });
         let call_entity = existing.unwrap_or(Entity::PLACEHOLDER);
 
+        let (mut text_reads, mut class_reads, mut style_reads) = (Vec::new(), Vec::new(), Vec::new());
         let text = if node.dynamic_text {
             let mut text = String::new();
             let mut call = caller(world, self.root, call_entity);
             write_text(node.text.as_ref().unwrap(), &mut EvalCtx::new(frames, props, &mut call), &mut text);
+            text_reads = call.into_reads();
             Some(text)
         } else {
             node.static_text.clone()
         };
         let classes = if node.dynamic_classes {
             let mut call = caller(world, self.root, call_entity);
-            Some(ClassList::new_with_classes(class_names(&node.classes, &mut EvalCtx::new(frames, props, &mut call))))
+            let names = class_names(&node.classes, &mut EvalCtx::new(frames, props, &mut call));
+            class_reads = call.into_reads();
+            Some(ClassList::new_with_classes(names))
         } else {
             node.static_classes.clone()
         };
         let style = if node.dynamic_styles {
             let mut call = caller(world, self.root, call_entity);
-            Some(inline_style(&node.styles, &mut EvalCtx::new(frames, props, &mut call)))
+            let style = inline_style(&node.styles, &mut EvalCtx::new(frames, props, &mut call));
+            style_reads = call.into_reads();
+            Some(style)
         } else {
             node.static_style.clone()
         };
@@ -636,13 +705,16 @@ impl TemplateInstance {
         let entity = entity_mut.id();
 
         if node.dynamic_text {
-            self.add_binding(entity, node_id, BindingKind::Text, scope, owner, &node.text_deps, DepMode::Deep);
+            let id = self.add_binding(entity, node_id, BindingKind::Text, scope, owner, &node.text_deps, DepMode::Deep);
+            self.set_entity_reads(world, id, text_reads);
         }
         if node.dynamic_classes {
-            self.add_binding(entity, node_id, BindingKind::Class, scope, owner, &node.class_deps, DepMode::Deep);
+            let id = self.add_binding(entity, node_id, BindingKind::Class, scope, owner, &node.class_deps, DepMode::Deep);
+            self.set_entity_reads(world, id, class_reads);
         }
         if node.dynamic_styles {
-            self.add_binding(entity, node_id, BindingKind::Style, scope, owner, &node.style_deps, DepMode::Deep);
+            let id = self.add_binding(entity, node_id, BindingKind::Style, scope, owner, &node.style_deps, DepMode::Deep);
+            self.set_entity_reads(world, id, style_reads);
         }
         if !node.listeners.is_empty() {
             self.listeners.insert(entity, (node_id, scope));
@@ -732,7 +804,7 @@ impl TemplateInstance {
         frames: Option<&[Frame<'p>]>,
     ) {
         let Some(Block::If(block)) = self.blocks.get(block_id) else { return };
-        let (parent, scope, current) = (block.parent, block.scope, block.active);
+        let (parent, scope, current, binding) = (block.parent, block.scope, block.active, block.binding);
         let compiled = self.compiled.clone();
         let Slot::If(chain) = &compiled.get(block.node).slots[block.slot] else { return };
         let initial = frames.is_some();
@@ -744,11 +816,16 @@ impl TemplateInstance {
                 &owned_frames
             }
         };
-        let active = {
+        let (active, reads) = {
             let mut call = caller(world, self.root, parent);
             let mut ctx = EvalCtx::new(frames, props, &mut call);
-            chain.0.iter().position(|(cond, _)| cond.as_ref().is_none_or(|c| eval(c, &mut ctx).is_truthy()))
+            let active =
+                chain.0.iter().position(|(cond, _)| cond.as_ref().is_none_or(|c| eval(c, &mut ctx).is_truthy()));
+            (active, call.into_reads())
         };
+        if let Some(binding) = binding {
+            self.set_entity_reads(world, binding, reads);
+        }
         if active == current {
             return;
         }
@@ -791,7 +868,7 @@ impl TemplateInstance {
     ) {
         let compiled = self.compiled.clone();
         let Some(Block::For(block)) = self.blocks.get(block_id) else { return };
-        let (parent, node, scope) = (block.parent, block.node, block.scope);
+        let (parent, node, scope, binding) = (block.parent, block.node, block.scope, block.binding);
         // Items of an iterable that is not a static path get no element routing, so reused
         // items must always be re-evaluated.
         let force = force || block.route.is_none();
@@ -834,7 +911,10 @@ impl TemplateInstance {
                 .collect(),
             None => Vec::new(),
         };
-        drop(call);
+        let reads = call.into_reads();
+        if let Some(binding) = binding {
+            self.set_entity_reads(world, binding, reads);
+        }
         let keyed = list.key.is_some();
 
         let Some(Block::For(block)) = self.blocks.get(block_id) else { return };
@@ -949,7 +1029,7 @@ impl TemplateInstance {
         deps: &[Dep],
         mode: DepMode,
     ) -> BindingId {
-        let id = self.bindings.insert(Binding { entity, node, kind, scope, registrations: Vec::new() });
+        let id = self.bindings.insert(Binding { entity, node, kind, scope, registrations: Vec::new(), entity_reads: Vec::new() });
 
         let mut registrations = Vec::with_capacity(deps.len());
         for dep in deps {
@@ -977,7 +1057,8 @@ impl TemplateInstance {
     fn apply(&mut self, world: &mut World, props: &Value, id: BindingId) {
         let Some(binding) = self.bindings.get(id) else { return };
         let (entity, scope) = (binding.entity, binding.scope);
-        let node = self.compiled.get(binding.node);
+        let compiled = self.compiled.clone();
+        let node = compiled.get(binding.node);
         match binding.kind {
             BindingKind::Text => {
                 let frames = self.frames(world, scope, props);
@@ -985,7 +1066,8 @@ impl TemplateInstance {
                 text.clear();
                 let mut call = caller(world, self.root, entity);
                 write_text(node.text.as_ref().unwrap(), &mut EvalCtx::new(&frames, props, &mut call), &mut text);
-                drop(call);
+                let reads = call.into_reads();
+                self.set_entity_reads(world, id, reads);
                 if let Ok(mut entity) = world.get_entity_mut(entity) {
                     match entity.get_mut::<Text>() {
                         Some(mut current) => {
@@ -1004,7 +1086,8 @@ impl TemplateInstance {
                 let frames = self.frames(world, scope, props);
                 let mut call = caller(world, self.root, entity);
                 let names = class_names(&node.classes, &mut EvalCtx::new(&frames, props, &mut call));
-                drop(call);
+                let reads = call.into_reads();
+                self.set_entity_reads(world, id, reads);
                 let classes = ClassList::new_with_classes(names);
                 let Ok(mut entity) = world.get_entity_mut(entity) else { return };
                 if entity.get::<ClassList>() != Some(&classes) {
@@ -1015,7 +1098,8 @@ impl TemplateInstance {
                 let frames = self.frames(world, scope, props);
                 let mut call = caller(world, self.root, entity);
                 let style = inline_style(&node.styles, &mut EvalCtx::new(&frames, props, &mut call));
-                drop(call);
+                let reads = call.into_reads();
+                self.set_entity_reads(world, id, reads);
                 let Ok(mut entity) = world.get_entity_mut(entity) else { return };
                 write_style(&mut entity, style);
             }
@@ -1181,6 +1265,9 @@ impl TemplateInstance {
 
     fn remove_binding(&mut self, id: BindingId) {
         let Some(binding) = self.bindings.remove(id) else { return };
+        for key in binding.entity_reads {
+            self.unlink_entity_dep(key, id);
+        }
         for (owner, path) in binding.registrations {
             match owner {
                 TrieOwner::ItemIndex(item) => {
@@ -1195,6 +1282,61 @@ impl TemplateInstance {
                 }
             }
         }
+    }
+
+    // Entity components
+
+    /// Replaces the components binding `id` reads through entities.
+    fn set_entity_reads(&mut self, world: &World, id: BindingId, mut reads: Vec<(Entity, ComponentId)>) {
+        reads.sort_unstable();
+        reads.dedup();
+        let Some(binding) = self.bindings.get_mut(id) else { return };
+        if binding.entity_reads == reads {
+            return;
+        }
+        let old = std::mem::replace(&mut binding.entity_reads, reads.clone());
+        for key in old {
+            self.unlink_entity_dep(key, id);
+        }
+        for key in reads {
+            let dep = self.entity_deps.entry(key).or_insert_with(|| EntityDep {
+                bindings: Vec::new(),
+                present: world.get_entity(key.0).is_ok_and(|e| e.contains_id(key.1)),
+            });
+            dep.bindings.push(id);
+        }
+    }
+
+    fn unlink_entity_dep(&mut self, key: (Entity, ComponentId), id: BindingId) {
+        if let Some(dep) = self.entity_deps.get_mut(&key) {
+            dep.bindings.retain(|b| *b != id);
+            if dep.bindings.is_empty() {
+                self.entity_deps.remove(&key);
+            }
+        }
+    }
+
+    /// Returns true if some binding reads a component through an entity.
+    pub fn has_entity_deps(&self) -> bool {
+        !self.entity_deps.is_empty()
+    }
+
+    /// The bindings reading entity components that were changed, inserted or removed (or whose
+    /// entity was despawned) since the last check. `this_run` is the tick of this check.
+    pub(crate) fn changed_entity_bindings(&mut self, world: &World, this_run: Tick) -> Vec<BindingId> {
+        let last_run = std::mem::replace(&mut self.entity_tick, this_run);
+        let mut fired = Vec::new();
+        for (&(entity, component), dep) in &mut self.entity_deps {
+            let entity_ref = world.get_entity(entity).ok();
+            let ticks = entity_ref.and_then(|e| e.get_change_ticks_by_id(component));
+            let present = ticks.is_some();
+            let changed = present != dep.present || ticks.is_some_and(|t| t.is_changed(last_run, this_run));
+            dep.present = present;
+            if changed {
+                fired.extend_from_slice(&dep.bindings);
+            }
+        }
+        fired
     }
 
     /// Orders `parent`'s children as its slots dictate, after a block changed.
@@ -1281,6 +1423,7 @@ fn walk(trie: &DepTrie, value: &Value, need_real: bool, pending: &mut Pending) -
         real = match value.value_type() {
             crate::core::value::ValueType::List(list) => list.iter().any(has_real_change),
             crate::core::value::ValueType::Dict(map) => map.values().any(has_real_change),
+            crate::core::value::ValueType::Struct(s) => s.fields().iter().any(has_real_change),
             _ => false,
         };
     }
@@ -1304,6 +1447,7 @@ fn has_real_change(value: &Value) -> bool {
     match value.value_type() {
         crate::core::value::ValueType::List(list) => list.iter().any(has_real_change),
         crate::core::value::ValueType::Dict(map) => map.values().any(has_real_change),
+        crate::core::value::ValueType::Struct(s) => s.fields().iter().any(has_real_change),
         _ => false,
     }
 }

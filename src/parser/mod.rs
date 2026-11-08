@@ -163,7 +163,7 @@ pub use expr::{
 
 pub use crate::core::template::{
     BevueTemplate, ConditionDirective, ConditionKind, Expression, Identifier, ListDirective, NodeId, PropsDeclaration,
-    PropsSourceKind, TemplateImport, TemplateNode, TemplateRef, TemplateStyle, TemplateText, TextFragment,
+    PropsSourceKind, QueryComponent, QueryDeclaration, SortKey, TemplateImport, TemplateNode, TemplateRef, TemplateStyle, TemplateText, TextFragment,
 };
 use crate::core::path::PropPath;
 
@@ -196,6 +196,70 @@ impl From<ExprParseError> for ParseError {
 
 pub type Result<T> = std::result::Result<T, ParseError>;
 
+/// Splits a comma separated list of type names.
+fn type_list(value: Option<&str>) -> Vec<Cow<'static, str>> {
+    value
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| Cow::Owned(s.to_string()))
+        .collect()
+}
+
+/// Parses a `<query>` element of `<props>`.
+fn parse_query_declaration(tag: &HTMLTag<'_>) -> Result<QueryDeclaration> {
+    let error = |message: String| ParseError::InvalidDirective(message);
+    let (mut name, mut data, mut with, mut without, mut order_by) = (None, None, None, None, None);
+    for (attribute, value) in tag_attributes(tag) {
+        match attribute {
+            "name" => name = value,
+            "data" => data = value,
+            "with" => with = value,
+            "without" => without = value,
+            "order-by" => order_by = value,
+            other => return Err(error(format!("unknown attribute '{other}' in <query>"))),
+        }
+    }
+
+    let name = name.map(str::trim).filter(|n| !n.is_empty()).ok_or_else(|| error("<query> requires a name".into()))?;
+    PropPath::parse(name).map_err(|e| error(e.to_string()))?;
+    let data: Vec<QueryComponent> = type_list(data)
+        .into_iter()
+        .map(|type_path| match type_path.strip_suffix('?') {
+            Some(stripped) => QueryComponent { type_path: Cow::Owned(stripped.trim().to_string()), optional: true },
+            None => QueryComponent { type_path, optional: false },
+        })
+        .collect();
+    if data.is_empty() {
+        return Err(error("<query> requires data: the components of each row, e.g. data=\"Name, Health\"".into()));
+    }
+
+    let mut keys = Vec::new();
+    for key in order_by.unwrap_or_default().split(',').map(str::trim).filter(|k| !k.is_empty()) {
+        let mut words = key.split_whitespace();
+        let path = words.next().unwrap_or_default();
+        let descending = match words.next() {
+            None | Some("asc") => false,
+            Some("desc") => true,
+            Some(other) => return Err(error(format!("unexpected '{other}' in order-by, expected asc or desc"))),
+        };
+        if let Some(extra) = words.next() {
+            return Err(error(format!("unexpected '{extra}' in order-by")));
+        }
+        let path = PropPath::parse(path).map_err(|e| error(e.to_string()))?;
+        keys.push(SortKey { path, descending });
+    }
+
+    Ok(QueryDeclaration {
+        name: Cow::Owned(name.to_string()),
+        data,
+        with: type_list(with),
+        without: type_list(without),
+        order_by: keys,
+    })
+}
+
 /// Parses a `<resource>` or `<component>` element of `<props>`.
 fn parse_props_declaration(tag: &HTMLTag<'_>) -> Result<PropsDeclaration> {
     let tag_name = tag.name().as_utf8_str();
@@ -205,7 +269,7 @@ fn parse_props_declaration(tag: &HTMLTag<'_>) -> Result<PropsDeclaration> {
         PropsSourceKind::Component
     } else {
         return Err(ParseError::InvalidDirective(format!(
-            "unexpected <{tag_name}> in <props>, expected <resource> or <component>"
+            "unexpected <{tag_name}> in <props>, expected <resource>, <component> or <query>"
         )));
     };
 
@@ -350,6 +414,7 @@ pub fn parse_template(source: &str) -> Result<BevueTemplate> {
     let mut is_top_level_template = false;
     let mut in_props = false;
     let mut props: Vec<PropsDeclaration> = Vec::new();
+    let mut queries: Vec<QueryDeclaration> = Vec::new();
     let mut imports: Vec<TemplateImport> = Vec::new();
     // `<import>` elements that were opened. One written without `/>` contains what follows it.
     let mut open_imports: usize = 0;
@@ -372,7 +437,11 @@ pub fn parse_template(source: &str) -> Result<BevueTemplate> {
                 }
 
                 if in_props {
-                    props.push(parse_props_declaration(tag)?);
+                    if tag_name.eq_ignore_ascii_case("query") {
+                        queries.push(parse_query_declaration(tag)?);
+                    } else {
+                        props.push(parse_props_declaration(tag)?);
+                    }
                     continue;
                 }
 
@@ -533,7 +602,7 @@ pub fn parse_template(source: &str) -> Result<BevueTemplate> {
         }
     }
 
-    let mut template = BevueTemplate::new(nodes).with_props(props);
+    let mut template = BevueTemplate::new(nodes).with_props(props).with_queries(queries);
     template.imports = imports;
     if let Some(style) = parsed_style
         && let Some(root_idx) = template.root_index()
@@ -883,11 +952,39 @@ use super::*;
         assert_eq!(error("<props><resource name='a'/></props><div/>"), "Invalid directive: <resource> requires a type");
         assert_eq!(
             error("<props><asset type='A'/></props><div/>"),
-            "Invalid directive: unexpected <asset> in <props>, expected <resource> or <component>"
+            "Invalid directive: unexpected <asset> in <props>, expected <resource>, <component> or <query>"
         );
         assert!(parse_template("<props><resource type='A' name='a..b'/></props><div/>").is_err());
         assert!(parse_template("<props><resource type='A' name=''/></props><div/>").is_err());
         assert!(parse_template("<props><resource type='A' entity='x'/></props><div/>").is_err());
+    }
+
+    #[test]
+    fn query_declarations() {
+        let template = parse_template(
+            r#"<props>
+                <resource type="Menu"/>
+                <query name="enemies" data="Name, Health , Target?" with="Enemy" without="Dead, Hidden"
+                       order-by="health.current desc, name"/>
+            </props>
+            <div/>"#,
+        )
+        .unwrap();
+        assert_eq!(template.props.len(), 1);
+        let [query] = &template.queries[..] else { panic!("expected one query") };
+        assert_eq!(query.name, "enemies");
+        let data: Vec<_> = query.data.iter().map(|c| (c.type_path.as_ref(), c.optional)).collect();
+        assert_eq!(data, vec![("Name", false), ("Health", false), ("Target", true)]);
+        assert_eq!(query.with, vec!["Enemy"]);
+        assert_eq!(query.without, vec!["Dead", "Hidden"]);
+        let keys: Vec<_> = query.order_by.iter().map(|k| (k.path.to_string(), k.descending)).collect();
+        assert_eq!(keys, vec![("health.current".to_string(), true), ("name".to_string(), false)]);
+
+        let error = |source: &str| parse_template(source).unwrap_err().to_string();
+        assert_eq!(error("<props><query data='A'/></props><div/>"), "Invalid directive: <query> requires a name");
+        assert!(error("<props><query name='q'/></props><div/>").contains("requires data"));
+        assert!(error("<props><query name='q' data='A' order-by='a up'/></props><div/>").contains("asc or desc"));
+        assert!(error("<props><query name='q' data='A' sort='a'/></props><div/>").contains("unknown attribute"));
     }
 
     #[test]
