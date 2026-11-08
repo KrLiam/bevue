@@ -1,6 +1,6 @@
 //! Proxied property values for the API.
 //!
-//! A [`Value`] is a dynamically typed tree (booleans, numbers, strings, lists and dicts) that
+//! A [`Value`] is a dynamically typed tree (booleans, numbers, strings, entities, lists and dicts) that
 //! records *where* it was mutated, so the runtime can update only the UI nodes bound to the parts
 //! that changed.
 //!
@@ -15,7 +15,7 @@
 
 use std::{fmt, ops::DerefMut};
 
-use bevy::platform::collections::HashMap;
+use bevy::{ecs::entity::Entity, platform::collections::HashMap};
 
 use crate::core::path::PathSegment;
 
@@ -147,6 +147,10 @@ impl Value {
     pub fn string(value: String) -> Self {
         Self::new(ValueType::String(value))
     }
+    /// Creates an entity value.
+    pub fn entity(value: Entity) -> Self {
+        Self::new(ValueType::Entity(value))
+    }
     /// Creates a list value.
     pub fn list(value: Vec<Value>) -> Self {
         Self::new(ValueType::List(value))
@@ -185,6 +189,11 @@ impl Value {
         match &self.t { ValueType::String(v) => Some(v), _ => None }
     }
 
+    /// Unwraps the entity value if value is `Entity`.
+    pub fn as_entity(&self) -> Option<Entity> {
+        match &self.t { ValueType::Entity(v) => Some(*v), _ => None }
+    }
+
     /// Unwraps the list value if value is `List`.
     pub fn as_list(&self) -> Option<&Vec<Value>> {
         match &self.t { ValueType::List(v) => Some(v), _ => None }
@@ -196,13 +205,14 @@ impl Value {
     }
 
     /// Truthiness used by `v-if`: `false`, `0`, `NaN`, `""`, `null` and empty lists and dicts are
-    /// falsy, everything else is truthy.
+    /// falsy, everything else (including entities) is truthy.
     pub fn is_truthy(&self) -> bool {
         match &self.t {
             ValueType::Null => false,
             ValueType::Boolean(b) => *b,
             ValueType::Number(n) => *n != 0.0 && !n.is_nan(),
             ValueType::String(s) => !s.is_empty(),
+            ValueType::Entity(_) => true,
             ValueType::List(list) => !list.is_empty(),
             ValueType::Dict(map) => !map.is_empty(),
         }
@@ -230,6 +240,9 @@ impl Value {
                 let _ = write!(out, "{n}");
             }
             ValueType::String(s) => out.push_str(s),
+            ValueType::Entity(e) => {
+                let _ = write!(out, "{e}");
+            }
             ValueType::List(_) | ValueType::Dict(_) => {
                 let _ = write!(out, "{self}");
             }
@@ -567,6 +580,8 @@ pub enum ValueType {
     Number(f64),
     /// An owned string.
     String(String),
+    /// A Bevy entity.
+    Entity(Entity),
     /// A dynamically sized list.
     List(Vec<Value>),
     /// A key-value map.
@@ -579,6 +594,7 @@ impl fmt::Display for ValueType {
             ValueType::Boolean(b) => { fmt::Debug::fmt(b, f)?; },
             ValueType::Number(n) => { fmt::Debug::fmt(n, f)?; },
             ValueType::String(s) => { fmt::Debug::fmt(s, f)?; },
+            ValueType::Entity(e) => { fmt::Display::fmt(e, f)?; },
             ValueType::List(values) => {
                 f.write_str("[")?;
                 for (i, el) in values.iter().enumerate() {
@@ -645,6 +661,11 @@ impl From<&String> for Value {
 impl From<String> for Value {
     fn from(value: String) -> Self {
         Self::string(value)
+    }
+}
+impl From<Entity> for Value {
+    fn from(value: Entity) -> Self {
+        Self::entity(value)
     }
 }
 impl From<ValueType> for Value {
@@ -982,6 +1003,19 @@ mod tests {
         assert!(Value::dict(HashMap::from([("a".to_owned(), Value::null())])).is_truthy());
         assert!(Value::from(Some(1)).is_truthy());
         assert!(!Value::from(None::<i32>).is_truthy());
+    }
+
+    #[test]
+    fn entity() {
+        let entity = bevy::ecs::entity::Entity::from_raw_u32(12).unwrap();
+        let value = Value::from(entity);
+        assert_eq!(value.as_entity(), Some(entity));
+        assert_eq!(Value::from(12).as_entity(), None);
+        assert!(value.is_truthy());
+        assert_eq!(value.to_text(), entity.to_string());
+        assert_eq!(value.to_string(), entity.to_string());
+        assert_eq!(value, Value::entity(entity));
+        assert_ne!(value, Value::entity(bevy::ecs::entity::Entity::from_raw_u32(13).unwrap()));
     }
 
     impl Value {

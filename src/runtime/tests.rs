@@ -1245,6 +1245,29 @@ mod events_and_functions {
     }
 
     #[test]
+    fn entity_props_are_passed_to_functions() {
+        fn name_of(In(ctx): In<BevueCtx>, names: bevy::ecs::system::Query<&bevy::ecs::name::Name>) -> String {
+            let entity = ctx.get_args::<Entity>().unwrap();
+            names.get(entity).map(|n| n.to_string()).unwrap_or_default()
+        }
+
+        let mut app = event_app();
+        app.register_bevue_function("name_of", name_of);
+        let ana = app.world_mut().spawn(bevy::ecs::name::Name::new("Ana")).id();
+        let bo = app.world_mut().spawn(bevy::ecs::name::Name::new("Bo")).id();
+        let root = spawn(
+            &mut app,
+            r#"<div><p>{{name_of(target)}}</p><p v-for="e in all" :key="e">{{name_of(e)}}</p></div>"#,
+            value!({ "target": ana, "all": [ana, bo] }),
+        );
+        assert_eq!(texts(app.world(), root), vec!["Ana", "Ana", "Bo"]);
+
+        props(&mut app, root).get_mut("target").unwrap().set(bo);
+        app.update();
+        assert_eq!(texts(app.world(), root), vec!["Bo", "Ana", "Bo"]);
+    }
+
+    #[test]
     fn call_iterables() {
         let mut app = event_app();
         let root = spawn(

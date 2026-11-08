@@ -15,7 +15,7 @@
 
 use std::{any::Any, borrow::Cow, fmt};
 
-use bevy::{platform::collections::HashMap, reflect::utility::GenericTypePathCell};
+use bevy::{ecs::entity::Entity, platform::collections::HashMap, reflect::utility::GenericTypePathCell};
 
 use crate::core::{
     path::{AsPropPath, PathParseError, PathSegment, PropPath},
@@ -400,6 +400,20 @@ macro_rules! impl_number {
 }
 impl_number!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize, f32, f64);
 
+impl Props for Entity {
+    fn to_value(&self) -> Value {
+        Value::entity(*self)
+    }
+    fn apply_value(&mut self, value: &Value) -> Result<(), PropsError> {
+        *self = Self::from_value(value)?;
+        Ok(())
+    }
+    fn from_value(value: &Value) -> Result<Self, PropsError> {
+        value.as_entity().ok_or_else(|| PropsError::expected("entity", value))
+    }
+    leaf_any!();
+}
+
 impl Props for String {
     fn to_value(&self) -> Value {
         Value::string(self.clone())
@@ -720,6 +734,31 @@ mod tests {
 
     #[derive(crate::Props, Debug, Clone, PartialEq)]
     struct Tags(Vec<String>);
+
+    #[derive(crate::Props, Debug, Clone, PartialEq)]
+    struct Targets {
+        main: Entity,
+        alt: Option<Entity>,
+        all: Vec<Entity>,
+    }
+
+    #[test]
+    fn entity_fields() {
+        let a = Entity::from_raw_u32(1).unwrap();
+        let b = Entity::from_raw_u32(2).unwrap();
+        let targets = Targets { main: a, alt: None, all: vec![a, b] };
+        let value = targets.to_value();
+        assert_eq!(value, value!({ "main": a, "alt": (), "all": [a, b] }));
+        assert_eq!(Targets::from_value(&value), Ok(targets.clone()));
+
+        let mut synced = value.clone();
+        Targets { main: b, ..targets }.sync_value(&mut synced);
+        assert_eq!(synced.get("main").unwrap().flags(), ChangeFlags::SELF);
+        assert!(!synced.get("all").unwrap().is_dirty());
+
+        let error = Entity::from_value(&value!("x")).unwrap_err();
+        assert_eq!(error.to_string(), "expected entity, found \"x\"");
+    }
 
     #[derive(crate::Props, Debug, Clone, PartialEq)]
     struct Player {

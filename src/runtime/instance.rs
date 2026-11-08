@@ -268,6 +268,7 @@ enum ItemKey {
     Bool(bool),
     Number(u64),
     String(Box<str>),
+    Entity(Entity),
     Other(String),
 }
 
@@ -283,6 +284,7 @@ impl ItemKey {
             ValueType::Boolean(b) => ItemKey::Bool(*b),
             ValueType::Number(n) => ItemKey::Number(number_key(*n)),
             ValueType::String(s) => ItemKey::String(s.as_str().into()),
+            ValueType::Entity(e) => ItemKey::Entity(*e),
             ValueType::List(_) | ValueType::Dict(_) => ItemKey::Other(value.to_string()),
         }
     }
@@ -294,6 +296,7 @@ impl ItemKey {
             (ItemKey::Bool(a), ValueType::Boolean(b)) => a == b,
             (ItemKey::Number(a), ValueType::Number(b)) => *a == number_key(*b),
             (ItemKey::String(a), ValueType::String(b)) => **a == **b,
+            (ItemKey::Entity(a), ValueType::Entity(b)) => a == b,
             (ItemKey::Other(a), ValueType::List(_) | ValueType::Dict(_)) => *a == value.to_string(),
             _ => false,
         }

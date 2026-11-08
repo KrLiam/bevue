@@ -234,5 +234,13 @@ mod tests {
         assert_eq!(error.to_string(), "argument 1: expected number, found \"x\"");
         let error = call.get_args::<(f32, String, Vec<u8>, bool)>().unwrap_err();
         assert_eq!(error.to_string(), "argument 3: expected bool, found null");
+
+        let entity = Entity::from_raw_u32(7).unwrap();
+        let call = ctx(vec![Value::entity(entity), value!(1)]);
+        assert_eq!(call.get_args::<Entity>(), Ok(entity));
+        assert_eq!(call.get_args::<Option<Entity>>(), Ok(Some(entity)));
+        assert_eq!(ctx(vec![]).get_args::<Option<Entity>>(), Ok(None));
+        let error = call.get_args::<(Entity, Entity)>().unwrap_err();
+        assert_eq!(error.to_string(), "argument 1: expected entity, found 1.0");
     }
 }
